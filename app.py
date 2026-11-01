@@ -69,6 +69,11 @@ def exec_write(sql: str, params=()):
 def now():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+def json_serial(obj):
+    if isinstance(obj, (datetime.datetime, datetime.date)):
+        return obj.strftime("%Y-%m-%d %H:%M:%S") if isinstance(obj, datetime.datetime) else obj.strftime("%Y-%m-%d")
+    return str(obj)
+
 # --- INITIALIZATION & AUTO-MIGRATION ---
 def init_db():
     conn = get_conn()
@@ -130,12 +135,20 @@ def init_db():
         ''')
     conn.commit()
 
+    # Sync sequence for PostgreSQL
+    if USE_PG:
+        try:
+            cur.execute("SELECT setval(pg_get_serial_sequence('tcode_records', 'id'), COALESCE((SELECT MAX(id)+1 FROM tcode_records), 1), false);")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+
     cur_time = now()
 
     # Org Record
     cur.execute(q("SELECT 1 FROM org WHERE id=1"))
     if not cur.fetchone():
-        cur.execute(q("INSERT INTO org VALUES (?,?,?,?)"), (1, "Thermocables Group", "NX-01", "GLOBAL"))
+        cur.execute(q("INSERT INTO org VALUES (?,?,?,?)"), (1, "Thermocables Enterprise Group", "NX-01", "GLOBAL"))
 
     # Default Departments
     for d in ["Production", "Quality Control", "Final Inspection", "Commercial", "Planning", "Logistics", "Engineering"]:
@@ -149,7 +162,7 @@ def init_db():
         if not cur.fetchone():
             cur.execute(q("INSERT INTO plants VALUES (?,?,?,?)"), (p_code, p_name, 1, cur_time))
 
-    # Master Administrator Guarantee (Always sync Admin@123 as active)
+    # Master Admin Guarantee
     ph = bcrypt.hashpw("Admin@123".encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     cur.execute(q("SELECT username FROM users WHERE username='admin'"))
     if cur.fetchone():
@@ -158,12 +171,12 @@ def init_db():
         cur.execute(q("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?)"),
                     ("admin", ph, "Master System Administrator", "master", "IT & Systems", "1000,1400,2000,CORP", "approved", cur_time, cur_time))
 
-    # Default Functional Modules / T-Codes
+    # Default Modules
     default_modules = [
         ("PROD", "Production Handover Report", "Manufacturing batch & lot transfer logs", "PROD", "Production,Quality Control"),
         ("GCH0", "Quality Green Card Release", "Incoming QA & physical cable release inspection", "QC", "Quality Control,Production"),
         ("NCR0", "Non-Conformance Incidents", "QC deviation & defect corrective tracking", "QC", "Quality Control,Final Inspection,Production"),
-        ("PLN0", "Production Planning & Schedule", "Machine allocation and manufacturing order queue", "PLAN", "Planning,Production,Logistics"),
+        ("PLN0", "Production Planning Details", "Machine allocation and manufacturing order queue", "PLAN", "Planning,Production,Logistics"),
         ("QCH0", "Stage QC to Final Clearance", "Clearance release slips before shipment", "QC", "Quality Control,Final Inspection"),
         ("STD0", "Inventory Transfer Orders", "Inter-plant and store material movements", "INV", "Logistics,Planning,Production")
     ]
@@ -245,7 +258,7 @@ def check_tcode_access(u, code: str):
     return bool(grant)
 
 # --- FASTAPI APP ---
-app = FastAPI(title="Nexus Core ERP - Industrial Operations Suite", version="3.2.0")
+app = FastAPI(title="Nexus Core ERP - Industrial Operations Suite", version="3.2.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- AUTH APIS ---
@@ -262,7 +275,6 @@ def api_login(res: Response, username: str = Form(...), password: str = Form(...
     exp = (datetime.datetime.now() + datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
     exec_write("INSERT INTO sessions VALUES (?,?,?)", (token, username, exp))
 
-    # Dual session: Set cookie AND return token for Bearer header storage
     res.set_cookie("nexus_session", token, httponly=True, samesite="lax", max_age=86400 * 7)
     return {
         "ok": True,
@@ -299,7 +311,7 @@ def api_me(req: Request):
         "company": org_info.get("name", "Thermocables Group")
     }
 
-# --- SYSTEM SETUP & UNITS (SPRO) ---
+# --- SYSTEM UNITS & DEPTS (SPRO) ---
 @app.get("/api/spro/overview")
 def spro_overview(req: Request):
     need(req)
@@ -589,7 +601,7 @@ def create_record(code: str, req: Request, payload: dict):
     plant = payload.pop("_plant", "").strip()
     cur_time = now()
     exec_write("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
-               (code, plant, json.dumps(payload), "active", u["username"], u["full_name"], cur_time, cur_time))
+               (code, plant, json.dumps(payload, default=json_serial), "active", u["username"], u["full_name"], cur_time, cur_time))
     return {"ok": True}
 
 @app.put("/api/tcode/{code}/records/{rid}")
@@ -607,7 +619,7 @@ def update_record(code: str, rid: int, req: Request, payload: dict):
 
     plant = payload.pop("_plant", rec["plant"]).strip()
     exec_write("UPDATE tcode_records SET plant=?, data=?, updated_at=? WHERE id=?",
-               (plant, json.dumps(payload), now(), rid))
+               (plant, json.dumps(payload, default=json_serial), now(), rid))
     return {"ok": True}
 
 @app.delete("/api/tcode/{code}/records/{rid}")
@@ -626,7 +638,7 @@ def delete_record(code: str, rid: int, req: Request):
     exec_write("UPDATE tcode_records SET status='deleted', updated_at=? WHERE id=?", (now(), rid))
     return {"ok": True}
 
-# --- EXCEL SPREADSHEET ENGINE ---
+# --- ROBUST EXCEL SPREADSHEET ENGINE ---
 @app.get("/api/tcode/{code}/export")
 def export_excel(code: str, req: Request):
     u = need(req)
@@ -673,37 +685,70 @@ def import_excel(code: str, req: Request, file: UploadFile = File(...)):
     u = need(req)
     code = code.upper().strip()
     if not check_tcode_access(u, code):
-        raise HTTPException(403, "Import denied")
+        raise HTTPException(403, "Import denied: You lack access to this module.")
 
-    contents = file.file.read()
-    wb = load_workbook(io.BytesIO(contents))
-    ws = wb.active
-    data_rows = list(ws.iter_rows(values_only=True))
-    if not data_rows:
-        return {"ok": True, "count": 0}
+    try:
+        contents = file.file.read()
+        wb = load_workbook(io.BytesIO(contents), data_only=True)
+        ws = wb.active
+        data_rows = list(ws.iter_rows(values_only=True))
+        if not data_rows or len(data_rows) < 2:
+            return {"ok": True, "count": 0}
 
-    headers = [str(h).strip() for h in data_rows[0] if h is not None]
-    count = 0
-    cur_time = now()
+        # Clean headers and map non-empty column indexes
+        raw_headers = data_rows[0]
+        valid_cols = []
+        for idx, h in enumerate(raw_headers):
+            if h is not None and str(h).strip():
+                valid_cols.append((idx, str(h).strip()))
 
-    for row in data_rows[1:]:
-        if not any(row):
-            continue
-        rec = {}
-        plant_val = ""
-        for idx, col in enumerate(headers):
-            if idx < len(row):
-                val = row[idx]
-                if col.lower() == "plant":
-                    plant_val = str(val or "")
-                elif col not in ["id", "created_by_name", "created_at"]:
-                    rec[col] = val if val is not None else ""
-        exec_write("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
-                   (code, plant_val, json.dumps(rec), "active", u["username"], u["full_name"], cur_time, cur_time))
-        count += 1
-    return {"ok": True, "count": count}
+        if not valid_cols:
+            return {"ok": True, "count": 0}
 
-# --- MODERN SLATE & INDIGO UI (NON-SAP LOOK) ---
+        count = 0
+        cur_time = now()
+        insert_sql = q("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)")
+
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            for row in data_rows[1:]:
+                if not row or not any(row):
+                    continue
+                rec = {}
+                plant_val = ""
+                for col_idx, col_name in valid_cols:
+                    if col_idx < len(row):
+                        val = row[col_idx]
+                        if val is None:
+                            val = ""
+                        elif isinstance(val, (datetime.datetime, datetime.date)):
+                            val = val.strftime("%Y-%m-%d %H:%M:%S") if isinstance(val, datetime.datetime) else val.strftime("%Y-%m-%d")
+
+                        c_lower = col_name.lower().strip()
+                        if c_lower in ["plant", "facility"]:
+                            plant_val = str(val or "").strip()
+                        elif c_lower not in ["id", "doc #", "created_by_name", "logged by", "created_at", "timestamp", "actions"]:
+                            rec[col_name] = val
+
+                if not plant_val:
+                    plant_val = (u.get("plants") or "1000").split(",")[0].strip() or "1000"
+
+                data_str = json.dumps(rec, default=json_serial)
+                cur.execute(insert_sql, (code, plant_val, data_str, "active", u["username"], u["full_name"], cur_time, cur_time))
+                count += 1
+            conn.commit()
+        finally:
+            conn.close()
+
+        return {"ok": True, "count": count}
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Spreadsheet Parse Error: {str(e)}")
+
+# --- MODERN SLATE & INDIGO UI ---
 HTML_MODERN_UI = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -729,10 +774,8 @@ HTML_MODERN_UI = """<!DOCTYPE html>
 </head>
 <body class="h-screen flex flex-col select-none overflow-hidden bg-slate-900 text-slate-100">
 
-<!-- APP SHELL -->
 <div id="app_root" class="h-full flex flex-col">
 
-  <!-- TOP HEADER -->
   <header class="h-14 bg-slate-900/90 backdrop-blur border-b border-slate-800 px-4 flex items-center justify-between z-10 shrink-0">
     <div class="flex items-center gap-4">
       <div class="flex items-center gap-2.5 cursor-pointer" onclick="goHome()">
@@ -746,17 +789,15 @@ HTML_MODERN_UI = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- GLOBAL COMMAND JUMP BAR -->
       <div class="relative ml-4">
         <i class="ri-search-line absolute left-3 top-2.5 text-slate-400 text-xs"></i>
-        <input id="cmd_box" placeholder="Jump to module (e.g. PROD, GCH0, SU01, SPRO)..." 
+        <input id="cmd_box" placeholder="Jump to module (e.g. PROD, PLN0, GCH0, SU01)..." 
                class="bg-slate-800/80 border border-slate-700/80 rounded-lg pl-8 pr-16 py-1.5 text-xs text-slate-100 placeholder:text-slate-500 w-80 focus:outline-none focus:border-indigo-500 transition-all font-mono"
                onkeydown="if(event.key==='Enter') execCmd()">
         <span class="absolute right-2 top-2 text-[10px] bg-slate-700/60 text-slate-400 px-1.5 py-0.5 rounded font-mono">Enter</span>
       </div>
     </div>
 
-    <!-- USER & ORG PILL -->
     <div id="nav_right" class="flex items-center gap-3">
       <div id="user_chip" class="flex items-center gap-2 bg-slate-800 border border-slate-700/60 px-3 py-1 rounded-full text-xs">
         <div class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></div>
@@ -769,10 +810,8 @@ HTML_MODERN_UI = """<!DOCTYPE html>
     </div>
   </header>
 
-  <!-- BODY: SIDEBAR + WORKSPACE -->
   <div class="flex-1 flex overflow-hidden">
     
-    <!-- LEFT SIDEBAR -->
     <aside id="sidebar" class="w-64 bg-slate-950 border-r border-slate-800 flex flex-col justify-between shrink-0">
       <div class="p-3 overflow-y-auto flex-1 space-y-4">
         <div>
@@ -822,11 +861,9 @@ HTML_MODERN_UI = """<!DOCTYPE html>
       </div>
     </aside>
 
-    <!-- RIGHT MAIN WORKSPACE -->
     <main id="main_screen" class="flex-1 bg-slate-900 overflow-hidden flex flex-col"></main>
   </div>
 
-  <!-- STATUS FOOTER -->
   <footer class="h-7 bg-slate-950 border-t border-slate-800 px-4 flex items-center justify-between text-[11px] text-slate-400 font-mono shrink-0">
     <div class="flex items-center gap-2 truncate">
       <span id="stat_dot" class="w-2 h-2 rounded-full bg-emerald-400"></span>
@@ -841,7 +878,6 @@ HTML_MODERN_UI = """<!DOCTYPE html>
 
 </div>
 
-<!-- DIALOG MODAL -->
 <div id="app_dialog" class="hidden fixed inset-0 bg-slate-950/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
   <div id="app_dialog_body" class="bg-white text-slate-800 rounded-2xl shadow-2xl border border-slate-200 max-h-[90vh] overflow-y-auto w-full max-w-2xl"></div>
 </div>
@@ -894,7 +930,6 @@ async function api(path, opts = {}) {
   return await res.json();
 }
 
-// MODERN SIGN-IN SCREEN
 function renderLogon(errorMsg = "") {
   $('#app_root').innerHTML = `
   <div class="min-h-screen bg-slate-950 flex items-center justify-center p-4 relative overflow-hidden select-text">
@@ -1016,7 +1051,7 @@ function goHome() {
           </div>
           <div class="bg-slate-800/60 border border-slate-700/60 rounded-2xl p-5">
             <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Command Shortcut</div>
-            <div class="text-xs text-slate-300 mt-2 font-mono">Type module code in the search bar (e.g. <b class="text-indigo-400">PROD</b>, <b class="text-indigo-400">GCH0</b>)</div>
+            <div class="text-xs text-slate-300 mt-2 font-mono">Type module code in the search bar (e.g. <b class="text-indigo-400">PROD</b>, <b class="text-indigo-400">PLN0</b>)</div>
           </div>
         </div>
 
@@ -1420,7 +1455,6 @@ async function renderSPRO() {
       </div>
 
       <div class="grid grid-cols-1 md:grid-cols-2 gap-6 flex-1 mt-4 overflow-auto">
-        <!-- PLANTS -->
         <div class="bg-slate-950 border border-slate-800 rounded-2xl flex flex-col overflow-hidden">
           <div class="p-4 border-b border-slate-800 flex justify-between items-center bg-slate-900/60">
             <span class="text-xs font-bold text-white uppercase tracking-wider">Manufacturing Plants</span>
@@ -1443,7 +1477,6 @@ async function renderSPRO() {
           </div>
         </div>
 
-        <!-- DEPARTMENTS -->
         <div class="bg-slate-950 border border-slate-800 rounded-2xl flex flex-col overflow-hidden">
           <div class="p-4 border-b border-slate-800 flex justify-between items-center bg-slate-900/60">
             <span class="text-xs font-bold text-white uppercase tracking-wider">Operational Departments</span>
@@ -1564,7 +1597,6 @@ async function renderBusinessModule(tc) {
 
   $('#main_screen').innerHTML = `
     <div class="flex-1 flex flex-col bg-slate-900 overflow-hidden select-text">
-      <!-- WORKSPACE TOOLBAR -->
       <div class="p-4 border-b border-slate-800 flex items-center justify-between shrink-0">
         <div class="flex items-center gap-3">
           <div>
@@ -1580,13 +1612,11 @@ async function renderBusinessModule(tc) {
         </div>
 
         <div class="flex items-center gap-2">
-          <!-- PLANT SELECTOR -->
           <select id="rec_plant_filter" onchange="reloadRecords()" class="bg-slate-800 border border-slate-700 text-xs rounded-xl px-2.5 py-1.5 text-slate-200">
             <option value="">(All Facilities)</option>
             ${allowedPlants.map(p=>`<option value="${esc(p.code)}">${esc(p.code)} - ${esc(p.name)}</option>`).join('')}
           </select>
 
-          <!-- VIEW SELECTOR -->
           <select id="view_sel" onchange="switchLayout(this.value)" class="bg-slate-800 border border-slate-700 text-xs rounded-xl px-2.5 py-1.5 text-slate-200">
             ${ACTIVE_LAYOUTS.map(l => `<option value="${esc(l.layout_code)}" ${CURRENT_LAYOUT && l.layout_code===CURRENT_LAYOUT.layout_code?'selected':''}>${esc(l.name)}</option>`).join('')}
           </select>
@@ -1607,7 +1637,6 @@ async function renderBusinessModule(tc) {
         </div>
       </div>
 
-      <!-- DATA TABLE -->
       <div id="data_grid_container" class="flex-1 bg-slate-950 border-t border-slate-800 overflow-auto"></div>
     </div>`;
 
@@ -1748,8 +1777,12 @@ async function importSpreadsheet(e) {
     const res = await api(`/api/tcode/${CURRENT_TCODE}/import`, {method: 'POST', body: fd});
     reloadRecords();
     setMsg(`Imported ${res.count} records successfully`);
+    alert(`Success: ${res.count} records imported!`);
   } catch(err) {
     alert(err);
+    setMsg("Import failed", true);
+  } finally {
+    e.target.value = '';
   }
 }
 
@@ -1865,7 +1898,6 @@ function closeDialog() {
   $('#app_dialog_body').innerHTML = '';
 }
 
-// STARTUP
 initSession();
 </script>
 </body>
@@ -1878,7 +1910,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "3.2.0"}
+    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "3.2.1"}
 
 if __name__ == "__main__":
     import uvicorn
