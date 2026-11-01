@@ -1,4 +1,4 @@
-import io, json, sqlite3, secrets, datetime, os
+import io, json, sqlite3, secrets, datetime, os, re, csv
 from pathlib import Path
 import bcrypt
 from fastapi import FastAPI, Request, Response, UploadFile, File, Form, HTTPException
@@ -73,6 +73,48 @@ def json_serial(obj):
     if isinstance(obj, (datetime.datetime, datetime.date)):
         return obj.strftime("%Y-%m-%d %H:%M:%S") if isinstance(obj, datetime.datetime) else obj.strftime("%Y-%m-%d")
     return str(obj)
+
+def infer_field_type(sample_values):
+    """Infers whether column is date, number, textarea, or standard text."""
+    if not sample_values:
+        return "text"
+    is_num = True
+    is_date = True
+    is_long = False
+    date_patterns = [
+        r'^\d{4}-\d{2}-\d{2}',
+        r'^\d{2}/\d{2}/\d{4}',
+        r'^\d{2}-\d{2}-\d{4}'
+    ]
+    for v in sample_values:
+        if v is None or v == "":
+            continue
+        if isinstance(v, (datetime.datetime, datetime.date)):
+            is_num = False
+            continue
+        if isinstance(v, (int, float)):
+            is_date = False
+            continue
+        s = str(v).strip()
+        if len(s) > 70 or '\n' in s:
+            is_long = True
+            is_num = False
+            is_date = False
+            break
+        try:
+            float(s.replace(',', ''))
+        except ValueError:
+            is_num = False
+        if not any(re.match(p, s) for p in date_patterns):
+            is_date = False
+
+    if is_date:
+        return "date"
+    if is_num:
+        return "number"
+    if is_long:
+        return "textarea"
+    return "text"
 
 # --- INITIALIZATION & AUTO-MIGRATION ---
 def init_db():
@@ -216,7 +258,7 @@ def init_db():
         cur.execute(q("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?)"),
                     ("admin", ph, "Master System Administrator", "master", "IT & Systems", "1000,1400,2000,CORP", "approved", cur_time, cur_time))
 
-    # Seed Sample Department Users for smooth dispatch testing
+    # Sample Department Users for smooth dispatch testing
     sample_users = [
         ("prod_user", "Production Supervisor", "Production", "1000"),
         ("testing_lead", "Final Testing Incharge", "Final Testing", "1000"),
@@ -229,7 +271,7 @@ def init_db():
             cur.execute(q("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?)"),
                         (su_name, ph, su_full, "user", su_dept, su_pl, "approved", cur_time, cur_time))
 
-    # Register TN01 along with standard operations modules
+    # Default Functional Modules including TN01
     default_modules = [
         ("TN01", "Transfer Note & Handover Sheet", "Inter-department material handover & batch transfer note", "MM", "Production,Final Testing,Commercial,Store,Quality Control,Planning"),
         ("PROD", "Production Handover Report", "Manufacturing batch & lot transfer logs", "PROD", "Production,Quality Control"),
@@ -305,7 +347,7 @@ def check_tcode_access(u, code: str):
     return bool(grant)
 
 # --- FASTAPI APP ---
-app = FastAPI(title="Nexus Core ERP - Industrial Operations Suite", version="3.3.0")
+app = FastAPI(title="Nexus Core ERP - Industrial Operations Suite", version="3.4.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- AUTH APIS ---
@@ -499,7 +541,9 @@ def pfcg_revoke(req: Request, username: str = Form(...), tcode: str = Form(...))
     exec_write("DELETE FROM access_grants WHERE username=? AND tcode_code=?", (username.lower().strip(), tcode.upper().strip()))
     return {"ok": True}
 
-# --- MODULES & REGISTRY STUDIO (SE93) ---
+# =========================================================================
+# --- AUTO T-CODE CREATION FROM UPLOADED FILE / EXCEL / CODE ---
+# =========================================================================
 @app.get("/api/se93/list")
 def se93_list(req: Request):
     u = need(req)
@@ -510,18 +554,151 @@ def se93_list(req: Request):
         t["has_access"] = check_tcode_access(u, t["code"])
     return all_t
 
-@app.post("/api/se93/create")
-def se93_create(req: Request, code: str = Form(...), title: str = Form(...), description: str = Form(...),
-                module: str = Form("PROD"), allowed_depts: str = Form(...)):
+@app.post("/api/se93/auto-create")
+async def se93_auto_create(
+    req: Request,
+    code: str = Form(...),
+    title: str = Form(...),
+    description: str = Form(""),
+    module: str = Form("PROD"),
+    allowed_depts: str = Form("Production,Quality Control"),
+    import_sample_data: int = Form(1),
+    file: UploadFile = File(...)
+):
+    """
+    Auto-creates a complete T-Code by reading columns and sample rows from an uploaded file.
+    Infers data types, builds the schema, generates default layout, and registers the T-Code.
+    """
     u = need_admin(req)
     code = code.upper().strip()
+
+    if not code:
+        raise HTTPException(400, "T-Code identifier is required.")
     if fetch_one("SELECT 1 FROM tcodes WHERE code=?", (code,)):
-        raise HTTPException(400, f"Module code '{code}' already exists.")
+        raise HTTPException(400, f"Module / T-Code '{code}' already exists.")
+
+    contents = await file.read()
+    filename = file.filename.lower()
+    headers = []
+    data_rows = []
+
+    try:
+        # Excel format (.xlsx, .xls)
+        if filename.endswith(".xlsx") or filename.endswith(".xls"):
+            wb = load_workbook(io.BytesIO(contents), data_only=True)
+            ws = wb.active
+            rows = list(ws.iter_rows(values_only=True))
+            if rows:
+                headers = [str(h).strip() for h in rows[0] if h is not None and str(h).strip()]
+                data_rows = rows[1:]
+
+        # CSV format (.csv)
+        elif filename.endswith(".csv"):
+            text = contents.decode("utf-8", errors="ignore")
+            reader = csv.reader(io.StringIO(text))
+            rows = list(reader)
+            if rows:
+                headers = [str(h).strip() for h in rows[0] if str(h).strip()]
+                data_rows = rows[1:]
+
+        # JSON format (.json)
+        elif filename.endswith(".json"):
+            parsed = json.loads(contents.decode("utf-8", errors="ignore"))
+            if isinstance(parsed, list) and len(parsed) > 0 and isinstance(parsed[0], dict):
+                headers = list(parsed[0].keys())
+                for item in parsed:
+                    data_rows.append([item.get(k, "") for k in headers])
+            elif isinstance(parsed, dict) and "columns" in parsed:
+                headers = parsed["columns"]
+        else:
+            raise HTTPException(400, "Unsupported file format. Please upload an Excel (.xlsx/.xls), CSV, or JSON template.")
+
+    except Exception as e:
+        raise HTTPException(400, f"Could not parse uploaded template: {str(e)}")
+
+    if not headers:
+        raise HTTPException(400, "No valid column headers found in the uploaded file.")
+
+    # Infer types per column
+    fields = []
+    col_samples = {idx: [] for idx in range(len(headers))}
+    for r in data_rows[:25]:
+        for c_idx in range(len(headers)):
+            if c_idx < len(r) and r[c_idx] is not None:
+                col_samples[c_idx].append(r[c_idx])
+
+    for idx, h in enumerate(headers):
+        clean_key = re.sub(r'[^a-zA-Z0-9_]', '_', h.lower().strip())
+        clean_key = re.sub(r'_+', '_', clean_key).strip('_')
+        if not clean_key:
+            clean_key = f"col_{idx+1}"
+
+        field_type = infer_field_type(col_samples[idx])
+        fields.append({
+            "key": clean_key,
+            "label": h,
+            "type": field_type,
+            "required": False,
+            "width": 2 if field_type == "textarea" else 1
+        })
 
     cur_time = now()
+
+    # 1. Register T-Code in Repository
     exec_write("INSERT INTO tcodes VALUES (?,?,?,?,?,?,?,?,?)",
-               (code, title.strip(), description.strip(), module.strip(), allowed_depts.strip(), 1, cur_time, cur_time, u["username"]))
-    return {"ok": True}
+               (code, title.strip() or f"{code} Module", description.strip(), module.strip(), allowed_depts.strip(), 1, cur_time, cur_time, u["username"]))
+
+    # 2. Register Generated Schema
+    fields_json = json.dumps(fields)
+    exec_write("INSERT INTO tcode_schemas VALUES (?,?,?,?,?)",
+               (code, fields_json, json.dumps({"columns": 3}), cur_time, u["username"]))
+
+    # 3. Create Default ALV Grid Layout
+    layout_code = f"GRID_{code}_01"
+    exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+               (code, layout_code, "Default Grid", f"{title or code} Data View", 1, fields_json, json.dumps({"columns": 3}), "Auto-generated from uploaded file", u["username"], u["full_name"], cur_time, cur_time))
+
+    # 4. Optional: Import sample rows if present in template
+    imported_count = 0
+    if import_sample_data and data_rows:
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            insert_sql = q("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)")
+            default_plant = (u.get("plants") or "1000").split(",")[0].strip() or "1000"
+
+            for r in data_rows:
+                if not any(r):
+                    continue
+                rec = {}
+                row_plant = default_plant
+                for idx, h in enumerate(headers):
+                    if idx < len(r):
+                        val = r[idx]
+                        if val is None:
+                            val = ""
+                        elif isinstance(val, (datetime.datetime, datetime.date)):
+                            val = val.strftime("%Y-%m-%d %H:%M:%S") if isinstance(val, datetime.datetime) else val.strftime("%Y-%m-%d")
+                        key = fields[idx]["key"]
+                        if key in ["plant", "facility"]:
+                            row_plant = str(val or default_plant).strip()
+                        else:
+                            rec[key] = val
+
+                cur.execute(insert_sql, (code, row_plant, json.dumps(rec, default=json_serial), "active", u["username"], u["full_name"], cur_time, cur_time))
+                imported_count += 1
+            conn.commit()
+        finally:
+            conn.close()
+
+    return {
+        "ok": True,
+        "code": code,
+        "title": title,
+        "columns_count": len(fields),
+        "columns": [f["label"] for f in fields],
+        "imported_count": imported_count
+    }
 
 @app.post("/api/se93/update")
 def se93_update(req: Request, code: str = Form(...), title: str = Form(...), description: str = Form(...),
@@ -542,11 +719,7 @@ def se93_delete(req: Request, code: str = Form(...)):
     exec_write("DELETE FROM access_grants WHERE code=?", (code,))
     return {"ok": True}
 
-# =========================================================================
-# --- TN01 - TRANSFER NOTE ENGINE & DISPATCH SYSTEM ---
-# =========================================================================
-
-# Preset route schemas
+# --- TN01 ROUTES & PRESETS ---
 TN01_PRESET_ROUTES = {
     "PROD_TO_QC": {
         "title": "Production to Final Testing",
@@ -606,8 +779,6 @@ def tn01_suggest_users(req: Request, plant: str = "", dept: str = ""):
         sql += " AND department = ?"
         params.append(dept)
     users = fetch_all(sql, tuple(params))
-    
-    # Filter by plant membership
     if plant:
         matched = []
         for u in users:
@@ -660,8 +831,6 @@ def tn01_delete_layout(req: Request, lid: int):
 def tn01_send(req: Request, payload: dict):
     u = need(req)
     cur_time = now()
-    
-    # Generate unique TN serial number (e.g. TN-20261101-0042)
     today_tag = datetime.date.today().strftime("%Y%m%d")
     cnt_row = fetch_one("SELECT COUNT(*) as c FROM transfer_notes WHERE created_at LIKE ?", (f"{datetime.date.today().strftime('%Y-%m-%d')}%",))
     daily_num = (cnt_row["c"] if cnt_row else 0) + 1
@@ -708,13 +877,11 @@ def tn01_send(req: Request, payload: dict):
 @app.get("/api/tn01/inbox")
 def tn01_get_inbox(req: Request):
     u = need(req)
-    # Notes sent directly to user, or to user's department
-    notes = fetch_all('''
+    return fetch_all('''
     SELECT * FROM transfer_notes 
     WHERE to_user = ? OR (to_dept = ? AND to_user = '')
     ORDER BY id DESC
     ''', (u["username"].lower(), u["department"]))
-    return notes
 
 @app.post("/api/tn01/receive/{nid}")
 def tn01_receive(req: Request, nid: int):
@@ -770,7 +937,6 @@ def tn01_get_note(req: Request, nid: int):
         note["sheet_data"] = []
     return note
 
-# Printable PDF view endpoint
 @app.get("/api/tn01/print/{nid}", response_class=HTMLResponse)
 def tn01_print_preview(req: Request, nid: int):
     u = need(req)
@@ -809,10 +975,7 @@ def tn01_print_preview(req: Request, nid: int):
         table {{ width: 100%; border-collapse: collapse; margin-bottom: 30px; }}
         .sign-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-top: 50px; text-align: center; }}
         .sign-box {{ border-top: 1px solid #0f172a; padding-top: 8px; font-size: 11px; font-weight: 600; text-transform: uppercase; }}
-        @media print {{
-          body {{ margin: 0; }}
-          .no-print {{ display: none; }}
-        }}
+        @media print {{ body {{ margin: 0; }} .no-print {{ display: none; }} }}
       </style>
     </head>
     <body>
@@ -867,11 +1030,114 @@ def tn01_print_preview(req: Request, nid: int):
         </div>
       </div>
     </body>
-    </html>
-    """
+    </html>"""
     return HTMLResponse(html)
 
-# --- MODERN SLATE & INDIGO UI WITH TN01 SPREADSHEET ENGINE ---
+# --- STANDARD MODULE RECORDS & ALV ENGINE ---
+@app.get("/api/tcode/{code}/layouts")
+def get_layouts(code: str, req: Request):
+    u = need(req)
+    code = code.upper().strip()
+    if not check_tcode_access(u, code):
+        raise HTTPException(403, f"No authorization for code {code}")
+    rows = fetch_all("SELECT * FROM tcode_layouts WHERE tcode_code=? ORDER BY is_default DESC, id ASC", (code,))
+    for r in rows:
+        try:
+            r["fields"] = json.loads(r["fields"])
+        except:
+            r["fields"] = []
+    return rows
+
+@app.get("/api/tcode/{code}/records")
+def get_tcode_records(code: str, req: Request, plant: str = "", limit: int = 500, offset: int = 0):
+    u = need(req)
+    code = code.upper().strip()
+    if not check_tcode_access(u, code):
+        raise HTTPException(403, f"Unauthorized: User {u['username']} lacks permission for {code}")
+
+    if plant:
+        rows = fetch_all("SELECT * FROM tcode_records WHERE tcode_code=? AND plant=? AND status='active' ORDER BY id DESC LIMIT ? OFFSET ?", (code, plant, limit, offset))
+    else:
+        rows = fetch_all("SELECT * FROM tcode_records WHERE tcode_code=? AND status='active' ORDER BY id DESC LIMIT ? OFFSET ?", (code, limit, offset))
+
+    for r in rows:
+        try:
+            r["data"] = json.loads(r["data"])
+        except:
+            r["data"] = {}
+    return rows
+
+@app.post("/api/tcode/{code}/records")
+def create_record(code: str, req: Request, payload: dict):
+    u = need(req)
+    code = code.upper().strip()
+    if not check_tcode_access(u, code):
+        raise HTTPException(403, "Access denied")
+
+    plant = payload.pop("_plant", "").strip()
+    cur_time = now()
+    exec_write("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+               (code, plant, json.dumps(payload, default=json_serial), "active", u["username"], u["full_name"], cur_time, cur_time))
+    return {"ok": True}
+
+@app.delete("/api/tcode/{code}/records/{rid}")
+def delete_record(code: str, rid: int, req: Request):
+    u = need(req)
+    code = code.upper().strip()
+    if not check_tcode_access(u, code):
+        raise HTTPException(403, "Access denied")
+
+    rec = fetch_one("SELECT * FROM tcode_records WHERE id=? AND tcode_code=?", (rid, code))
+    if not rec:
+        raise HTTPException(404, "Record not found")
+    if rec["created_by"] != u["username"] and not is_master(u) and u["role"] != "admin":
+        raise HTTPException(403, "Permission denied")
+
+    exec_write("UPDATE tcode_records SET status='deleted', updated_at=? WHERE id=?", (now(), rid))
+    return {"ok": True}
+
+@app.get("/api/tcode/{code}/export")
+def export_excel(code: str, req: Request):
+    u = need(req)
+    code = code.upper().strip()
+    if not check_tcode_access(u, code):
+        raise HTTPException(403, "Export denied")
+
+    rows = fetch_all("SELECT * FROM tcode_records WHERE tcode_code=? AND status='active' ORDER BY id ASC", (code,))
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"{code}_DATA"
+
+    keys = ["id", "plant", "created_by_name", "created_at"]
+    dynamic_keys = set()
+    parsed_rows = []
+    for r in rows:
+        try:
+            d = json.loads(r["data"]) if isinstance(r["data"], str) else r["data"]
+        except:
+            d = {}
+        dynamic_keys.update(d.keys())
+        parsed_rows.append((r, d))
+
+    all_cols = keys + sorted(list(dynamic_keys))
+    ws.append(all_cols)
+
+    for r, d in parsed_rows:
+        row_vals = [r["id"], r["plant"], r["created_by_name"], r["created_at"]]
+        for k in sorted(list(dynamic_keys)):
+            row_vals.append(d.get(k, ""))
+        ws.append(row_vals)
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=Export_{code}_{datetime.date.today().strftime('%Y%m%d')}.xlsx"}
+    )
+
+# --- MODERN SLATE & INDIGO UI ---
 HTML_MODERN_UI = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -915,7 +1181,7 @@ HTML_MODERN_UI = """<!DOCTYPE html>
         </div>
         <div>
           <div class="font-bold text-sm tracking-tight text-white flex items-center gap-1.5">
-            Nexus Core <span class="text-[10px] bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono px-1.5 py-0.5 rounded">v3.3</span>
+            Nexus Core <span class="text-[10px] bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono px-1.5 py-0.5 rounded">v3.4</span>
           </div>
         </div>
       </div>
@@ -923,7 +1189,7 @@ HTML_MODERN_UI = """<!DOCTYPE html>
       <!-- GLOBAL JUMP BAR -->
       <div class="relative ml-4">
         <i class="ri-search-line absolute left-3 top-2.5 text-slate-400 text-xs"></i>
-        <input id="cmd_box" placeholder="Jump to module (e.g. TN01, PROD, PLN0, SU01)..." 
+        <input id="cmd_box" placeholder="Jump to module (e.g. TN01, PROD, PLN0, SE93)..." 
                class="bg-slate-800/80 border border-slate-700/80 rounded-lg pl-8 pr-16 py-1.5 text-xs text-slate-100 placeholder:text-slate-500 w-80 focus:outline-none focus:border-indigo-500 transition-all font-mono"
                onkeydown="if(event.key==='Enter') execCmd()">
         <span class="absolute right-2 top-2 text-[10px] bg-slate-700/60 text-slate-400 px-1.5 py-0.5 rounded font-mono">Enter</span>
@@ -952,7 +1218,7 @@ HTML_MODERN_UI = """<!DOCTYPE html>
           <div id="quick_links" class="space-y-0.5">
             <button onclick="openTcode('TN01')" class="w-full text-left px-2.5 py-2 rounded-xl text-xs font-semibold text-white bg-indigo-600/20 border border-indigo-500/30 hover:bg-indigo-600/30 flex items-center justify-between group shadow-sm">
               <span class="flex items-center gap-2"><i class="ri-exchange-box-line text-indigo-400 text-sm"></i> TN01 - Transfer Note</span>
-              <span class="text-[9px] bg-indigo-500 text-white px-1.5 py-0.5 rounded-full font-mono">NEW</span>
+              <span class="text-[9px] bg-indigo-500 text-white px-1.5 py-0.5 rounded-full font-mono">EXCEL</span>
             </button>
             <button onclick="openTcode('PROD')" class="w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:bg-slate-800/80 hover:text-white flex items-center justify-between group mt-1">
               <span class="flex items-center gap-2"><i class="ri-git-commit-line text-indigo-400"></i> PROD - Handover</span>
@@ -969,14 +1235,15 @@ HTML_MODERN_UI = """<!DOCTYPE html>
             <i class="ri-shield-keyhole-line text-xs"></i>
           </div>
           <div class="space-y-0.5">
+            <button onclick="openTcode('SE93')" class="w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-white flex items-center justify-between">
+              <span class="flex items-center gap-2"><i class="ri-apps-2-line text-indigo-400"></i> Module Studio (SE93)</span>
+              <span class="text-[9px] bg-indigo-900 text-indigo-300 px-1 rounded">AUTO</span>
+            </button>
             <button onclick="openTcode('SU01')" class="w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-white flex items-center gap-2">
               <i class="ri-user-settings-line text-slate-400"></i> User Directory (SU01)
             </button>
             <button onclick="openTcode('PFCG')" class="w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-white flex items-center gap-2">
               <i class="ri-shield-user-line text-slate-400"></i> Access Policies (PFCG)
-            </button>
-            <button onclick="openTcode('SE93')" class="w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-white flex items-center gap-2">
-              <i class="ri-apps-2-line text-slate-400"></i> Module Studio (SE93)
             </button>
             <button onclick="openTcode('SPRO')" class="w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-white flex items-center gap-2">
               <i class="ri-building-line text-slate-400"></i> Units & Plants (SPRO)
@@ -1237,7 +1504,186 @@ async function openTcode(code) {
   if (code === 'SPRO') return renderSPRO();
   if (code === 'PFCG') return renderPFCG();
 
-  setMsg(`Standard module ${code} selected`);
+  renderStandardModule(code);
+}
+
+// =========================================================================
+// --- SE93: MODULE STUDIO WITH AUTOMATIC FILE / CODE CREATION ---
+// =========================================================================
+async function renderSE93() {
+  if (!ME.is_master && ME.role !== 'admin') return setMsg("Permission denied", true);
+  const list = await api('/api/se93/list');
+
+  $('#main_screen').innerHTML = `
+    <div class="flex-1 flex flex-col bg-slate-900 p-6 overflow-hidden select-text">
+      <div class="flex items-center justify-between pb-5 border-b border-slate-800 shrink-0">
+        <div>
+          <h2 class="text-lg font-bold text-white tracking-tight">Module Studio (SE93)</h2>
+          <p class="text-xs text-slate-400">One-click auto-create T-Codes from Excel files, code files, or data templates</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <button onclick="showAutoCreateTcodeModal()" class="btn-primary text-xs font-bold px-4 py-2 rounded-xl flex items-center gap-1.5 shadow-lg shadow-indigo-600/30">
+            <i class="ri-file-excel-2-line"></i> + Auto-Create from File
+          </button>
+          <button onclick="renderSE93()" class="btn-secondary text-xs px-3 py-2 rounded-xl">
+            <i class="ri-refresh-line"></i>
+          </button>
+        </div>
+      </div>
+
+      <div class="flex-1 mt-4 bg-slate-950 border border-slate-800 rounded-2xl overflow-auto">
+        <table class="w-full text-left custom-table">
+          <thead><tr><th>T-Code</th><th>Module Name</th><th>Category</th><th>Authorized Depts</th><th>Records</th><th>Status</th><th>Actions</th></tr></thead>
+          <tbody class="text-slate-300">
+            ${list.map(t => `
+              <tr class="border-b border-slate-800/60 hover:bg-slate-900/60">
+                <td class="font-mono font-bold text-indigo-400">${esc(t.code)}</td>
+                <td class="font-medium text-white">${esc(t.title)}</td>
+                <td><span class="font-mono text-xs bg-slate-800 px-2 py-0.5 rounded text-slate-300">${esc(t.module||'ERP')}</span></td>
+                <td>${esc(t.allowed_depts)}</td>
+                <td class="font-mono text-xs font-semibold">${t.record_count}</td>
+                <td><span class="text-[10px] font-semibold px-2 py-0.5 rounded-full ${t.active?'bg-emerald-950 text-emerald-300':'bg-red-950 text-red-300'}">${t.active?'ACTIVE':'DISABLED'}</span></td>
+                <td class="space-x-1">
+                  <button onclick="openTcode('${esc(t.code)}')" class="text-xs text-emerald-400 hover:text-emerald-300 px-2 py-1 font-semibold">Launch</button>
+                  <button onclick="deleteTcode('${esc(t.code)}')" class="text-xs text-red-400 hover:text-red-300 px-2 py-1">Delete</button>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+function showAutoCreateTcodeModal() {
+  openDialog(`
+    <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50 rounded-t-2xl">
+      <div>
+        <h3 class="font-bold text-slate-800 text-sm">One-Click Auto-Create T-Code</h3>
+        <p class="text-xs text-slate-500">Upload your Excel / CSV sheet. All columns, types, schemas, and layouts are generated automatically.</p>
+      </div>
+      <button onclick="closeDialog()"><i class="ri-close-line text-lg"></i></button>
+    </div>
+
+    <div class="p-6 space-y-4">
+      <!-- FILE UPLOAD DROPZONE -->
+      <div class="border-2 border-dashed border-indigo-300 bg-indigo-50/40 hover:bg-indigo-50/80 p-5 rounded-2xl text-center cursor-pointer transition-colors" onclick="$('#auto_file').click()">
+        <i class="ri-file-upload-line text-3xl text-indigo-600 mb-1"></i>
+        <div class="text-xs font-bold text-slate-700">Click to upload Excel / CSV File (.xlsx, .xls, .csv, .json)</div>
+        <div class="text-[11px] text-slate-500 mt-0.5">The system inspects column headers & sample data to configure the entire T-Code.</div>
+        <input type="file" id="auto_file" class="hidden" accept=".xlsx,.xls,.csv,.json" onchange="handleAutoFileChosen(this)">
+        <div id="file_chosen_badge" class="mt-2 text-xs font-mono font-bold text-indigo-700 hidden"></div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="block text-xs font-semibold text-slate-700 mb-1">T-Code Identifier *</label>
+          <input id="auto_c" class="w-full border border-slate-300 rounded-xl p-2.5 text-xs font-mono uppercase" placeholder="e.g. ZEXP01">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-700 mb-1">Module Title / Name *</label>
+          <input id="auto_t" class="w-full border border-slate-300 rounded-xl p-2.5 text-xs" placeholder="e.g. Drum Cable Extrusion Record">
+        </div>
+      </div>
+
+      <div>
+        <label class="block text-xs font-semibold text-slate-700 mb-1">Operational Description</label>
+        <textarea id="auto_d" class="w-full border border-slate-300 rounded-xl p-2.5 text-xs" rows="2" placeholder="e.g. Inspection handover record for plant production lines..."></textarea>
+      </div>
+
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="block text-xs font-semibold text-slate-700 mb-1">Category Code</label>
+          <input id="auto_m" class="w-full border border-slate-300 rounded-xl p-2.5 text-xs uppercase" value="PROD">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-700 mb-1">Permitted Departments</label>
+          <input id="auto_ad" class="w-full border border-slate-300 rounded-xl p-2.5 text-xs" value="Production,Quality Control,Final Testing">
+        </div>
+      </div>
+
+      <div class="flex items-center gap-2 pt-1">
+        <input type="checkbox" id="auto_import_rows" checked class="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500">
+        <label for="auto_import_rows" class="text-xs text-slate-700 font-medium">Also import all data rows present in this file immediately into the new T-Code</label>
+      </div>
+    </div>
+
+    <div class="px-6 py-4 bg-slate-50 border-t border-slate-200 flex justify-end gap-2 rounded-b-2xl">
+      <button onclick="closeDialog()" class="btn-secondary px-4 py-2 rounded-xl text-xs font-semibold">Cancel</button>
+      <button onclick="submitAutoCreateTcode()" class="btn-primary px-5 py-2 rounded-xl text-xs font-bold shadow-md shadow-indigo-600/30">Auto-Generate & Submit</button>
+    </div>`);
+}
+
+function handleAutoFileChosen(input) {
+  const file = input.files[0];
+  if (!file) return;
+
+  const badge = $('#file_chosen_badge');
+  badge.textContent = `Selected: ${file.name} (${Math.round(file.size/1024)} KB)`;
+  badge.classList.remove('hidden');
+
+  // Auto-suggest T-Code and Title based on file name
+  const rawName = file.name.replace(/\\.[^/.]+$/, "").replace(/[^a-zA-Z0-9 ]/g, " ");
+  const cleanTitle = rawName.trim().replace(/\\s+/g, " ");
+
+  if (!$('#auto_t').value.trim()) {
+    $('#auto_t').value = cleanTitle;
+  }
+  if (!$('#auto_c').value.trim()) {
+    const words = cleanTitle.split(" ");
+    let codeGuess = words.map(w => w[0] ? w[0].toUpperCase() : "").join("");
+    if (codeGuess.length < 3) codeGuess = "Z" + cleanTitle.substring(0, 3).toUpperCase();
+    $('#auto_c').value = codeGuess.substring(0, 5) + "1";
+  }
+}
+
+async function submitAutoCreateTcode() {
+  const fileInput = $('#auto_file');
+  if (!fileInput.files.length) {
+    alert("Please select an Excel or CSV file to auto-create the schema.");
+    return;
+  }
+  const code = $('#auto_c').value.trim();
+  const title = $('#auto_t').value.trim();
+  if (!code || !title) {
+    alert("Both T-Code and Module Name are required.");
+    return;
+  }
+
+  const fd = new FormData();
+  fd.append("file", fileInput.files[0]);
+  fd.append("code", code);
+  fd.append("title", title);
+  fd.append("description", $('#auto_d').value.trim());
+  fd.append("module", $('#auto_m').value.trim());
+  fd.append("allowed_depts", $('#auto_ad').value.trim());
+  fd.append("import_sample_data", $('#auto_import_rows').checked ? 1 : 0);
+
+  setMsg("Auto-detecting columns and generating T-Code...");
+  try {
+    const res = await api('/api/se93/auto-create', {method: 'POST', body: fd});
+    closeDialog();
+    renderSE93();
+    loadModules();
+    alert(`Success! T-Code ${res.code} created automatically with ${res.columns_count} auto-detected columns! (${res.imported_count} initial records imported)`);
+    setMsg(`T-Code ${res.code} ready.`);
+  } catch(e) {
+    alert(e);
+    setMsg("Auto-creation failed", true);
+  }
+}
+
+async function deleteTcode(code) {
+  if (!confirm(`Warning: Deleting ${code} permanently wipes all data entries and layouts. Continue?`)) return;
+  const fd = new FormData(); fd.append("code", code);
+  try {
+    await api('/api/se93/delete', {method: 'POST', body: fd});
+    renderSE93();
+    loadModules();
+    setMsg(`Module ${code} removed`);
+  } catch(e) {
+    alert(e);
+  }
 }
 
 // =========================================================================
@@ -1313,7 +1759,7 @@ function switchTN01Tab(tab) {
   renderTN01Main(tab);
 }
 
-// TAB 1: INTERACTIVE EXCEL SPREADSHEET
+// TAB 1: SPREADSHEET
 function renderTN01SheetTab() {
   if (!TN01_HEADERS.length) {
     applyRouteLayout(TN01_ACTIVE_ROUTE, false);
@@ -1339,7 +1785,7 @@ function renderTN01SheetTab() {
       </div>
 
       <div class="flex items-center gap-2 text-slate-400 text-xs">
-        <button onclick="copyGridForExcel()" title="Copy to Clipboard" class="bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-slate-700 px-3 py-1 rounded-lg flex items-center gap-1">
+        <button onclick="copyGridForExcel()" title="Copy to Clipboard" class="bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-slate-700 px-3 py-1 rounded-lg flex items-center gap-1 font-semibold">
           <i class="ri-file-copy-line"></i> Copy for Excel
         </button>
         <span class="text-[11px] bg-slate-800 border border-slate-700 px-2 py-0.5 rounded text-slate-400 font-mono">
@@ -1349,9 +1795,7 @@ function renderTN01SheetTab() {
     </div>
 
     <!-- EXCEL GRID TABLE CONTAINER -->
-    <div id="grid_table_container" class="flex-1 overflow-auto bg-slate-950 p-2 select-text" tabindex="0">
-      <!-- Grid table rendered dynamically -->
-    </div>
+    <div id="grid_table_container" class="flex-1 overflow-auto bg-slate-950 p-2 select-text" tabindex="0"></div>
 
     <div class="p-2 bg-slate-950 border-t border-slate-800 text-slate-400 text-[11px] flex justify-between items-center font-mono shrink-0">
       <span id="sheet_count_lbl">0 Batches / Rows loaded</span>
@@ -1371,7 +1815,7 @@ function applyRouteLayout(routeKey, resetData = true) {
     TN01_ROWS = [];
     for (let i = 1; i <= 8; i++) {
       const row = new Array(TN01_HEADERS.length).fill("");
-      row[0] = i; // Auto Sr. No
+      row[0] = i;
       TN01_ROWS.push(row);
     }
   }
@@ -1411,7 +1855,7 @@ function renderGridTable() {
 }
 
 function updateGridCell(r, c, val) {
-  if (c === 0) return; // Keep Sr No locked
+  if (c === 0) return;
   if (TN01_ROWS[r][c] !== val.trim()) {
     pushUndo();
     TN01_ROWS[r][c] = val.trim();
@@ -1466,7 +1910,6 @@ function clearGrid() {
   renderGridTable();
 }
 
-// DIRECT EXCEL PASTE HANDLER (TSV parser)
 function setupPasteHandler() {
   const container = $('#grid_table_container');
   if (!container) return;
@@ -1480,14 +1923,13 @@ function setupPasteHandler() {
     const lines = clipData.replace(/\\r\\n/g, '\\n').replace(/\\r/g, '\\n').split('\\n');
     let startR = TN01_ACTIVE_CELL.r || 0;
     let startC = TN01_ACTIVE_CELL.c || 1;
-    if (startC === 0) startC = 1; // Don't paste over Sr No
+    if (startC === 0) startC = 1;
 
     lines.forEach((line, lIdx) => {
-      if (!line && lIdx === lines.length - 1) return; // skip trailing empty line
+      if (!line && lIdx === lines.length - 1) return;
       const cells = line.split('\\t');
       const targetR = startR + lIdx;
 
-      // Expand rows if paste exceeds current row count
       while (TN01_ROWS.length <= targetR) {
         const nr = new Array(TN01_HEADERS.length).fill("");
         nr[0] = TN01_ROWS.length + 1;
@@ -1502,7 +1944,6 @@ function setupPasteHandler() {
       });
     });
 
-    // Re-verify sequential Sr Numbers
     TN01_ROWS.forEach((r, idx) => { r[0] = idx + 1; });
     renderGridTable();
     setMsg("Excel data pasted successfully into sheet.");
@@ -1515,12 +1956,10 @@ function copyGridForExcel() {
     tsv += r.join('\\t') + '\\n';
   });
   navigator.clipboard.writeText(tsv).then(() => {
-    setMsg("Table copied to clipboard! You can now paste directly into Microsoft Excel.");
     alert("Copied! Open Microsoft Excel and press Ctrl+V to paste.");
   });
 }
 
-// SEND WORKFLOW: PRINT PREVIEW & DISPATCH MODAL
 async function openSendModal() {
   const activeRoute = TN01_ROUTES[TN01_ACTIVE_ROUTE];
   const filledRows = TN01_ROWS.filter(r => r.slice(1).some(c => String(c).trim() !== ''));
@@ -1569,9 +2008,7 @@ async function openSendModal() {
 
         <div>
           <label class="block text-xs font-semibold text-slate-700 mb-1">Assigned Receiver</label>
-          <select id="send_user" class="w-full border border-slate-300 rounded-xl p-2.5 text-xs bg-white font-medium text-indigo-900">
-            <!-- Dynamically populated -->
-          </select>
+          <select id="send_user" class="w-full border border-slate-300 rounded-xl p-2.5 text-xs bg-white font-medium text-indigo-900"></select>
         </div>
       </div>
 
@@ -1588,7 +2025,6 @@ async function openSendModal() {
         <textarea id="send_remarks" class="w-full border border-slate-300 rounded-xl p-2.5 text-xs" rows="2" placeholder="e.g. Urgent dispatch for 11kV core test, complete handover by 2 PM..."></textarea>
       </div>
 
-      <!-- PRINT PREVIEW TABLE -->
       <div>
         <div class="text-xs font-bold text-slate-700 mb-1">Print Preview Data Summary:</div>
         <div class="max-h-40 overflow-auto border border-slate-200 rounded-xl bg-slate-50">
@@ -1611,7 +2047,7 @@ async function openSendModal() {
     </div>
 
     <div class="px-6 py-4 bg-slate-50 border-t border-slate-200 flex justify-between items-center rounded-b-2xl">
-      <div class="text-xs text-slate-500 font-medium">Auto-dispatches to recipient's login inbox immediately</div>
+      <div class="text-xs text-slate-500 font-medium">Dispatches immediately to recipient's login inbox</div>
       <div class="flex gap-2">
         <button onclick="closeDialog()" class="btn-secondary px-4 py-2 rounded-xl text-xs font-semibold">Cancel</button>
         <button onclick="submitSendNote()" class="btn-primary px-5 py-2 rounded-xl text-xs font-bold shadow-md shadow-indigo-600/30">Confirm & Dispatch</button>
@@ -1663,7 +2099,7 @@ async function submitSendNote() {
       body: JSON.stringify(payload)
     });
     closeDialog();
-    alert(`Transfer Note Dispatched Successfully!\nGenerated Document #: ${res.note_no}\nTotal Batches: ${res.entries}`);
+    alert(`Transfer Note Dispatched!\nDocument #: ${res.note_no}\nBatches: ${res.entries}`);
     switchTN01Tab('history');
   } catch(e) {
     alert(e);
@@ -1722,14 +2158,13 @@ async function renderTN01ReceiveTab() {
 async function acknowledgeNote(nid) {
   try {
     await api(`/api/tn01/receive/${nid}`, {method: 'POST'});
-    setMsg("Transfer note received & acknowledged.");
+    setMsg("Transfer note acknowledged.");
     renderTN01ReceiveTab();
   } catch(e) {
     alert(e);
   }
 }
 
-// VIEW & COPY FROM RECEIVED NOTE MODAL
 async function viewTransferNote(nid) {
   const note = await api(`/api/tn01/note/${nid}`);
   openDialog(`
@@ -1752,11 +2187,11 @@ async function viewTransferNote(nid) {
       <div class="flex justify-between items-center">
         <span class="text-xs font-bold text-slate-700">Batch Rows (${note.entry_count} Entries):</span>
         <div class="flex gap-2">
-          <!-- COPY ALL FOR EXCEL -->
+          <!-- COPY FOR EXCEL -->
           <button onclick="copyReceivedForExcel(${nid})" class="btn-secondary text-xs px-3 py-1.5 rounded-lg flex items-center gap-1 text-emerald-700 font-semibold border-emerald-300">
             <i class="ri-file-copy-line"></i> Copy for Excel
           </button>
-          <!-- LOAD DIRECTLY INTO WORKSPACE -->
+          <!-- LOAD INTO WORKSPACE -->
           <button onclick="loadNoteIntoWorkspace(${nid})" class="btn-primary text-xs px-3 py-1.5 rounded-lg flex items-center gap-1 font-semibold">
             <i class="ri-download-cloud-2-line"></i> Load into My Workspace
           </button>
@@ -1815,7 +2250,7 @@ async function loadNoteIntoWorkspace(nid) {
   setMsg(`Loaded note ${note.note_no} into your active Excel grid workspace.`);
 }
 
-// TAB 3: TRANSFER HISTORY & AUDIT TRAIL
+// TAB 3: TRANSFER HISTORY
 async function renderTN01HistoryTab() {
   const p = $('#hist_p') ? $('#hist_p').value : '';
   const r = $('#hist_r') ? $('#hist_r').value : '';
@@ -1825,7 +2260,6 @@ async function renderTN01HistoryTab() {
 
   $('#tn01_content').innerHTML = `
     <div class="p-6 flex-1 flex flex-col overflow-hidden">
-      <!-- FILTERS -->
       <div class="bg-slate-950 border border-slate-800 p-3.5 rounded-2xl flex items-center justify-between gap-3 shrink-0 text-xs">
         <div class="flex items-center gap-2 flex-1">
           <select id="hist_p" onchange="renderTN01HistoryTab()" class="bg-slate-800 border border-slate-700 text-slate-200 rounded-xl px-3 py-1.5">
@@ -1856,7 +2290,7 @@ async function renderTN01HistoryTab() {
             </tr>
           </thead>
           <tbody class="text-slate-300">
-            ${!history.length ? `<tr><td colspan="9" class="text-center py-12 text-slate-500">No transfer history found matching filters.</td></tr>` : ''}
+            ${!history.length ? `<tr><td colspan="9" class="text-center py-12 text-slate-500">No transfer history found.</td></tr>` : ''}
             ${history.map(h => `
               <tr class="border-b border-slate-800/60 hover:bg-slate-900/60">
                 <td class="font-mono font-bold text-indigo-400">${esc(h.note_no)}</td>
@@ -1883,7 +2317,7 @@ async function renderTN01HistoryTab() {
     </div>`;
 }
 
-// TAB 4: FORMAT STUDIO (ADMIN ONLY)
+// TAB 4: FORMAT STUDIO (ADMIN)
 async function renderTN01FormatTab() {
   const layouts = await api('/api/tn01/layouts');
   $('#tn01_content').innerHTML = `
@@ -1978,7 +2412,238 @@ async function deleteLayoutTN01(lid) {
   renderTN01FormatTab();
 }
 
-// DIALOG MODAL HELPERS
+// STANDARD MODULE ALV VIEW (PROD, GCH0, AUTO-CREATED MODULES)
+async function renderStandardModule(code) {
+  const layouts = await api(`/api/tcode/${code}/layouts`);
+  const activeLayout = layouts.find(l => l.is_default) || layouts[0];
+  const fields = activeLayout ? activeLayout.fields : [];
+  const recs = await api(`/api/tcode/${code}/records`);
+
+  $('#main_screen').innerHTML = `
+    <div class="flex-1 flex flex-col bg-slate-900 overflow-hidden select-text">
+      <div class="p-4 border-b border-slate-800 flex items-center justify-between shrink-0">
+        <div class="flex items-center gap-3">
+          <span class="font-mono font-bold text-xs bg-indigo-500/10 text-indigo-400 border border-indigo-500/30 px-2 py-0.5 rounded-lg">${code}</span>
+          <h2 class="text-base font-bold text-white">${activeLayout ? esc(activeLayout.title) : code}</h2>
+          <div class="h-5 w-[1px] bg-slate-800 mx-2"></div>
+          <button onclick="showStandardRecordModal('${code}')" class="btn-primary text-xs font-semibold px-3 py-1.5 rounded-xl flex items-center gap-1.5 shadow-md shadow-indigo-600/30">
+            <i class="ri-add-line"></i> New Entry
+          </button>
+        </div>
+        <div class="flex items-center gap-2">
+          <a href="/api/tcode/${code}/export" class="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold px-2.5 py-1.5 border border-slate-700 rounded-xl flex items-center gap-1">
+            <i class="ri-download-2-line"></i> Export ALV
+          </a>
+          <button onclick="renderStandardModule('${code}')" class="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold p-2 border border-slate-700 rounded-xl">
+            <i class="ri-refresh-line"></i>
+          </button>
+        </div>
+      </div>
+
+      <div class="flex-1 bg-slate-950 border-t border-slate-800 overflow-auto">
+        <table class="w-full text-left custom-table">
+          <thead>
+            <tr>
+              <th style="width:60px;">Doc #</th>
+              <th style="width:90px;">Facility</th>
+              ${fields.map(f => `<th>${esc(f.label)}</th>`).join('')}
+              <th style="width:130px;">Logged By</th>
+              <th style="width:140px;">Timestamp</th>
+              <th style="width:80px;">Action</th>
+            </tr>
+          </thead>
+          <tbody class="text-slate-300">
+            ${!recs.length ? `<tr><td colspan="${fields.length + 5}" class="text-center py-12 text-slate-500">No active records found.</td></tr>` : ''}
+            ${recs.map(r => `
+              <tr class="border-b border-slate-800/60 hover:bg-slate-900/60">
+                <td class="font-mono text-slate-500 font-semibold">${r.id}</td>
+                <td><span class="font-mono text-xs bg-slate-800 border border-slate-700 px-2 py-0.5 rounded text-indigo-300">${esc(r.plant || '1000')}</span></td>
+                ${fields.map(f => `<td>${esc(r.data[f.key] || '')}</td>`).join('')}
+                <td class="text-xs text-slate-400 font-medium">${esc(r.created_by_name || r.created_by)}</td>
+                <td class="text-xs text-slate-500 font-mono">${esc(r.created_at)}</td>
+                <td>
+                  <button onclick="deleteStandardRecord('${code}', ${r.id})" class="text-xs text-red-400 hover:text-red-300">Del</button>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+function showStandardRecordModal(code) {
+  api(`/api/tcode/${code}/layouts`).then(layouts => {
+    const activeLayout = layouts.find(l => l.is_default) || layouts[0];
+    const fields = activeLayout ? activeLayout.fields : [];
+    const myPlant = (ME.plants && ME.plants[0]) ? ME.plants[0] : "1000";
+
+    openDialog(`
+      <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50 rounded-t-2xl">
+        <h3 class="font-bold text-slate-800 text-sm">Post Entry: ${code}</h3>
+        <button onclick="closeDialog()"><i class="ri-close-line text-lg"></i></button>
+      </div>
+      <div class="p-6 space-y-4">
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1">Facility Code</label>
+          <input id="std_f__plant" class="w-full border border-slate-300 rounded-xl p-2.5 text-xs font-mono" value="${esc(myPlant)}">
+        </div>
+        <div class="grid grid-cols-2 gap-4">
+          ${fields.map(f => `
+            <div class="col-span-${f.width||1}">
+              <label class="block text-xs font-semibold text-slate-600 mb-1">${esc(f.label)}</label>
+              ${f.type==='textarea' ?
+                `<textarea id="std_f_${f.key}" class="w-full border border-slate-300 rounded-xl p-2.5 text-xs" rows="2"></textarea>` :
+                `<input type="${f.type==='number'?'number':(f.type==='date'?'date':'text')}" id="std_f_${f.key}" class="w-full border border-slate-300 rounded-xl p-2.5 text-xs">`
+              }
+            </div>
+          `).join('')}
+        </div>
+      </div>
+      <div class="px-6 py-4 bg-slate-50 border-t border-slate-200 flex justify-end gap-2 rounded-b-2xl">
+        <button onclick="closeDialog()" class="btn-secondary px-4 py-2 rounded-xl text-xs font-semibold">Cancel</button>
+        <button onclick="submitStandardRecord('${code}')" class="btn-primary px-4 py-2 rounded-xl text-xs font-semibold">Save Entry</button>
+      </div>`);
+  });
+}
+
+async function submitStandardRecord(code) {
+  const layouts = await api(`/api/tcode/${code}/layouts`);
+  const activeLayout = layouts.find(l => l.is_default) || layouts[0];
+  const fields = activeLayout ? activeLayout.fields : [];
+
+  const payload = { _plant: $('#std_f__plant').value };
+  for (let f of fields) {
+    const el = $('#std_f_' + f.key);
+    payload[f.key] = el ? el.value.trim() : "";
+  }
+
+  try {
+    await api(`/api/tcode/${code}/records`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    closeDialog();
+    renderStandardModule(code);
+    setMsg("Entry recorded");
+  } catch(e) {
+    alert(e);
+  }
+}
+
+async function deleteStandardRecord(code, rid) {
+  if (!confirm(`Delete entry #${rid}?`)) return;
+  try {
+    await api(`/api/tcode/${code}/records/${rid}`, {method: 'DELETE'});
+    renderStandardModule(code);
+    setMsg("Record deleted");
+  } catch(e) {
+    alert(e);
+  }
+}
+
+// SU01, SPRO, PFCG IMPLEMENTATIONS
+async function renderSU01() {
+  if (!ME.is_master && ME.role !== 'admin') return setMsg("Permission denied", true);
+  const users = await api('/api/su01/users');
+
+  $('#main_screen').innerHTML = `
+    <div class="flex-1 flex flex-col bg-slate-900 p-6 overflow-hidden select-text">
+      <div class="flex items-center justify-between pb-5 border-b border-slate-800 shrink-0">
+        <div>
+          <h2 class="text-lg font-bold text-white tracking-tight">User Directory & IAM (SU01)</h2>
+          <p class="text-xs text-slate-400">Manage user credentials, plant access, and roles</p>
+        </div>
+      </div>
+      <div class="flex-1 mt-4 bg-slate-950 border border-slate-800 rounded-2xl overflow-auto">
+        <table class="w-full text-left custom-table">
+          <thead><tr><th>Username</th><th>Full Name</th><th>Role</th><th>Department</th><th>Facilities</th><th>Status</th></tr></thead>
+          <tbody class="text-slate-300">
+            ${users.map(u => `
+              <tr class="border-b border-slate-800/60">
+                <td class="font-mono font-bold text-indigo-400">${esc(u.username)}</td>
+                <td class="font-medium text-white">${esc(u.full_name)}</td>
+                <td><span class="text-[10px] font-semibold px-2 py-0.5 rounded-full ${u.role==='master'?'bg-red-950 text-red-300 border border-red-800':(u.role==='admin'?'bg-amber-950 text-amber-300 border border-amber-800':'bg-slate-800 text-slate-300')}">${u.role.toUpperCase()}</span></td>
+                <td>${esc(u.department)}</td>
+                <td class="font-mono text-xs">${esc(u.plants || 'ALL')}</td>
+                <td><span class="text-[10px] font-semibold px-2 py-0.5 rounded-full ${u.status==='approved'?'bg-emerald-950 text-emerald-300 border border-emerald-800':'bg-red-950 text-red-300 border border-red-800'}">${u.status}</span></td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+async function renderSPRO() {
+  if (!ME.is_master) return setMsg("Restricted to Master Administrators", true);
+  const data = await api('/api/spro/overview');
+  $('#main_screen').innerHTML = `
+    <div class="flex-1 flex flex-col bg-slate-900 p-6 overflow-hidden select-text">
+      <div class="pb-5 border-b border-slate-800 shrink-0">
+        <h2 class="text-lg font-bold text-white tracking-tight">Enterprise Organization Units (SPRO)</h2>
+      </div>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6 flex-1 mt-4 overflow-auto">
+        <div class="bg-slate-950 border border-slate-800 rounded-2xl p-4">
+          <h4 class="font-bold text-white mb-2 text-xs uppercase tracking-wider">Manufacturing Plants</h4>
+          <div class="space-y-1">
+            ${data.plants.map(p => `<div class="p-2 border border-slate-800 rounded-xl text-xs flex justify-between"><b>${esc(p.code)}</b> <span>${esc(p.name)}</span></div>`).join('')}
+          </div>
+        </div>
+        <div class="bg-slate-950 border border-slate-800 rounded-2xl p-4">
+          <h4 class="font-bold text-white mb-2 text-xs uppercase tracking-wider">Departments</h4>
+          <div class="space-y-1">
+            ${data.departments.map(d => `<div class="p-2 border border-slate-800 rounded-xl text-xs flex justify-between"><b>${esc(d.name)}</b> <span class="text-emerald-400">Active</span></div>`).join('')}
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function renderPFCG() {
+  if (!ME.is_master && ME.role !== 'admin') return setMsg("Permission denied", true);
+  const m = await api('/api/pfcg/matrix');
+  $('#main_screen').innerHTML = `
+    <div class="flex-1 flex flex-col bg-slate-900 p-6 overflow-hidden select-text">
+      <div class="flex items-center justify-between pb-5 border-b border-slate-800 shrink-0">
+        <h2 class="text-lg font-bold text-white tracking-tight">Access Control & Permissions (PFCG)</h2>
+        <div class="flex items-center gap-2">
+          <select id="pfcg_u" class="bg-slate-800 border border-slate-700 text-xs rounded-xl px-3 py-2 text-white">
+            ${m.users.map(u=>`<option value="${esc(u.username)}">${esc(u.username)} (${esc(u.full_name)})</option>`).join('')}
+          </select>
+          <select id="pfcg_t" class="bg-slate-800 border border-slate-700 text-xs rounded-xl px-3 py-2 text-white">
+            ${m.tcodes.map(t=>`<option value="${esc(t.code)}">${esc(t.code)} - ${esc(t.title)}</option>`).join('')}
+          </select>
+          <button onclick="grantAccess()" class="btn-primary text-xs font-semibold px-3 py-2 rounded-xl">+ Grant</button>
+        </div>
+      </div>
+      <div class="flex-1 mt-4 bg-slate-950 border border-slate-800 rounded-2xl overflow-auto">
+        <table class="w-full text-left custom-table">
+          <thead><tr><th>User</th><th>Permitted Module</th><th>Approved By</th><th>Granted At</th></tr></thead>
+          <tbody class="text-slate-300">
+            ${m.grants.map(g => `
+              <tr class="border-b border-slate-800/60">
+                <td class="font-mono font-bold text-indigo-400">${esc(g.username)}</td>
+                <td class="font-mono font-bold text-white">${esc(g.tcode_code)}</td>
+                <td>${esc(g.granted_by)}</td>
+                <td class="text-slate-400 text-xs">${esc(g.granted_at)}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+async function grantAccess() {
+  const u = $('#pfcg_u').value, t = $('#pfcg_t').value;
+  const fd = new FormData(); fd.append("username", u); fd.append("tcode", t);
+  await api('/api/pfcg/grant', {method: 'POST', body: fd});
+  renderPFCG();
+  setMsg("Permission granted");
+}
+
 function openDialog(content) {
   $('#app_dialog_body').innerHTML = content;
   $('#app_dialog').classList.remove('hidden');
@@ -1989,7 +2654,6 @@ function closeDialog() {
   $('#app_dialog_body').innerHTML = '';
 }
 
-// ENTRYPOINT
 initSession();
 </script>
 </body>
@@ -2002,7 +2666,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "3.3.0"}
+    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "3.4.0"}
 
 if __name__ == "__main__":
     import uvicorn
