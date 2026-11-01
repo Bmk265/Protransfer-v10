@@ -1,11 +1,12 @@
-import io, json, sqlite3, secrets, datetime, os
+import io, json, sqlite3, secrets, datetime, os, html
 from pathlib import Path
 import bcrypt
-from fastapi import FastAPI, Request, Response, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, Request, Response, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import load_workbook, Workbook
 
+# --- DATABASE ENGINE SETUP ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
 USE_PG = bool(DATABASE_URL and DATABASE_URL.startswith("postgres"))
 if USE_PG:
@@ -14,139 +15,155 @@ if USE_PG:
     if DATABASE_URL.startswith("postgres://"):
         DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-DB_PATH = Path(__file__).parent / "protransfer.db"
+DB_PATH = Path(__file__).parent / "sap_protransfer.db"
 
 def get_conn():
     if USE_PG:
         return psycopg2.connect(DATABASE_URL, sslmode='require')
     else:
-        con = sqlite3.connect(DB_PATH)
+        con = sqlite3.connect(DB_PATH, check_same_thread=False)
         con.row_factory = sqlite3.Row
         return con
 
-def q(sql):
+def q(sql: str) -> str:
     return sql.replace("?", "%s") if USE_PG else sql
 
-def fetch_all(sql, params=()):
+def fetch_all(sql: str, params=()):
     conn = get_conn()
     try:
         if USE_PG:
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute(q(sql), params)
-            return cur.fetchall()
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(q(sql), params)
+                return cur.fetchall()
         else:
             return [dict(r) for r in conn.execute(sql, params).fetchall()]
     finally:
         conn.close()
 
-def fetch_one(sql, params=()):
+def fetch_one(sql: str, params=()):
     conn = get_conn()
     try:
         if USE_PG:
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute(q(sql), params)
-            return cur.fetchone()
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(q(sql), params)
+                return cur.fetchone()
         else:
             r = conn.execute(sql, params).fetchone()
             return dict(r) if r else None
     finally:
         conn.close()
 
-def exec_write(sql, params=()):
+def exec_write(sql: str, params=()):
     conn = get_conn()
     try:
         if USE_PG:
-            cur = conn.cursor()
-            cur.execute(q(sql), params)
+            with conn.cursor() as cur:
+                cur.execute(q(sql), params)
+            conn.commit()
         else:
             conn.execute(sql, params)
-        conn.commit()
+            conn.commit()
     finally:
         conn.close()
 
-def init_db():
+def exec_script(sql_script: str):
     conn = get_conn()
-    cur = conn.cursor()
+    try:
+        if USE_PG:
+            with conn.cursor() as cur:
+                cur.execute(sql_script)
+            conn.commit()
+        else:
+            conn.executescript(sql_script)
+            conn.commit()
+    finally:
+        conn.close()
+
+def now():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# --- INITIALIZATION & SEEDING ---
+def init_db():
     if USE_PG:
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS users(username TEXT PRIMARY KEY,password_hash TEXT,full_name TEXT,role TEXT,department TEXT,sub_department TEXT,plant TEXT,status TEXT DEFAULT 'pending',created_at TEXT,updated_at TEXT);
-        CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,username TEXT,expires TEXT);
-        CREATE TABLE IF NOT EXISTS departments(name TEXT PRIMARY KEY,active INT DEFAULT 1,created_at TEXT);
-        CREATE TABLE IF NOT EXISTS plants(name TEXT PRIMARY KEY,active INT DEFAULT 1,created_at TEXT);
-        CREATE TABLE IF NOT EXISTS org(id INT PRIMARY KEY,name TEXT);
-        CREATE TABLE IF NOT EXISTS tcodes(code TEXT PRIMARY KEY,title TEXT,description TEXT,color TEXT,icon TEXT,allowed_depts TEXT,active INT DEFAULT 1,created_at TEXT,updated_at TEXT,created_by TEXT);
-        CREATE TABLE IF NOT EXISTS tcode_schemas(code TEXT PRIMARY KEY,fields TEXT,layout TEXT,updated_at TEXT,updated_by TEXT);
-        CREATE TABLE IF NOT EXISTS tcode_records(id SERIAL PRIMARY KEY,tcode_code TEXT,data TEXT,status TEXT DEFAULT 'active',created_by TEXT,created_by_name TEXT,created_at TEXT,updated_at TEXT);
-        CREATE TABLE IF NOT EXISTS tcode_layouts(id SERIAL PRIMARY KEY,tcode_code TEXT,layout_code TEXT UNIQUE,name TEXT,title TEXT,is_default INT DEFAULT 0,fields TEXT,layout_config TEXT,description TEXT,created_by TEXT,created_by_name TEXT,created_at TEXT,updated_at TEXT);
-        CREATE TABLE IF NOT EXISTS access_grants(id SERIAL PRIMARY KEY,username TEXT,tcode_code TEXT,layout_code TEXT,granted_by TEXT,granted_at TEXT,UNIQUE(username,tcode_code,layout_code));
+        exec_script('''
+        CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password_hash TEXT, full_name TEXT, role TEXT, department TEXT, plants TEXT DEFAULT '', status TEXT DEFAULT 'approved', created_at TEXT, updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, username TEXT, expires TEXT);
+        CREATE TABLE IF NOT EXISTS departments (name TEXT PRIMARY KEY, active INT DEFAULT 1, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS plants (code TEXT PRIMARY KEY, name TEXT, active INT DEFAULT 1, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS org (id INT PRIMARY KEY, name TEXT, system_id TEXT, client TEXT);
+        CREATE TABLE IF NOT EXISTS tcodes (code TEXT PRIMARY KEY, title TEXT, description TEXT, module TEXT, allowed_depts TEXT, active INT DEFAULT 1, created_at TEXT, updated_at TEXT, created_by TEXT);
+        CREATE TABLE IF NOT EXISTS tcode_schemas (code TEXT PRIMARY KEY, fields TEXT, layout TEXT, updated_at TEXT, updated_by TEXT);
+        CREATE TABLE IF NOT EXISTS tcode_records (id SERIAL PRIMARY KEY, tcode_code TEXT, plant TEXT DEFAULT '', data TEXT, status TEXT DEFAULT 'active', created_by TEXT, created_by_name TEXT, created_at TEXT, updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS tcode_layouts (id SERIAL PRIMARY KEY, tcode_code TEXT, layout_code TEXT UNIQUE, name TEXT, title TEXT, is_default INT DEFAULT 0, fields TEXT, layout_config TEXT, description TEXT, created_by TEXT, created_by_name TEXT, created_at TEXT, updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS access_grants (id SERIAL PRIMARY KEY, username TEXT, tcode_code TEXT, granted_by TEXT, granted_at TEXT, UNIQUE(username, tcode_code));
         ''')
     else:
-        cur.executescript('''
-        CREATE TABLE IF NOT EXISTS users(username TEXT PRIMARY KEY,password_hash TEXT,full_name TEXT,role TEXT,department TEXT,sub_department TEXT,plant TEXT,status TEXT DEFAULT 'pending',created_at TEXT,updated_at TEXT);
-        CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,username TEXT,expires TEXT);
-        CREATE TABLE IF NOT EXISTS departments(name TEXT PRIMARY KEY,active INT DEFAULT 1,created_at TEXT);
-        CREATE TABLE IF NOT EXISTS plants(name TEXT PRIMARY KEY,active INT DEFAULT 1,created_at TEXT);
-        CREATE TABLE IF NOT EXISTS org(id INT PRIMARY KEY,name TEXT DEFAULT 'TCL Pvt Ltd');
-        CREATE TABLE IF NOT EXISTS tcodes(code TEXT PRIMARY KEY,title TEXT,description TEXT,color TEXT,icon TEXT,allowed_depts TEXT,active INT DEFAULT 1,created_at TEXT,updated_at TEXT,created_by TEXT);
-        CREATE TABLE IF NOT EXISTS tcode_schemas(code TEXT PRIMARY KEY,fields TEXT,layout TEXT,updated_at TEXT,updated_by TEXT);
-        CREATE TABLE IF NOT EXISTS tcode_records(id INTEGER PRIMARY KEY AUTOINCREMENT,tcode_code TEXT,data TEXT,status TEXT DEFAULT 'active',created_by TEXT,created_by_name TEXT,created_at TEXT,updated_at TEXT);
-        CREATE TABLE IF NOT EXISTS tcode_layouts(id INTEGER PRIMARY KEY AUTOINCREMENT,tcode_code TEXT,layout_code TEXT UNIQUE,name TEXT,title TEXT,is_default INT DEFAULT 0,fields TEXT,layout_config TEXT,description TEXT,created_by TEXT,created_by_name TEXT,created_at TEXT,updated_at TEXT);
-        CREATE TABLE IF NOT EXISTS access_grants(id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT,tcode_code TEXT,layout_code TEXT,granted_by TEXT,granted_at TEXT,UNIQUE(username,tcode_code,layout_code));
+        exec_script('''
+        CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password_hash TEXT, full_name TEXT, role TEXT, department TEXT, plants TEXT DEFAULT '', status TEXT DEFAULT 'approved', created_at TEXT, updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, username TEXT, expires TEXT);
+        CREATE TABLE IF NOT EXISTS departments (name TEXT PRIMARY KEY, active INT DEFAULT 1, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS plants (code TEXT PRIMARY KEY, name TEXT, active INT DEFAULT 1, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS org (id INT PRIMARY KEY, name TEXT, system_id TEXT, client TEXT);
+        CREATE TABLE IF NOT EXISTS tcodes (code TEXT PRIMARY KEY, title TEXT, description TEXT, module TEXT, allowed_depts TEXT, active INT DEFAULT 1, created_at TEXT, updated_at TEXT, created_by TEXT);
+        CREATE TABLE IF NOT EXISTS tcode_schemas (code TEXT PRIMARY KEY, fields TEXT, layout TEXT, updated_at TEXT, updated_by TEXT);
+        CREATE TABLE IF NOT EXISTS tcode_records (id INTEGER PRIMARY KEY AUTOINCREMENT, tcode_code TEXT, plant TEXT DEFAULT '', data TEXT, status TEXT DEFAULT 'active', created_by TEXT, created_by_name TEXT, created_at TEXT, updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS tcode_layouts (id INTEGER PRIMARY KEY AUTOINCREMENT, tcode_code TEXT, layout_code TEXT UNIQUE, name TEXT, title TEXT, is_default INT DEFAULT 0, fields TEXT, layout_config TEXT, description TEXT, created_by TEXT, created_by_name TEXT, created_at TEXT, updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS access_grants (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, tcode_code TEXT, granted_by TEXT, granted_at TEXT, UNIQUE(username, tcode_code));
         ''')
-    conn.commit()
-    now_ = datetime.datetime.now().isoformat()
 
-    def safe(sql, vals):
-        try:
-            if USE_PG:
-                sql2 = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO").replace("?", "%s")
-                if "ON CONFLICT" not in sql2:
-                    if "departments" in sql2:
-                        sql2 += " ON CONFLICT (name) DO NOTHING"
-                    elif "plants" in sql2:
-                        sql2 += " ON CONFLICT (name) DO NOTHING"
-                    elif "org" in sql2:
-                        sql2 += " ON CONFLICT (id) DO NOTHING"
-                    elif "tcodes" in sql2:
-                        sql2 += " ON CONFLICT (code) DO NOTHING"
-                    elif "users" in sql2:
-                        sql2 += " ON CONFLICT (username) DO NOTHING"
-                cur.execute(sql2, vals)
-            else:
-                cur.execute(sql, vals)
-            conn.commit()
-        except Exception as e:
-            print("safe error", e)
+    cur_time = now()
+    # Seed Master Org info
+    if not fetch_one("SELECT 1 FROM org WHERE id=1"):
+        exec_write("INSERT INTO org VALUES (?,?,?,?)", (1, "Thermocables Enterprise Group", "PRD", "100"))
 
-    safe("INSERT OR IGNORE INTO departments VALUES(?,?,?)", ("Production", 1, now_))
-    safe("INSERT OR IGNORE INTO departments VALUES(?,?,?)", ("Quality Control", 1, now_))
-    safe("INSERT OR IGNORE INTO departments VALUES(?,?,?)", ("Final QC", 1, now_))
-    safe("INSERT OR IGNORE INTO departments VALUES(?,?,?)", ("Commercial", 1, now_))
-    safe("INSERT OR IGNORE INTO departments VALUES(?,?,?)", ("Planning", 1, now_))
-    safe("INSERT OR IGNORE INTO departments VALUES(?,?,?)", ("Store", 1, now_))
-    safe("INSERT OR IGNORE INTO plants VALUES(?,?,?)", ("Gooty", 1, now_))
-    safe("INSERT OR IGNORE INTO plants VALUES(?,?,?)", ("Plant 1400", 1, now_))
-    safe("INSERT OR IGNORE INTO plants VALUES(?,?,?)", ("HYD", 1, now_))
-    safe("INSERT OR IGNORE INTO plants VALUES(?,?,?)", ("TCL Corporate", 1, now_))
-    safe("INSERT OR IGNORE INTO org VALUES(?,?)", (1, "Thermocables Limited"))
-    safe("INSERT OR IGNORE INTO tcodes VALUES(?,?,?,?,?,?,?,?,?,?)", ("GCH0", "Green Card Records", "Green card inspection", "#22c55e", "ri-checkbox-circle-line", "Quality Control,Production", 1, now_, now_, "system"))
-    safe("INSERT OR IGNORE INTO tcodes VALUES(?,?,?,?,?,?,?,?,?,?)", ("NCR0", "Non Conformance Records", "Quality issues NCR", "#ef4444", "ri-error-warning-line", "Quality Control,Final QC,Production", 1, now_, now_, "system"))
-    safe("INSERT OR IGNORE INTO tcodes VALUES(?,?,?,?,?,?,?,?,?,?)", ("PLN0", "Planning Details", "Master planning & Scheduling", "#06b6d4", "ri-calendar-check-line", "Planning,Production,Commercial,Quality Control,Final QC,Store", 1, now_, now_, "system"))
-    safe("INSERT OR IGNORE INTO tcodes VALUES(?,?,?,?,?,?,?,?,?,?)", ("PROD", "Production Handover", "Outer Sheathing Handover", "#3b82f6", "ri-send-plane-line", "Production,Quality Control,Final QC", 1, now_, now_, "system"))
-    safe("INSERT OR IGNORE INTO tcodes VALUES(?,?,?,?,?,?,?,?,?,?)", ("QCH0", "QC Handover", "QC to Final QC", "#f59e0b", "ri-shield-check-line", "Quality Control,Final QC", 1, now_, now_, "system"))
-    safe("INSERT OR IGNORE INTO tcodes VALUES(?,?,?,?,?,?,?,?,?,?)", ("STD0", "Store Transfer", "Store material transfer", "#8b5cf6", "ri-store-3-line", "Store,Planning,Production", 1, now_, now_, "system"))
+    # Seed Departments
+    for d in ["Production", "Quality Control", "Final QC", "Commercial", "Planning", "Store", "Plant Maintenance"]:
+        if not fetch_one("SELECT 1 FROM departments WHERE name=?", (d,)):
+            exec_write("INSERT INTO departments VALUES (?,?,?)", (d, 1, cur_time))
 
-    ph = bcrypt.hashpw("Admin@123".encode(), bcrypt.gensalt()).decode()
-    safe("INSERT OR IGNORE INTO users VALUES(?,?,?,?,?,?,?,?,?,?)", ("admin", ph, "System Admin", "master", "Planning", "", "Gooty", "approved", now_, now_))
-    conn.close()
+    # Seed Plants
+    for p_code, p_name in [("1000", "Gooty Central Plant"), ("1400", "Plant 1400 Extrusion"), ("2000", "Hyderabad Cable Works"), ("CORP", "TCL Corporate HQ")]:
+        if not fetch_one("SELECT 1 FROM plants WHERE code=?", (p_code,)):
+            exec_write("INSERT INTO plants VALUES (?,?,?,?)", (p_code, p_name, 1, cur_time))
+
+    # Seed Master Admin (Password: Admin@123)
+    if not fetch_one("SELECT 1 FROM users WHERE username='admin'"):
+        ph = bcrypt.hashpw("Admin@123".encode(), bcrypt.gensalt()).decode()
+        exec_write("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?)",
+                   ("admin", ph, "SAP Super Administrator", "master", "BASIS / IT", "1000,1400,2000,CORP", "approved", cur_time, cur_time))
+
+    # Standard Business T-Codes
+    default_tcodes = [
+        ("PROD", "Production Handover Report", "Outer Sheathing Production tracking", "PP", "Production,Quality Control"),
+        ("GCH0", "Green Card Inspection Check", "Incoming QA & Cable Release Cards", "QM", "Quality Control,Production"),
+        ("NCR0", "Non-Conformance Records", "Internal & Customer QC Deviation Logging", "QM", "Quality Control,Final QC,Production"),
+        ("PLN0", "Master Planning & Scheduling", "Plant Order scheduling and lot runs", "PP", "Planning,Production,Store"),
+        ("QCH0", "Quality Control to Final QC", "QC Stage clearance handover slips", "QM", "Quality Control,Final QC"),
+        ("STD0", "Store Material Transfer", "Inter-plant and store stock issue", "MM", "Store,Planning,Production")
+    ]
+
+    for code, title, desc, mod, depts in default_tcodes:
+        if not fetch_one("SELECT 1 FROM tcodes WHERE code=?", (code,)):
+            exec_write("INSERT INTO tcodes VALUES (?,?,?,?,?,?,?,?,?)",
+                       (code, title, desc, mod, depts, 1, cur_time, cur_time, "SAP_SYSTEM"))
+            fields = json.dumps([
+                {"key": "job_no", "label": "Job / Production Order", "type": "text", "required": True, "width": 1},
+                {"key": "batch_no", "label": "Batch / Lot No", "type": "text", "required": True, "width": 1},
+                {"key": "cable_size", "label": "Cable Spec / Size", "type": "text", "required": True, "width": 1},
+                {"key": "quantity", "label": "Quantity (Mtrs)", "type": "number", "required": True, "width": 1},
+                {"key": "target_date", "label": "Completion Date", "type": "date", "required": False, "width": 1},
+                {"key": "operator", "label": "Plant Operator", "type": "text", "required": False, "width": 1},
+                {"key": "remarks", "label": "Engineering Remarks", "type": "textarea", "required": False, "width": 3}
+            ])
+            exec_write("INSERT INTO tcode_schemas VALUES (?,?,?,?,?)", (code, fields, json.dumps({"columns": 3}), cur_time, "SAP_SYSTEM"))
+            exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (code, f"/1SAP/{code}_DEFAULT", "Standard SAP ALV", f"Standard Grid: {title}", 1, fields, json.dumps({"columns": 3}), "Default SAP Table View", "admin", "SAP Super Administrator", cur_time, cur_time))
 
 init_db()
 
-def now():
-    return datetime.datetime.now().isoformat()
-
+# --- AUTH & ACCESS HELPERS ---
 def get_user(req: Request):
-    t = req.cookies.get("pt")
+    t = req.cookies.get("sap_session")
     if not t:
         return None
     s = fetch_one("SELECT * FROM sessions WHERE token=?", (t,))
@@ -160,316 +177,363 @@ def get_user(req: Request):
 def need(req: Request):
     u = get_user(req)
     if not u:
-        raise HTTPException(401, "login")
+        raise HTTPException(401, "Authorization required. Please log into SAP System.")
     return u
 
 def is_master(u):
-    return u["username"] == "admin" or u["role"] == "master"
+    return u["role"] == "master" or u["username"] == "admin"
 
 def need_admin(req: Request):
     u = need(req)
     if u["role"] not in ["admin", "master"]:
-        raise HTTPException(403, "admin required")
+        raise HTTPException(403, "Access Denied: Authorization object S_TCODE / S_TABU_DIS required.")
     return u
 
 def need_master(req: Request):
     u = need(req)
     if not is_master(u):
-        raise HTTPException(403, "MASTER ADMIN ONLY")
+        raise HTTPException(403, "Access Denied: Superuser Authorization (SAP_ALL / MASTER) required.")
     return u
 
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+def check_tcode_access(u, code: str):
+    code = code.upper().strip()
+    if is_master(u) or u["role"] == "admin":
+        return True
+    tc = fetch_one("SELECT * FROM tcodes WHERE code=? AND active=1", (code,))
+    if not tc:
+        return False
+    # Check department membership
+    allowed = [x.strip() for x in (tc["allowed_depts"] or "").split(",") if x.strip()]
+    if u["department"] in allowed:
+        return True
+    # Check explicit PFCG grant
+    grant = fetch_one("SELECT 1 FROM access_grants WHERE username=? AND tcode_code=?", (u["username"], code))
+    return bool(grant)
 
+# --- FASTAPI APP ---
+app = FastAPI(title="SAP Enterprise GUI - ProTransfer ERP", version="7.70-REV2")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# --- AUTH APIS ---
 @app.post("/api/login")
 def api_login(res: Response, username: str = Form(...), password: str = Form(...)):
     username = username.lower().strip()
     u = fetch_one("SELECT * FROM users WHERE username=?", (username,))
     if not u or not bcrypt.checkpw(password.encode(), u["password_hash"].encode()):
-        raise HTTPException(401, "invalid credentials")
+        raise HTTPException(401, "RFC Error: User or Password Incorrect")
     if u["status"] != "approved":
-        raise HTTPException(403, "not approved")
-    tok = secrets.token_urlsafe(32)
-    exp = (datetime.datetime.now() + datetime.timedelta(days=30)).isoformat()
-    exec_write("INSERT INTO sessions VALUES(?,?,?)", (tok, username, exp))
-    res.set_cookie("pt", tok, httponly=True, samesite="lax", max_age=2592000)
-    return {"ok": True}
+        raise HTTPException(403, "RFC Error: User Account Locked or Not Approved by BASIS")
+
+    token = secrets.token_hex(32)
+    exp = (datetime.datetime.now() + datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    exec_write("INSERT INTO sessions VALUES (?,?,?)", (token, username, exp))
+    res.set_cookie("sap_session", token, httponly=True, samesite="lax", max_age=86400 * 7)
+    return {"ok": True, "user": {"username": u["username"], "full_name": u["full_name"], "role": u["role"]}}
 
 @app.post("/api/logout")
 def api_logout(res: Response, req: Request):
-    exec_write("DELETE FROM sessions WHERE token=?", (req.cookies.get("pt"),))
-    res.delete_cookie("pt")
+    t = req.cookies.get("sap_session")
+    if t:
+        exec_write("DELETE FROM sessions WHERE token=?", (t,))
+    res.delete_cookie("sap_session")
     return {"ok": True}
 
 @app.get("/api/me")
 def api_me(req: Request):
-    return need(req)
+    u = need(req)
+    org_info = fetch_one("SELECT * FROM org WHERE id=1")
+    return {
+        "username": u["username"],
+        "full_name": u["full_name"],
+        "role": u["role"],
+        "department": u["department"],
+        "plants": [p for p in (u["plants"] or "").split(",") if p],
+        "is_master": is_master(u),
+        "system": org_info.get("system_id", "PRD"),
+        "client": org_info.get("client", "100"),
+        "company": org_info.get("name", "Thermocables")
+    }
 
-@app.get("/api/org")
-def get_org(req: Request):
+# --- SAP SPRO: SYSTEM ORG & ENTERPRISE STRUCTURE (PLANTS / DEPTS) ---
+@app.get("/api/spro/overview")
+def spro_overview(req: Request):
     need(req)
-    return fetch_one("SELECT * FROM org WHERE id=?", (1,))
+    return {
+        "org": fetch_one("SELECT * FROM org WHERE id=1"),
+        "departments": fetch_all("SELECT * FROM departments ORDER BY name"),
+        "plants": fetch_all("SELECT * FROM plants ORDER BY code")
+    }
 
-@app.post("/api/org")
-def set_org(req: Request, name: str = Form(...)):
+@app.post("/api/admin/plants/create")
+def spro_create_plant(req: Request, code: str = Form(...), name: str = Form(...)):
     need_master(req)
-    exec_write("UPDATE org SET name=? WHERE id=1", (name,))
+    code = code.upper().strip()
+    if fetch_one("SELECT 1 FROM plants WHERE code=?", (code,)):
+        raise HTTPException(400, f"Plant code {code} already exists.")
+    exec_write("INSERT INTO plants VALUES (?,?,?,?)", (code, name.strip(), 1, now()))
     return {"ok": True}
 
-@app.get("/api/admin/users")
-def admin_list_users(req: Request):
-    need_admin(req)
-    return fetch_all("SELECT * FROM users ORDER BY created_at DESC")
-
-@app.post("/api/admin/create-user")
-def admin_create_user(req: Request, username: str = Form(...), password: str = Form(...), full_name: str = Form(...), department: str = Form(...), plant: str = Form(...), role: str = Form(...)):
-    need_admin(req)
-    caller = need(req)
-    if role == "master" and not is_master(caller):
-        raise HTTPException(403, "Only MASTER can create master")
-    username = username.lower().strip()
-    if fetch_one("SELECT 1 FROM users WHERE username=?", (username,)):
-        raise HTTPException(400, "User exists")
-    ph = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-    exec_write("INSERT INTO users VALUES(?,?,?,?,?,?,?,?,?,?)", (username, ph, full_name, role, department, "", plant, "approved", now(), now()))
+@app.post("/api/admin/plants/update")
+def spro_update_plant(req: Request, code: str = Form(...), name: str = Form(...), active: int = Form(...)):
+    need_master(req)
+    exec_write("UPDATE plants SET name=?, active=? WHERE code=?", (name.strip(), active, code.strip()))
     return {"ok": True}
 
-@app.post("/api/admin/update-user")
-def admin_update_user(req: Request, username: str = Form(...), full_name: str = Form(...), department: str = Form(...), plant: str = Form(...), role: str = Form(...), status: str = Form(...)):
+@app.post("/api/admin/plants/delete")
+def spro_delete_plant(req: Request, code: str = Form(...)):
+    need_master(req)
+    exec_write("DELETE FROM plants WHERE code=?", (code.strip(),))
+    return {"ok": True}
+
+@app.post("/api/admin/departments/create")
+def spro_create_dept(req: Request, name: str = Form(...)):
+    need_master(req)
+    name = name.strip()
+    if fetch_one("SELECT 1 FROM departments WHERE name=?", (name,)):
+        raise HTTPException(400, "Department already exists.")
+    exec_write("INSERT INTO departments VALUES (?,?,?)", (name, 1, now()))
+    return {"ok": True}
+
+@app.post("/api/admin/departments/delete")
+def spro_delete_dept(req: Request, name: str = Form(...)):
+    need_master(req)
+    exec_write("DELETE FROM departments WHERE name=?", (name.strip(),))
+    return {"ok": True}
+
+# --- SAP SU01: USER MAINTENANCE ---
+@app.get("/api/su01/users")
+def su01_list_users(req: Request):
+    need_admin(req)
+    return fetch_all("SELECT username, full_name, role, department, plants, status, created_at, updated_at FROM users ORDER BY username")
+
+@app.post("/api/su01/create")
+def su01_create_user(req: Request, username: str = Form(...), password: str = Form(...), full_name: str = Form(...),
+                     department: str = Form(...), plants: str = Form(""), role: str = Form("user")):
     caller = need_admin(req)
-    target = fetch_one("SELECT * FROM users WHERE username=?", (username.lower().strip(),))
-    if not target:
-        raise HTTPException(404, "not found")
-    if is_master(target) and not is_master(caller):
-        raise HTTPException(403, "Cannot edit MASTER")
+    username = username.lower().strip()
     if role == "master" and not is_master(caller):
-        raise HTTPException(403, "Only MASTER can set master role")
-    exec_write("UPDATE users SET full_name=?,department=?,plant=?,role=?,status=?,updated_at=? WHERE username=?", (full_name, department, plant, role, status, now(), username.lower().strip()))
+        raise HTTPException(403, "Authorization violation: Only MASTER superuser can grant SAP_ALL/Master role.")
+    if fetch_one("SELECT 1 FROM users WHERE username=?", (username,)):
+        raise HTTPException(400, f"User {username} already exists in client.")
+
+    ph = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    cur_time = now()
+    exec_write("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?)",
+               (username, ph, full_name.strip(), role, department.strip(), plants.strip(), "approved", cur_time, cur_time))
     return {"ok": True}
 
-@app.post("/api/admin/delete-user")
-def admin_delete_user(req: Request, username: str = Form(...)):
+@app.post("/api/su01/update")
+def su01_update_user(req: Request, username: str = Form(...), full_name: str = Form(...),
+                     department: str = Form(...), plants: str = Form(""), role: str = Form(...), status: str = Form(...)):
     caller = need_admin(req)
     username = username.lower().strip()
     target = fetch_one("SELECT * FROM users WHERE username=?", (username,))
     if not target:
-        raise HTTPException(404, "not found")
+        raise HTTPException(404, "User not found")
+    if is_master(target) and not is_master(caller):
+        raise HTTPException(403, "Security Error: Cannot modify MASTER user")
+    if role == "master" and not is_master(caller):
+        raise HTTPException(403, "Cannot elevate role to MASTER")
+
+    exec_write("UPDATE users SET full_name=?, department=?, plants=?, role=?, status=?, updated_at=? WHERE username=?",
+               (full_name.strip(), department.strip(), plants.strip(), role, status, now(), username))
+    return {"ok": True}
+
+@app.post("/api/su01/delete")
+def su01_delete_user(req: Request, username: str = Form(...)):
+    caller = need_admin(req)
+    username = username.lower().strip()
+    target = fetch_one("SELECT * FROM users WHERE username=?", (username,))
+    if not target:
+        raise HTTPException(404, "User not found")
     if is_master(target):
-        raise HTTPException(400, "Cannot delete MASTER ADMIN - Protected")
+        raise HTTPException(400, "Security Violation: Master Administrator cannot be deleted!")
     if target["role"] == "admin" and not is_master(caller):
-        raise HTTPException(403, "Only MASTER can delete admins")
+        raise HTTPException(403, "Security Error: Only Master Admin can delete other Administrators")
     if username == caller["username"]:
-        raise HTTPException(400, "Cannot delete self")
+        raise HTTPException(400, "Cannot delete your own active logon account.")
+
     exec_write("DELETE FROM users WHERE username=?", (username,))
     exec_write("DELETE FROM sessions WHERE username=?", (username,))
     exec_write("DELETE FROM access_grants WHERE username=?", (username,))
     return {"ok": True}
 
-@app.post("/api/admin/reset-password")
-def admin_reset_password(req: Request, username: str = Form(...), new_password: str = Form(...)):
-    need_admin(req)
+@app.post("/api/su01/reset-password")
+def su01_reset_password(req: Request, username: str = Form(...), new_password: str = Form(...)):
+    caller = need_admin(req)
+    username = username.lower().strip()
+    target = fetch_one("SELECT * FROM users WHERE username=?", (username,))
+    if not target:
+        raise HTTPException(404, "User not found")
+    if is_master(target) and not is_master(caller):
+        raise HTTPException(403, "Cannot change password of Master Admin")
+
     ph = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
-    exec_write("UPDATE users SET password_hash=? WHERE username=?", (ph, username.lower().strip()))
+    exec_write("UPDATE users SET password_hash=?, updated_at=? WHERE username=?", (ph, now(), username))
+    exec_write("DELETE FROM sessions WHERE username=?", (username,))
     return {"ok": True}
 
-@app.get("/api/departments")
-def depts(req: Request):
-    need(req)
-    return fetch_all("SELECT * FROM departments ORDER BY name")
-
-@app.get("/api/admin/departments")
-def admin_depts(req: Request):
+# --- SAP PFCG: AUTHORIZATIONS & TCODE GRANTS ---
+@app.get("/api/pfcg/matrix")
+def pfcg_matrix(req: Request):
     need_admin(req)
-    return fetch_all("SELECT * FROM departments ORDER BY name")
+    users = fetch_all("SELECT username, full_name, role, department FROM users ORDER BY username")
+    tcodes = fetch_all("SELECT code, title, module, allowed_depts FROM tcodes WHERE active=1 ORDER BY code")
+    grants = fetch_all("SELECT * FROM access_grants")
+    return {"users": users, "tcodes": tcodes, "grants": grants}
 
-@app.post("/api/admin/departments/create")
-def create_dept(req: Request, name: str = Form(...)):
-    need_master(req)
-    exec_write("INSERT INTO departments(name,active,created_at) VALUES(?,?,?) ON CONFLICT (name) DO NOTHING" if USE_PG else "INSERT OR REPLACE INTO departments VALUES(?,?,?)", (name.strip(), 1, now()))
+@app.post("/api/pfcg/grant")
+def pfcg_grant(req: Request, username: str = Form(...), tcode: str = Form(...)):
+    caller = need_admin(req)
+    username = username.lower().strip()
+    tcode = tcode.upper().strip()
+    if USE_PG:
+        exec_write("INSERT INTO access_grants (username, tcode_code, granted_by, granted_at) VALUES (?,?,?,?) ON CONFLICT (username, tcode_code) DO NOTHING",
+                   (username, tcode, caller["username"], now()))
+    else:
+        exec_write("INSERT OR IGNORE INTO access_grants (username, tcode_code, granted_by, granted_at) VALUES (?,?,?,?)",
+                   (username, tcode, caller["username"], now()))
     return {"ok": True}
 
-@app.post("/api/admin/departments/delete")
-def delete_dept(req: Request, name: str = Form(...)):
-    need_master(req)
-    exec_write("DELETE FROM departments WHERE name=?", (name,))
-    return {"ok": True}
-
-@app.post("/api/admin/departments/toggle")
-def toggle_dept(req: Request, name: str = Form(...)):
-    need_master(req)
-    r = fetch_one("SELECT active FROM departments WHERE name=?", (name,))
-    if r:
-        exec_write("UPDATE departments SET active=? WHERE name=?", (0 if r["active"] == 1 else 1, name))
-    return {"ok": True}
-
-@app.get("/api/plants")
-def plants(req: Request):
-    need(req)
-    return fetch_all("SELECT * FROM plants ORDER BY name")
-
-@app.get("/api/admin/plants")
-def admin_plants(req: Request):
+@app.post("/api/pfcg/revoke")
+def pfcg_revoke(req: Request, username: str = Form(...), tcode: str = Form(...)):
     need_admin(req)
-    return fetch_all("SELECT * FROM plants ORDER BY name")
-
-@app.post("/api/admin/plants/create")
-def create_plant(req: Request, name: str = Form(...)):
-    need_master(req)
-    exec_write("INSERT INTO plants(name,active,created_at) VALUES(?,?,?) ON CONFLICT (name) DO NOTHING" if USE_PG else "INSERT OR REPLACE INTO plants VALUES(?,?,?)", (name.strip(), 1, now()))
+    exec_write("DELETE FROM access_grants WHERE username=? AND tcode_code=?", (username.lower().strip(), tcode.upper().strip()))
     return {"ok": True}
 
-@app.post("/api/admin/plants/delete")
-def delete_plant(req: Request, name: str = Form(...)):
-    need_master(req)
-    exec_write("DELETE FROM plants WHERE name=?", (name,))
-    return {"ok": True}
-
-@app.post("/api/admin/plants/toggle")
-def toggle_plant(req: Request, name: str = Form(...)):
-    need_master(req)
-    r = fetch_one("SELECT active FROM plants WHERE name=?", (name,))
-    if r:
-        exec_write("UPDATE plants SET active=? WHERE name=?", (0 if r["active"] == 1 else 1, name))
-    return {"ok": True}
-
-@app.get("/api/tcodes")
-def list_tcodes(req: Request):
+# --- SAP SE93: TRANSACTION CODES & REPOSITORY ---
+@app.get("/api/se93/list")
+def se93_list(req: Request):
     u = need(req)
-    all_c = fetch_all("SELECT * FROM tcodes WHERE active=1 ORDER BY code")
-    for tc in all_c:
-        try:
-            tc["layout_count"] = fetch_one("SELECT COUNT(*) as c FROM tcode_layouts WHERE tcode_code=?", (tc["code"],))["c"]
-        except:
-            tc["layout_count"] = 0
-    if is_master(u) or u["role"] == "admin":
-        return all_c
-    grants = fetch_all("SELECT tcode_code FROM access_grants WHERE username=?", (u["username"],))
-    granted = set(g["tcode_code"] for g in grants)
-    return [tc for tc in all_c if u["department"] in [x.strip() for x in tc["allowed_depts"].split(",")] or tc["code"] in granted]
+    all_t = fetch_all("SELECT * FROM tcodes ORDER BY code")
+    for t in all_t:
+        t["layout_count"] = fetch_one("SELECT COUNT(*) as c FROM tcode_layouts WHERE tcode_code=?", (t["code"],))["c"]
+        t["record_count"] = fetch_one("SELECT COUNT(*) as c FROM tcode_records WHERE tcode_code=? AND status='active'", (t["code"],))["c"]
+        t["has_access"] = check_tcode_access(u, t["code"])
+    return all_t
 
-@app.get("/api/tcodes/all")
-def list_tcodes_all(req: Request):
-    need_admin(req)
-    all_c = fetch_all("SELECT * FROM tcodes ORDER BY code")
-    for tc in all_c:
-        try:
-            cnt = fetch_one("SELECT COUNT(*) as c FROM tcode_layouts WHERE tcode_code=?", (tc["code"],))
-            tc["layout_count"] = cnt["c"] if cnt else 0
-        except:
-            tc["layout_count"] = 0
-    return all_c
-
-@app.post("/api/admin/tcodes/create")
-def create_tcode(req: Request, code: str = Form(...), title: str = Form(...), description: str = Form(...), color: str = Form(...), icon: str = Form(...), allowed_depts: str = Form(...)):
-    need_admin(req)
+@app.post("/api/se93/create")
+def se93_create(req: Request, code: str = Form(...), title: str = Form(...), description: str = Form(...),
+                module: str = Form("PP"), allowed_depts: str = Form(...)):
+    u = need_admin(req)
     code = code.upper().strip()
     if fetch_one("SELECT 1 FROM tcodes WHERE code=?", (code,)):
-        raise HTTPException(400, "T-Code exists")
-    exec_write("INSERT INTO tcodes VALUES(?,?,?,?,?,?,?,?,?,?)", (code, title, description, color or "#3b82f6", icon or "ri-apps-line", allowed_depts, 1, now(), now(), need(req)["username"]))
-    default_fields = json.dumps([
-        {"key": "job_no", "label": "Job No / SAP No", "type": "text", "required": True, "width": 1},
-        {"key": "customer", "label": "Customer", "type": "text", "width": 1},
-        {"key": "cable_size", "label": "Cable Size", "type": "text", "width": 1},
-        {"key": "remarks", "label": "Remarks", "type": "textarea", "width": 3}
+        raise HTTPException(400, f"Transaction code {code} already exists in SAP Repository.")
+
+    cur_time = now()
+    exec_write("INSERT INTO tcodes VALUES (?,?,?,?,?,?,?,?,?)",
+               (code, title.strip(), description.strip(), module.strip(), allowed_depts.strip(), 1, cur_time, cur_time, u["username"]))
+
+    # Default starter layout & schema
+    starter_fields = json.dumps([
+        {"key": "job_no", "label": "Job / Document No", "type": "text", "required": True, "width": 1},
+        {"key": "batch_no", "label": "Batch / Heat Lot", "type": "text", "required": True, "width": 1},
+        {"key": "description", "label": "Item Description", "type": "text", "required": False, "width": 2},
+        {"key": "quantity", "label": "Target Quantity", "type": "number", "required": False, "width": 1},
+        {"key": "remarks", "label": "Operational Notes", "type": "textarea", "required": False, "width": 3}
     ])
-    exec_write("INSERT INTO tcode_schemas VALUES(?,?,?,?,?)", (code, default_fields, json.dumps({"columns": 3}), now(), need(req)["username"]))
-    exec_write("INSERT INTO tcode_layouts(tcode_code,layout_code,name,title,is_default,fields,layout_config,description,created_by,created_by_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (code, f"{code}-001", "Default", f"Default {title} View", 1, default_fields, json.dumps({"columns": 3}), f"Default for {code}", need(req)["username"], need(req)["full_name"], now(), now()))
+    exec_write("INSERT INTO tcode_schemas VALUES (?,?,?,?,?)", (code, starter_fields, json.dumps({"columns": 3}), cur_time, u["username"]))
+    exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+               (code, f"/1SAP/{code}_DEF", "Default View", f"{title} Grid", 1, starter_fields, json.dumps({"columns": 3}), "Generated Default", u["username"], u["full_name"], cur_time, cur_time))
     return {"ok": True}
 
-@app.post("/api/admin/tcodes/update")
-def update_tcode(req: Request, code: str = Form(...), title: str = Form(...), description: str = Form(...), color: str = Form(...), icon: str = Form(...), allowed_depts: str = Form(...), active: int = Form(...)):
+@app.post("/api/se93/update")
+def se93_update(req: Request, code: str = Form(...), title: str = Form(...), description: str = Form(...),
+                module: str = Form(...), allowed_depts: str = Form(...), active: int = Form(...)):
     need_admin(req)
-    exec_write("UPDATE tcodes SET title=?,description=?,color=?,icon=?,allowed_depts=?,active=?,updated_at=? WHERE code=?", (title, description, color, icon, allowed_depts, active, now(), code.upper().strip()))
+    exec_write("UPDATE tcodes SET title=?, description=?, module=?, allowed_depts=?, active=?, updated_at=? WHERE code=?",
+               (title.strip(), description.strip(), module.strip(), allowed_depts.strip(), active, now(), code.upper().strip()))
     return {"ok": True}
 
-@app.post("/api/admin/tcodes/delete")
-def delete_tcode(req: Request, code: str = Form(...)):
-    u = need(req)
+@app.post("/api/se93/delete")
+def se93_delete(req: Request, code: str = Form(...)):
+    need_master(req)
     code = code.upper().strip()
-    if not is_master(u):
-        raise HTTPException(403, "Only MASTER ADMIN can delete T-Codes")
     exec_write("DELETE FROM tcodes WHERE code=?", (code,))
     exec_write("DELETE FROM tcode_schemas WHERE code=?", (code,))
-    exec_write("DELETE FROM tcode_layouts WHERE tcode_code=?", (code,))
-    exec_write("DELETE FROM tcode_records WHERE tcode_code=?", (code,))
+    exec_write("DELETE FROM tcode_layouts WHERE code=?", (code,))
+    exec_write("DELETE FROM tcode_records WHERE code=?", (code,))
+    exec_write("DELETE FROM access_grants WHERE tcode_code=?", (code,))
     return {"ok": True}
 
+# --- SAP ALV LAYOUT ENGINE ---
 @app.get("/api/tcode/{code}/layouts")
-def list_layouts(code: str, req: Request):
-    need(req)
-    rows = fetch_all("SELECT * FROM tcode_layouts WHERE tcode_code=? ORDER BY is_default DESC, layout_code ASC", (code,))
+def get_layouts(code: str, req: Request):
+    u = need(req)
+    code = code.upper().strip()
+    if not check_tcode_access(u, code):
+        raise HTTPException(403, f"No authorization for T-Code {code}")
+    rows = fetch_all("SELECT * FROM tcode_layouts WHERE tcode_code=? ORDER BY is_default DESC, id ASC", (code,))
     for r in rows:
         try:
             r["fields"] = json.loads(r["fields"])
         except:
             r["fields"] = []
-        try:
-            r["layout_config"] = json.loads(r["layout_config"]) if isinstance(r["layout_config"], str) else (r["layout_config"] or {})
-        except:
-            r["layout_config"] = {}
     return rows
 
-@app.post("/api/tcode/{code}/layouts")
-async def create_layout(code: str, req: Request):
+@app.post("/api/tcode/{code}/layouts/save")
+def save_layout(code: str, req: Request, payload: dict):
     u = need(req)
-    b = await req.json()
-    layout_code = b.get("layout_code", "").upper().strip()
-    if not layout_code:
-        cnt = fetch_one("SELECT COUNT(*) as c FROM tcode_layouts WHERE tcode_code=?", (code,))["c"]
-        layout_code = f"{code}-{cnt+1:03d}"
-    exec_write("INSERT INTO tcode_layouts(tcode_code,layout_code,name,title,is_default,fields,layout_config,description,created_by,created_by_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (code, layout_code, b.get("name", ""), b.get("title", ""), 0, json.dumps(b["fields"]), json.dumps(b.get("layout_config", {"columns": 3})), b.get("description", ""), u["username"], u["full_name"], now(), now()))
-    return {"ok": True, "layout_code": layout_code}
+    code = code.upper().strip()
+    if not check_tcode_access(u, code):
+        raise HTTPException(403, f"No authorization for {code}")
 
-@app.delete("/api/tcode/{code}/layouts/{lid}")
-def del_layout(code: str, lid: int, req: Request):
-    u = need(req)
-    r = fetch_one("SELECT * FROM tcode_layouts WHERE id=?", (lid,))
-    if not r:
-        raise HTTPException(404, "not found")
-    if r["is_default"] == 1:
-        raise HTTPException(400, "Cannot delete default layout")
-    if r["created_by"] != u["username"] and not is_master(u):
-        raise HTTPException(403, "not owner")
-    exec_write("DELETE FROM tcode_layouts WHERE id=?", (lid,))
-    return {"ok": True}
+    l_name = payload.get("name", "Custom Layout").strip()
+    l_title = payload.get("title", l_name).strip()
+    fields_json = json.dumps(payload.get("fields", []))
+    config_json = json.dumps(payload.get("layout_config", {"columns": 3}))
+
+    l_code = payload.get("layout_code", "").strip()
+    if not l_code:
+        cnt = fetch_one("SELECT COUNT(*) as c FROM tcode_layouts WHERE tcode_code=?", (code,))["c"]
+        l_code = f"/VAR/{code}_{cnt+1:02d}"
+
+    cur_time = now()
+    existing = fetch_one("SELECT id FROM tcode_layouts WHERE tcode_code=? AND layout_code=?", (code, l_code))
+    if existing:
+        exec_write("UPDATE tcode_layouts SET name=?, title=?, fields=?, layout_config=?, updated_at=? WHERE id=?",
+                   (l_name, l_title, fields_json, config_json, cur_time, existing["id"]))
+    else:
+        exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (code, l_code, l_name, l_title, 0, fields_json, config_json, "User Custom Variant", u["username"], u["full_name"], cur_time, cur_time))
+    return {"ok": True, "layout_code": l_code}
 
 @app.post("/api/tcode/{code}/layouts/{lid}/set-default")
 def set_default_layout(code: str, lid: int, req: Request):
     need_admin(req)
+    code = code.upper().strip()
     exec_write("UPDATE tcode_layouts SET is_default=0 WHERE tcode_code=?", (code,))
-    exec_write("UPDATE tcode_layouts SET is_default=1,updated_at=? WHERE id=?", (now(), lid))
+    exec_write("UPDATE tcode_layouts SET is_default=1, updated_at=? WHERE id=? AND tcode_code=?", (now(), lid, code))
     return {"ok": True}
 
-@app.get("/api/tcode/{code}/schema")
-def get_schema(code: str, req: Request):
-    need(req)
-    s = fetch_one("SELECT * FROM tcode_schemas WHERE code=?", (code,))
-    if not s:
-        return {"fields": [], "layout": {"columns": 3}}
-    try:
-        fields = json.loads(s["fields"])
-    except:
-        fields = []
-    try:
-        layout = json.loads(s["layout"]) if isinstance(s["layout"], str) else s["layout"]
-    except:
-        layout = {"columns": 3}
-    return {"fields": fields, "layout": layout}
+@app.delete("/api/tcode/{code}/layouts/{lid}")
+def delete_layout(code: str, lid: int, req: Request):
+    u = need(req)
+    code = code.upper().strip()
+    lay = fetch_one("SELECT * FROM tcode_layouts WHERE id=? AND tcode_code=?", (lid, code))
+    if not lay:
+        raise HTTPException(404, "Layout variant not found")
+    if lay["is_default"] == 1:
+        raise HTTPException(400, "Cannot delete default ALV layout")
+    if lay["created_by"] != u["username"] and not is_master(u):
+        raise HTTPException(403, "You can only delete your own layout variants")
 
-@app.post("/api/tcode/{code}/schema")
-async def save_schema(code: str, req: Request):
-    need_admin(req)
-    b = await req.json()
-    if USE_PG:
-        exec_write("INSERT INTO tcode_schemas VALUES(?,?,?,?,?) ON CONFLICT (code) DO UPDATE SET fields=?,layout=?,updated_at=?,updated_by=?", (code, json.dumps(b["fields"]), json.dumps(b.get("layout", {"columns": 3})), now(), need(req)["username"], json.dumps(b["fields"]), json.dumps(b.get("layout", {"columns": 3})), now(), need(req)["username"]))
-    else:
-        exec_write("INSERT OR REPLACE INTO tcode_schemas VALUES(?,?,?,?,?)", (code, json.dumps(b["fields"]), json.dumps(b.get("layout", {"columns": 3})), now(), need(req)["username"]))
+    exec_write("DELETE FROM tcode_layouts WHERE id=?", (lid,))
     return {"ok": True}
 
+# --- SAP DATA RECORDS & ALV GRID CONTROLLER ---
 @app.get("/api/tcode/{code}/records")
-def get_records(code: str, req: Request, layout_code: str = ""):
-    need(req)
-    rows = fetch_all("SELECT * FROM tcode_records WHERE tcode_code=? AND status='active' ORDER BY id DESC", (code,))
+def get_tcode_records(code: str, req: Request, plant: str = "", limit: int = 500, offset: int = 0):
+    u = need(req)
+    code = code.upper().strip()
+    if not check_tcode_access(u, code):
+        raise HTTPException(403, f"Security Violation: User {u['username']} has no access to {code}")
+
+    if plant:
+        rows = fetch_all("SELECT * FROM tcode_records WHERE tcode_code=? AND plant=? AND status='active' ORDER BY id DESC LIMIT ? OFFSET ?", (code, plant, limit, offset))
+    else:
+        rows = fetch_all("SELECT * FROM tcode_records WHERE tcode_code=? AND status='active' ORDER BY id DESC LIMIT ? OFFSET ?", (code, limit, offset))
+
     for r in rows:
         try:
             r["data"] = json.loads(r["data"])
@@ -478,190 +542,1357 @@ def get_records(code: str, req: Request, layout_code: str = ""):
     return rows
 
 @app.post("/api/tcode/{code}/records")
-async def create_record(code: str, req: Request):
+def create_record(code: str, req: Request, payload: dict):
     u = need(req)
-    b = await req.json()
-    if USE_PG:
-        exec_write("INSERT INTO tcode_records(tcode_code,data,created_by,created_by_name,created_at,updated_at) VALUES(%s,%s,%s,%s,%s,%s)", (code, json.dumps(b), u["username"], u["full_name"], now(), now()))
-    else:
-        exec_write("INSERT INTO tcode_records(tcode_code,data,created_by,created_by_name,created_at,updated_at) VALUES(?,?,?,?,?,?)", (code, json.dumps(b), u["username"], u["full_name"], now(), now()))
+    code = code.upper().strip()
+    if not check_tcode_access(u, code):
+        raise HTTPException(403, f"No access to {code}")
+
+    plant = payload.pop("_plant", "").strip()
+    cur_time = now()
+    exec_write("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+               (code, plant, json.dumps(payload), "active", u["username"], u["full_name"], cur_time, cur_time))
     return {"ok": True}
 
 @app.put("/api/tcode/{code}/records/{rid}")
-async def update_record(code: str, rid: int, req: Request):
+def update_record(code: str, rid: int, req: Request, payload: dict):
     u = need(req)
-    b = await req.json()
-    rec = fetch_one("SELECT * FROM tcode_records WHERE id=?", (rid,))
+    code = code.upper().strip()
+    if not check_tcode_access(u, code):
+        raise HTTPException(403, f"No access to {code}")
+
+    rec = fetch_one("SELECT * FROM tcode_records WHERE id=? AND tcode_code=?", (rid, code))
     if not rec:
-        raise HTTPException(404, "not found")
+        raise HTTPException(404, "Record not found")
     if rec["created_by"] != u["username"] and not is_master(u) and u["role"] != "admin":
-        raise HTTPException(403, "not owner")
-    exec_write("UPDATE tcode_records SET data=?,updated_at=? WHERE id=?", (json.dumps(b), now(), rid))
+        raise HTTPException(403, "Access Denied: Only record owner or BASIS Admin can modify this entry.")
+
+    plant = payload.pop("_plant", rec["plant"]).strip()
+    exec_write("UPDATE tcode_records SET plant=?, data=?, updated_at=? WHERE id=?",
+               (plant, json.dumps(payload), now(), rid))
     return {"ok": True}
 
 @app.delete("/api/tcode/{code}/records/{rid}")
 def delete_record(code: str, rid: int, req: Request):
     u = need(req)
-    rec = fetch_one("SELECT * FROM tcode_records WHERE id=?", (rid,))
+    code = code.upper().strip()
+    if not check_tcode_access(u, code):
+        raise HTTPException(403, f"No access to {code}")
+
+    rec = fetch_one("SELECT * FROM tcode_records WHERE id=? AND tcode_code=?", (rid, code))
     if not rec:
-        raise HTTPException(404, "not found")
-    if rec["created_by"] != u["username"] and not is_master(u):
-        raise HTTPException(403, "not owner")
-    exec_write("UPDATE tcode_records SET status='deleted',updated_at=? WHERE id=?", (now(), rid))
+        raise HTTPException(404, "Record not found")
+    if rec["created_by"] != u["username"] and not is_master(u) and u["role"] != "admin":
+        raise HTTPException(403, "Cannot delete records of other plant operators")
+
+    exec_write("UPDATE tcode_records SET status='deleted', updated_at=? WHERE id=?", (now(), rid))
     return {"ok": True}
 
-@app.post("/api/tcode/{code}/import")
-async def import_excel(code: str, req: Request, file: UploadFile = File(...)):
-    need(req)
-    data = await file.read()
-    wb = load_workbook(io.BytesIO(data))
-    ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
-        return {"ok": True, "imported": 0}
-    headers = [str(h).strip() if h else "" for h in rows[0]]
-    count = 0
-    for row in rows[1:]:
-        d = {}
-        for i, h in enumerate(headers):
-            if h:
-                d[h] = row[i] if i < len(row) and row[i] is not None else ""
-        u = need(req)
-        if USE_PG:
-            exec_write("INSERT INTO tcode_records(tcode_code,data,created_by,created_by_name,created_at,updated_at) VALUES(%s,%s,%s,%s,%s,%s)", (code, json.dumps(d), u["username"], u["full_name"], now(), now()))
-        else:
-            exec_write("INSERT INTO tcode_records(tcode_code,data,created_by,created_by_name,created_at,updated_at) VALUES(?,?,?,?,?,?)", (code, json.dumps(d), u["username"], u["full_name"], now(), now()))
-        count += 1
-    return {"ok": True, "imported": count}
-
+# --- EXCEL IMPORT / EXPORT (SAP SPREADSHEET INTERFACE) ---
 @app.get("/api/tcode/{code}/export")
 def export_excel(code: str, req: Request):
-    need(req)
-    rows = fetch_all("SELECT * FROM tcode_records WHERE tcode_code=? AND status='active' ORDER BY id", (code,))
+    u = need(req)
+    code = code.upper().strip()
+    if not check_tcode_access(u, code):
+        raise HTTPException(403, f"Export denied for {code}")
+
+    rows = fetch_all("SELECT * FROM tcode_records WHERE tcode_code=? AND status='active' ORDER BY id ASC", (code,))
     wb = Workbook()
     ws = wb.active
-    keys = set()
-    parsed = []
+    ws.title = f"{code}_EXPORT"
+
+    keys = ["id", "plant", "created_by_name", "created_at"]
+    dynamic_keys = set()
+    parsed_rows = []
     for r in rows:
         try:
             d = json.loads(r["data"]) if isinstance(r["data"], str) else r["data"]
         except:
             d = {}
-        parsed.append(d)
-        keys.update(d.keys())
-    keys = sorted(list(keys))
-    if not keys:
-        ws.append(["No Data"])
-    else:
-        ws.append(keys)
-        for d in parsed:
-            ws.append([d.get(k, "") for k in keys])
+        dynamic_keys.update(d.keys())
+        parsed_rows.append((r, d))
+
+    all_cols = keys + sorted(list(dynamic_keys))
+    ws.append(all_cols)
+
+    for r, d in parsed_rows:
+        row_vals = [r["id"], r["plant"], r["created_by_name"], r["created_at"]]
+        for k in sorted(list(dynamic_keys)):
+            row_vals.append(d.get(k, ""))
+        ws.append(row_vals)
+
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)
-    return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename={code}_export.xlsx"})
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=SAP_{code}_{datetime.date.today().strftime('%Y%m%d')}.xlsx"}
+    )
 
-@app.get("/api/admin/access")
-def list_access(req: Request):
-    need_admin(req)
-    return fetch_all("SELECT * FROM access_grants ORDER BY granted_at DESC")
+@app.post("/api/tcode/{code}/import")
+def import_excel(code: str, req: Request, file: UploadFile = File(...)):
+    u = need(req)
+    code = code.upper().strip()
+    if not check_tcode_access(u, code):
+        raise HTTPException(403, f"Import denied for {code}")
 
-@app.post("/api/admin/access/grant")
-def grant_access(req: Request, username: str = Form(...), tcode_code: str = Form(...), layout_code: str = Form(...)):
-    need_admin(req)
-    if USE_PG:
-        exec_write("INSERT INTO access_grants(username,tcode_code,layout_code,granted_by,granted_at) VALUES(?,?,?,?,?) ON CONFLICT (username,tcode_code,layout_code) DO NOTHING", (username.lower().strip(), tcode_code.upper().strip(), layout_code.upper().strip(), need(req)["username"], now()))
-    else:
-        exec_write("INSERT OR IGNORE INTO access_grants(username,tcode_code,layout_code,granted_by,granted_at) VALUES(?,?,?,?,?)", (username.lower().strip(), tcode_code.upper().strip(), layout_code.upper().strip(), need(req)["username"], now()))
-    return {"ok": True}
+    contents = file.file.read()
+    wb = load_workbook(io.BytesIO(contents))
+    ws = wb.active
+    data_rows = list(ws.iter_rows(values_only=True))
+    if not data_rows:
+        return {"ok": True, "count": 0}
 
-@app.post("/api/admin/access/revoke")
-def revoke_access(req: Request, id: int = Form(...)):
-    need_admin(req)
-    exec_write("DELETE FROM access_grants WHERE id=?", (id,))
-    return {"ok": True}
+    headers = [str(h).strip() for h in data_rows[0] if h is not None]
+    count = 0
+    cur_time = now()
 
-# HTML Frontend - SECURE LOGIN (NO CREDENTIALS SHOWN) + COMPLETE FEATURES
-HTML = """
-<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>ProTransfer V15 COMPLETE - Secure</title>
-<script src="https://cdn.tailwindcss.com"></script><link href="https://cdn.jsdelivr.net/npm/remixicon@4.2.0/fonts/remixicon.css" rel="stylesheet">
-</head><body class="bg-[#0f172a] min-h-screen"><div id="root"></div>
+    for row in data_rows[1:]:
+        if not any(row):
+            continue
+        rec = {}
+        plant_val = ""
+        for idx, col in enumerate(headers):
+            if idx < len(row):
+                val = row[idx]
+                if col.lower() == "plant":
+                    plant_val = str(val or "")
+                elif col not in ["id", "created_by_name", "created_at"]:
+                    rec[col] = val if val is not None else ""
+        exec_write("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                   (code, plant_val, json.dumps(rec), "active", u["username"], u["full_name"], cur_time, cur_time))
+        count += 1
+    return {"ok": True, "count": count}
+
+# --- SAP EASY ACCESS & GUI THEMED FRONTEND ---
+HTML_SAP_UI = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SAP Easy Access - Thermocables Enterprise ERP</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://cdn.jsdelivr.net/npm/remixicon@4.2.0/fonts/remixicon.css" rel="stylesheet">
+<style>
+  body { font-family: 'Segoe UI', Tahoma, Arial, sans-serif; background-color: #dbe4ee; font-size: 13px; color: #1e293b; }
+  .sap-btn { background: linear-gradient(180deg, #f8fafc 0%, #e2e8f0 100%); border: 1px solid #94a3b8; border-radius: 3px; font-size: 11px; font-weight: 600; padding: 3px 10px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.8); }
+  .sap-btn:hover { background: #f1f5f9; border-color: #64748b; }
+  .sap-btn-primary { background: linear-gradient(180deg, #0284c7 0%, #0369a1 100%); color: white; border: 1px solid #075985; }
+  .sap-btn-primary:hover { background: #0284c7; }
+  .sap-input { border: 1px solid #94a3b8; border-radius: 2px; padding: 3px 6px; font-size: 12px; background: white; }
+  .sap-input:focus { outline: 1px solid #0284c7; border-color: #0284c7; }
+  .sap-table th { background: linear-gradient(180deg, #e2e8f0 0%, #cbd5e1 100%); border-right: 1px solid #94a3b8; border-bottom: 2px solid #64748b; padding: 4px 8px; font-size: 11px; text-transform: uppercase; }
+  .sap-table td { border-bottom: 1px solid #e2e8f0; border-right: 1px solid #e2e8f0; padding: 4px 8px; font-size: 12px; }
+  .sap-table tr:hover { background-color: #eff6ff; }
+</style>
+</head>
+<body class="h-screen flex flex-col select-none overflow-hidden">
+
+<!-- TOP SAP MENUBAR -->
+<div class="bg-[#1e293b] text-slate-200 text-xs px-3 py-1 flex items-center justify-between border-b border-slate-700">
+  <div class="flex items-center gap-4">
+    <span class="font-bold flex items-center gap-1.5 text-sky-400 tracking-wider"><i class="ri-instance-line"></i> SAP GUI 7.70</span>
+    <span class="hover:bg-slate-700 px-2 py-0.5 rounded cursor-pointer" onclick="goHome()">Menu</span>
+    <span class="hover:bg-slate-700 px-2 py-0.5 rounded cursor-pointer" onclick="goHome()">Edit</span>
+    <span class="hover:bg-slate-700 px-2 py-0.5 rounded cursor-pointer" onclick="goHome()">Favorites</span>
+    <span class="hover:bg-slate-700 px-2 py-0.5 rounded cursor-pointer" onclick="goHome()">Extras</span>
+    <span class="hover:bg-slate-700 px-2 py-0.5 rounded cursor-pointer" onclick="showHelp()">System</span>
+    <span class="hover:bg-slate-700 px-2 py-0.5 rounded cursor-pointer" onclick="showHelp()">Help</span>
+  </div>
+  <div id="sys_pill" class="text-[11px] text-slate-300 flex items-center gap-3">
+    <span>Client: <b id="lbl_client">100</b></span>
+    <span>Sys: <b id="lbl_sys">PRD</b></span>
+    <span id="user_display" class="bg-slate-800 text-sky-300 px-2 py-0.5 rounded border border-slate-600 font-mono">Not logged in</span>
+    <button onclick="logout()" class="hover:text-red-400 font-bold ml-2">Log off</button>
+  </div>
+</div>
+
+<!-- STANDARD SAP TOOLBAR WITH COMMAND OK-CODE FIELD -->
+<div class="bg-[#e9edf2] border-b border-slate-400 px-3 py-1.5 flex items-center justify-between">
+  <div class="flex items-center gap-2">
+    <!-- SAP Command Field -->
+    <div class="flex items-center bg-white border border-slate-500 rounded px-1.5 py-0.5 shadow-inner">
+      <input id="cmd_box" placeholder="/n..." class="outline-none w-28 uppercase font-mono text-xs font-bold text-blue-900" onkeydown="if(event.key==='Enter') execCmd()">
+      <button onclick="execCmd()" title="Enter (OK-Code)" class="text-green-700 hover:text-green-800 font-bold text-sm px-1"><i class="ri-checkbox-circle-fill"></i></button>
+      <button onclick="$('#cmd_box').value=''" title="Clear" class="text-slate-400 hover:text-slate-600 text-xs px-0.5"><i class="ri-close-line"></i></button>
+    </div>
+
+    <div class="h-5 w-[1px] bg-slate-400 mx-1"></div>
+
+    <!-- Standard SAP Function Keys -->
+    <button onclick="goHome()" title="Back (F3)" class="sap-btn flex items-center gap-1 text-emerald-800"><i class="ri-arrow-go-back-line"></i> Back</button>
+    <button onclick="goHome()" title="Exit (Shift+F3)" class="sap-btn flex items-center gap-1 text-amber-800"><i class="ri-logout-box-r-line"></i> Exit</button>
+    <button onclick="goHome()" title="Cancel (F12)" class="sap-btn flex items-center gap-1 text-red-800"><i class="ri-close-circle-line"></i> Cancel</button>
+
+    <div class="h-5 w-[1px] bg-slate-400 mx-1"></div>
+
+    <button onclick="window.print()" title="Print (Ctrl+P)" class="sap-btn"><i class="ri-printer-line"></i></button>
+    <button onclick="openFind()" title="Find" class="sap-btn"><i class="ri-search-line"></i></button>
+  </div>
+
+  <div class="flex items-center gap-2">
+    <span id="title_crumb" class="font-bold text-slate-700 text-xs uppercase tracking-wide">SAP Easy Access</span>
+  </div>
+</div>
+
+<!-- MAIN SAP WORKSPACE -->
+<div class="flex-1 flex overflow-hidden">
+
+  <!-- LEFT SAP EASY ACCESS TREE -->
+  <div id="tree_panel" class="w-72 bg-[#f1f5f9] border-r border-slate-400 flex flex-col justify-between">
+    <div class="p-2 border-b border-slate-300 bg-slate-200 font-bold text-xs flex justify-between items-center text-slate-700">
+      <span><i class="ri-folder-shared-line"></i> SAP Easy Access Menu</span>
+      <button onclick="loadUserTree()" title="Refresh" class="hover:text-blue-700"><i class="ri-refresh-line"></i></button>
+    </div>
+
+    <div id="tree_view" class="flex-1 overflow-y-auto p-2 text-xs space-y-1">
+      <!-- Generated dynamically -->
+    </div>
+
+    <div class="p-2 bg-slate-200 border-t border-slate-300 text-[11px] text-slate-600">
+      <div><b>Thermocables Limited</b></div>
+      <div id="plant_info_tree" class="truncate text-slate-500">Plant: All Authorized</div>
+    </div>
+  </div>
+
+  <!-- RIGHT SAP TRANSACTION WORKSPACE -->
+  <div id="sap_screen" class="flex-1 bg-white flex flex-col overflow-hidden">
+    <!-- Active screen gets populated here -->
+  </div>
+</div>
+
+<!-- BOTTOM SAP STATUS BAR -->
+<div class="bg-[#1e293b] text-slate-300 text-xs px-3 py-1 flex items-center justify-between border-t border-slate-700">
+  <div class="flex items-center gap-2 truncate">
+    <span id="status_icon" class="text-emerald-400"><i class="ri-checkbox-circle-fill"></i></span>
+    <span id="status_msg" class="font-mono text-[11px] text-slate-200">System Ready.</span>
+  </div>
+  <div class="flex items-center gap-4 text-[10px] text-slate-400 font-mono">
+    <span>PRD</span>
+    <span>100</span>
+    <span id="stat_tcode">SESSION_01</span>
+    <span id="stat_resp">12ms</span>
+    <span>INS</span>
+  </div>
+</div>
+
+<!-- MODAL DIALOG CONTAINER -->
+<div id="sap_dialog" class="hidden fixed inset-0 bg-slate-900/60 z-50 flex items-center justify-center p-4">
+  <div id="sap_dialog_body" class="bg-white border-2 border-slate-600 rounded-sm shadow-2xl max-h-[90vh] overflow-y-auto w-full max-w-3xl">
+  </div>
+</div>
+
 <script>
-let ME=null, TCODE=null, LAYOUTS=[], CUR_LAYOUT=null;
-const $=s=>document.querySelector(s);
-async function api(path, opts={}){ const r=await fetch(path, {...opts, credentials:'include'}); if(r.status==401){ auth(); throw 'login'; } if(!r.ok){ let t=await r.text(); throw t; } try{ return await r.json(); } catch{ return {}; } }
-function auth(){
- root.innerHTML=`<div class="min-h-screen flex items-center justify-center p-4 bg-[#0f172a]"><div class="bg-white rounded-2xl p-8 w-full max-w-md shadow-2xl"><div class="flex items-center gap-3 mb-6"><div class="w-10 h-10 bg-black rounded-xl flex items-center justify-center text-white"><i class="ri-shield-keyhole-line text-xl"></i></div><div><h2 class="text-xl font-bold">Secure Login</h2><div class="text-[11px] text-gray-500">Thermocables Limited - Authorized Access Only</div></div></div><div><input id="lu" placeholder="Username" class="w-full border p-3 rounded-xl mb-3"><input id="lp" type="password" placeholder="Password" class="w-full border p-3 rounded-xl mb-4"><button onclick="login()" class="w-full bg-black text-white py-3 rounded-xl font-semibold">Login</button><div class="mt-4 text-[11px] text-gray-400 bg-gray-50 p-3 rounded-xl">Contact Admin for account. No self-registration.</div></div></div></div>`;
-}
-async function login(){
- const u=$("#lu").value.trim(), p=$("#lp").value.trim(); if(!u||!p) return alert("Enter both");
- const fd=new FormData(); fd.append("username",u); fd.append("password",p);
- try{ await fetch("/api/login",{method:"POST",body:fd,credentials:"include"}).then(async r=>{ if(!r.ok) throw await r.text(); }); location.reload(); } catch(e){ alert("Login failed: "+e); }
-}
-async function load(){
- try{ ME=await api("/api/me"); } catch{ return auth(); }
- root.innerHTML=`<div class="min-h-screen bg-[#f8fafc]"><header class="bg-white border-b px-6 py-3 flex items-center justify-between sticky top-0 z-10"><div class="flex items-center gap-4"><div class="font-bold text-lg"><i class="ri-shield-check-line"></i> ProTransfer V15 COMPLETE</div><span class="text-xs bg-black text-white px-2 py-1 rounded-full">${ME.role.toUpperCase()}</span><span class="text-xs text-gray-500">${ME.username} - ${ME.department} - ${ME.plant}</span></div><div class="flex items-center gap-2"><button onclick="showAdmin()" class="text-xs bg-gray-900 text-white px-3 py-2 rounded-xl ${ME.role!='admin' && ME.role!='master' ? 'hidden':''}"><i class="ri-settings-3-line"></i> Admin Panel - Master</button><button onclick="logout()" class="text-xs border px-3 py-2 rounded-xl">Logout</button></div></header><div class="p-6"><div id="tcodes" class="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4"></div><div id="main" class="mt-6"></div></div></div>`;
- loadTcodes();
-}
-async function loadTcodes(){
- const list=await api("/api/tcodes");
- $("#tcodes").innerHTML=list.map(t=>`<div onclick="openTcode('${t.code}')" class="bg-white rounded-2xl p-5 border hover:shadow-lg cursor-pointer"><div class="flex items-center gap-3"><div class="w-10 h-10 rounded-xl flex items-center justify-center text-white" style="background:${t.color}"><i class="${t.icon}"></i></div><div><div class="font-bold">${t.code}</div><div class="text-xs text-gray-500">${t.title}</div></div></div><div class="mt-3 text-[11px] text-gray-400">${t.description||''} • ${t.layout_count||0} layouts • ${t.allowed_depts}</div></div>`).join("") || "<div class='text-gray-400'>No T-Codes assigned</div>";
-}
-async function openTcode(code){
- TCODE=code; LAYOUTS=await api(`/api/tcode/${code}/layouts`);
- $("#main").innerHTML=`<div class="bg-white rounded-2xl border p-5"><div class="flex items-center justify-between"><h2 class="font-bold text-lg">${code} - Layouts</h2><button onclick="newLayout()" class="text-xs bg-black text-white px-3 py-2 rounded-xl">+ New Layout</button></div><div class="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3">${LAYOUTS.map(l=>`<div class="border rounded-xl p-4 ${l.is_default?'bg-gray-900 text-white':''}"><div class="font-bold text-sm">${l.layout_code} ${l.is_default?'<span class="text-[10px] bg-white text-black px-2 py-0.5 rounded-full">DEFAULT</span>':''}</div><div class="text-xs mt-1">${l.title}</div><div class="text-[11px] mt-1 text-gray-400">${l.description||''}</div><div class="mt-3 flex gap-2"><button onclick="openLayout('${l.layout_code}')" class="text-[11px] ${l.is_default?'bg-white text-black':'bg-black text-white'} px-3 py-1.5 rounded-full">Open</button><button onclick="setDefault(${l.id})" class="text-[11px] border px-3 py-1.5 rounded-full">Set Default</button><button onclick="deleteLayout(${l.id})" class="text-[11px] text-red-500">Del</button></div></div>`).join("")}</div><div id="records" class="mt-6"></div></div>`;
- if(LAYOUTS.length) openLayout(LAYOUTS[0].layout_code);
-}
-async function openLayout(lc){
- CUR_LAYOUT=LAYOUTS.find(x=>x.layout_code==lc); if(!CUR_LAYOUT) return;
- const sch=await api(`/api/tcode/${TCODE}/schema`);
- const recs=await api(`/api/tcode/${TCODE}/records?layout_code=${lc}`);
- let fields=CUR_LAYOUT.fields||sch.fields;
- $("#records").innerHTML=`<div class="border-t pt-5"><div class="flex items-center justify-between"><h3 class="font-bold">${CUR_LAYOUT.title} - Records (${recs.length})</h3><div class="flex gap-2"><button onclick="showAdd()" class="text-xs bg-black text-white px-3 py-2 rounded-xl">+ Add Record</button><a href="/api/tcode/${TCODE}/export" class="text-xs border px-3 py-2 rounded-xl">Export Excel</a><label class="text-xs border px-3 py-2 rounded-xl cursor-pointer">Import Excel<input type="file" class="hidden" onchange="importFile(event)"></label></div></div><div class="mt-4 overflow-x-auto"><table class="w-full text-xs"><thead><tr class="bg-gray-50">${fields.map(f=>`<th class="text-left p-2 border">${f.label}</th>`).join("")}<th class="p-2 border">By</th><th class="p-2 border">Actions</th></tr></thead><tbody>${recs.map(r=>`<tr>${fields.map(f=>`<td class="p-2 border">${(r.data[f.key]||'')}</td>`).join("")}<td class="p-2 border">${r.created_by_name||r.created_by}</td><td class="p-2 border"><button onclick="editRec(${r.id})" class="text-blue-600">Edit</button> <button onclick="delRec(${r.id})" class="text-red-600 ml-2">Del</button></td></tr>`).join("")}</tbody></table></div></div>
- <div id="formModal" class="hidden fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-20"><div class="bg-white rounded-2xl p-6 w-full max-w-3xl max-h-[90vh] overflow-auto"><h3 class="font-bold mb-4" id="formTitle">Add Record</h3><div id="formFields" class="grid grid-cols-3 gap-3"></div><div class="mt-4 flex gap-2"><button onclick="saveRec()" class="bg-black text-white px-4 py-2 rounded-xl text-sm">Save</button><button onclick="$('#formModal').classList.add('hidden')" class="border px-4 py-2 rounded-xl text-sm">Cancel</button></div></div></div>`;
- window._fields=fields; window._editingId=null;
-}
-function showAdd(){ window._editingId=null; $("#formTitle").innerText="Add Record"; renderForm({}); $("#formModal").classList.remove("hidden"); }
-function editRec(id){ fetch(`/api/tcode/${TCODE}/records`,{credentials:"include"}).then(r=>r.json()).then(list=>{ const rec=list.find(x=>x.id==id); if(!rec) return; window._editingId=id; $("#formTitle").innerText="Edit Record"; renderForm(rec.data); $("#formModal").classList.remove("hidden"); }); }
-function renderForm(data){ $("#formFields").innerHTML=window._fields.map(f=>`<div class="col-span-${f.width||1}"><label class="text-[11px] text-gray-500">${f.label}${f.required?'*':''}</label><${f.type=='textarea'?'textarea':'input'} type="${f.type=='number'?'number':'text'}" id="f_${f.key}" class="w-full border rounded-xl p-2.5 text-sm mt-1" ${f.type=='textarea'?'rows=3':''}>${data[f.key]||''}</${f.type=='textarea'?'textarea':'input'}></div>`).join(""); }
-async function saveRec(){ const obj={}; window._fields.forEach(f=>{ const el=$("#f_"+f.key); obj[f.key]=el.value; }); const method=window._editingId?"PUT":"POST"; const url=window._editingId?`/api/tcode/${TCODE}/records/${window._editingId}`:`/api/tcode/${TCODE}/records`; await fetch(url,{method,credentials:"include",headers:{"Content-Type":"application/json"},body:JSON.stringify(obj)}); $("#formModal").classList.add("hidden"); openLayout(CUR_LAYOUT.layout_code); }
-async function delRec(id){ if(!confirm("Delete?")) return; await fetch(`/api/tcode/${TCODE}/records/${id}`,{method:"DELETE",credentials:"include"}); openLayout(CUR_LAYOUT.layout_code); }
-async function importFile(e){ const fd=new FormData(); fd.append("file",e.target.files[0]); await fetch(`/api/tcode/${TCODE}/import`,{method:"POST",body:fd,credentials:"include"}); openLayout(CUR_LAYOUT.layout_code); }
-async function newLayout(){ const name=prompt("Layout name?"); if(!name) return; const title=prompt("Title?")||name; await fetch(`/api/tcode/${TCODE}/layouts`,{method:"POST",credentials:"include",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,title,fields:window._fields||[],layout_config:{columns:3}})}); openTcode(TCODE); }
-async function deleteLayout(id){ if(!confirm("Delete layout?")) return; await fetch(`/api/tcode/${TCODE}/layouts/${id}`,{method:"DELETE",credentials:"include"}); openTcode(TCODE); }
-async function setDefault(id){ await fetch(`/api/tcode/${TCODE}/layouts/${id}/set-default`,{method:"POST",credentials:"include"}); openTcode(TCODE); }
+let ME = null;
+let CURRENT_TCODE = null;
+let ACTIVE_LAYOUTS = [];
+let CURRENT_LAYOUT = null;
+let ALL_TCODES = [];
+const $ = s => document.querySelector(s);
 
-async function showAdmin(){
- const users=await api("/api/admin/users"); const depts=await api("/api/departments"); const plants=await api("/api/plants"); const allT=await api("/api/tcodes/all");
- $("#main").innerHTML=`<div class="bg-white rounded-2xl border p-6"><h2 class="font-bold text-lg">Admin Panel - MASTER - COMPLETE</h2>
- <div class="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
- <div><h3 class="font-bold text-sm mb-3">Create User</h3><div class="space-y-2"><input id="cu_u" placeholder="Username" class="w-full border p-2 rounded-xl text-sm"><input id="cu_p" placeholder="Password" class="w-full border p-2 rounded-xl text-sm"><input id="cu_fn" placeholder="Full Name" class="w-full border p-2 rounded-xl text-sm"><select id="cu_d" class="w-full border p-2 rounded-xl text-sm">${depts.map(d=>`<option>${d.name}</option>`).join("")}</select><select id="cu_pl" class="w-full border p-2 rounded-xl text-sm">${plants.map(p=>`<option>${p.name}</option>`).join("")}</select><select id="cu_r" class="w-full border p-2 rounded-xl text-sm"><option value="user">User</option><option value="admin">Admin</option>${ME.username=='admin'?'<option value="master">Master</option>':''}</select><button onclick="createUser()" class="w-full bg-black text-white py-2 rounded-xl text-sm">Create User</button></div></div>
- <div><h3 class="font-bold text-sm mb-3">Plants & Departments (MASTER ONLY) - Add/Delete</h3><div class="flex gap-2 mb-2"><input id="new_plant" placeholder="New Plant" class="border p-2 rounded-xl text-sm flex-1"><button onclick="addPlant()" class="bg-black text-white px-3 py-2 rounded-xl text-xs">+ Add Plant</button></div><div class="flex flex-wrap gap-2 mb-4">${plants.map(p=>`<span class="text-xs border px-2 py-1 rounded-full">${p.name} <button onclick="delPlant('${p.name}')" class="text-red-500 ml-1">x</button></span>`).join("")}</div><div class="flex gap-2 mb-2"><input id="new_dept" placeholder="New Dept" class="border p-2 rounded-xl text-sm flex-1"><button onclick="addDept()" class="bg-black text-white px-3 py-2 rounded-xl text-xs">+ Add Dept</button></div><div class="flex flex-wrap gap-2">${depts.map(d=>`<span class="text-xs border px-2 py-1 rounded-full">${d.name} <button onclick="delDept('${d.name}')" class="text-red-500 ml-1">x</button></span>`).join("")}</div></div>
- </div>
- <div class="mt-6"><h3 class="font-bold text-sm mb-3">Users (${users.length}) - Edit / Delete / Modify</h3><div class="overflow-x-auto"><table class="w-full text-xs"><thead><tr class="bg-gray-50"><th class="p-2 text-left">User</th><th class="p-2 text-left">Name</th><th class="p-2">Dept</th><th class="p-2">Plant</th><th class="p-2">Role</th><th class="p-2">Status</th><th class="p-2">Actions</th></tr></thead><tbody>${users.map(u=>`<tr class="border-t"><td class="p-2">${u.username}</td><td class="p-2">${u.full_name}</td><td class="p-2">${u.department}</td><td class="p-2">${u.plant}</td><td class="p-2">${u.role}</td><td class="p-2">${u.status}</td><td class="p-2 flex gap-1"><button onclick="editUser('${u.username}')" class="bg-blue-600 text-white px-2 py-1 rounded-full">Edit</button><button onclick="resetPass('${u.username}')" class="bg-yellow-600 text-white px-2 py-1 rounded-full">Reset PW</button><button onclick="deleteUser('${u.username}')" class="bg-red-600 text-white px-2 py-1 rounded-full">Del</button></td></tr>`).join("")}</tbody></table></div></div>
- <div class="mt-6"><h3 class="font-bold text-sm mb-3">T-Codes - Add / Edit / Delete (MASTER can Delete) - 6 T-Codes</h3><div class="grid grid-cols-6 gap-2 mb-3"><input id="tc_code" placeholder="CODE" class="border p-2 rounded-xl text-xs"><input id="tc_title" placeholder="Title" class="border p-2 rounded-xl text-xs col-span-2"><input id="tc_desc" placeholder="Desc" class="border p-2 rounded-xl text-xs col-span-2"><button onclick="addTcode()" class="bg-black text-white rounded-xl text-xs">+ New T-Code</button></div><div class="overflow-x-auto"><table class="w-full text-xs"><thead><tr class="bg-gray-50"><th class="p-2 text-left">Code</th><th class="p-2 text-left">Title</th><th class="p-2">Depts</th><th class="p-2">Color</th><th class="p-2">Actions</th></tr></thead><tbody>${allT.map(t=>`<tr class="border-t"><td class="p-2 font-bold">${t.code}</td><td class="p-2">${t.title}</td><td class="p-2">${t.allowed_depts}</td><td class="p-2"><div class="w-4 h-4 rounded" style="background:${t.color}"></div></td><td class="p-2"><button onclick="editTcode('${t.code}')" class="text-blue-600">Edit</button> <button onclick="delTcode('${t.code}')" class="text-red-600 ml-2">Del</button></td></tr>`).join("")}</tbody></table></div></div>
- </div>`;
+// UTILITY: Safe HTML Escaping (Prevents Stored XSS)
+function esc(str) {
+  if (str === null || str === undefined) return '';
+  return String(str).replace(/[&<>"']/g, function (s) {
+    return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[s];
+  });
 }
-async function createUser(){ const fd=new FormData(); fd.append("username",$("#cu_u").value); fd.append("password",$("#cu_p").value); fd.append("full_name",$("#cu_fn").value); fd.append("department",$("#cu_d").value); fd.append("plant",$("#cu_pl").value); fd.append("role",$("#cu_r").value); const r=await fetch("/api/admin/create-user",{method:"POST",body:fd,credentials:"include"}); if(!r.ok) alert(await r.text()); else showAdmin(); }
-async function deleteUser(u){ if(!confirm("Delete "+u+"?")) return; const fd=new FormData(); fd.append("username",u); const r=await fetch("/api/admin/delete-user",{method:"POST",body:fd,credentials:"include"}); if(!r.ok) alert(await r.text()); else showAdmin(); }
-async function editUser(u){ const fn=prompt("New Full Name?"); if(fn===null) return; const dept=prompt("Department?"); if(dept===null) return; const plant=prompt("Plant?"); if(plant===null) return; const role=prompt("Role (user/admin/master)?"); if(role===null) return; const status=prompt("Status (approved/pending)?")||"approved"; const fd=new FormData(); fd.append("username",u); fd.append("full_name",fn||u); fd.append("department",dept||""); fd.append("plant",plant||""); fd.append("role",role||"user"); fd.append("status",status); await fetch("/api/admin/update-user",{method:"POST",body:fd,credentials:"include"}); showAdmin(); }
-async function resetPass(u){ const np=prompt("New password for "+u+"?"); if(!np) return; const fd=new FormData(); fd.append("username",u); fd.append("new_password",np); await fetch("/api/admin/reset-password",{method:"POST",body:fd,credentials:"include"}); alert("Password reset"); }
-async function addPlant(){ const n=$("#new_plant").value.trim(); if(!n) return; const fd=new FormData(); fd.append("name",n); await fetch("/api/admin/plants/create",{method:"POST",body:fd,credentials:"include"}); showAdmin(); }
-async function delPlant(n){ if(!confirm("Delete plant "+n+"?")) return; const fd=new FormData(); fd.append("name",n); await fetch("/api/admin/plants/delete",{method:"POST",body:fd,credentials:"include"}); showAdmin(); }
-async function addDept(){ const n=$("#new_dept").value.trim(); if(!n) return; const fd=new FormData(); fd.append("name",n); await fetch("/api/admin/departments/create",{method:"POST",body:fd,credentials:"include"}); showAdmin(); }
-async function delDept(n){ if(!confirm("Delete dept "+n+"?")) return; const fd=new FormData(); fd.append("name",n); await fetch("/api/admin/departments/delete",{method:"POST",body:fd,credentials:"include"}); showAdmin(); }
-async function addTcode(){ const fd=new FormData(); fd.append("code",$("#tc_code").value); fd.append("title",$("#tc_title").value); fd.append("description",$("#tc_desc").value); fd.append("color","#3b82f6"); fd.append("icon","ri-apps-line"); fd.append("allowed_depts","Production,Quality Control"); const r=await fetch("/api/admin/tcodes/create",{method:"POST",body:fd,credentials:"include"}); if(!r.ok) alert(await r.text()); else showAdmin(); }
-async function editTcode(code){ const title=prompt("New title?"); if(!title) return; const desc=prompt("Description?")||""; const depts=prompt("Allowed departments comma separated?")||"Production"; const fd=new FormData(); fd.append("code",code); fd.append("title",title); fd.append("description",desc); fd.append("color","#3b82f6"); fd.append("icon","ri-apps-line"); fd.append("allowed_depts",depts); fd.append("active",1); await fetch("/api/admin/tcodes/update",{method:"POST",body:fd,credentials:"include"}); showAdmin(); }
-async function delTcode(code){ if(!confirm("MASTER DELETE T-Code "+code+"? All records will be deleted!")) return; const fd=new FormData(); fd.append("code",code); const r=await fetch("/api/admin/tcodes/delete",{method:"POST",body:fd,credentials:"include"}); if(!r.ok) alert(await r.text()); else showAdmin(); }
-async function logout(){ await fetch("/api/logout",{method:"POST",credentials:"include"}); location.reload(); }
-load();
-</script></body></html>
+
+function setMsg(msg, isErr = false, isWarn = false) {
+  const el = $('#status_msg'), ico = $('#status_icon');
+  el.textContent = msg;
+  if (isErr) {
+    ico.innerHTML = '<i class="ri-error-warning-fill text-red-500"></i>';
+    el.className = 'font-mono text-[11px] text-red-400 font-bold';
+  } else if (isWarn) {
+    ico.innerHTML = '<i class="ri-alert-fill text-amber-400"></i>';
+    el.className = 'font-mono text-[11px] text-amber-300';
+  } else {
+    ico.innerHTML = '<i class="ri-checkbox-circle-fill text-emerald-400"></i>';
+    el.className = 'font-mono text-[11px] text-emerald-300';
+  }
+}
+
+async function api(path, opts = {}) {
+  const t0 = performance.now();
+  const res = await fetch(path, {...opts, credentials: 'include'});
+  const t1 = performance.now();
+  $('#stat_resp').textContent = Math.round(t1 - t0) + 'ms';
+  if (res.status === 401) {
+    renderLogon();
+    throw 'Auth';
+  }
+  if (!res.ok) {
+    let t = await res.text();
+    try { t = JSON.parse(t).detail || t; } catch {}
+    throw t;
+  }
+  return await res.json();
+}
+
+// LOGON SCREEN
+function renderLogon() {
+  $('#sap_screen').innerHTML = `
+  <div class="h-full flex items-center justify-center bg-[#dbe4ee]">
+    <div class="w-96 bg-white border-2 border-slate-500 shadow-xl p-6 rounded-sm">
+      <div class="flex items-center gap-3 border-b-2 border-sky-800 pb-3 mb-4">
+        <div class="w-10 h-10 bg-sky-900 text-white flex items-center justify-center font-bold text-xl rounded">SAP</div>
+        <div>
+          <h2 class="font-bold text-base text-slate-800">SAP GUI 7.70 Logon</h2>
+          <div class="text-[11px] text-slate-500">Thermocables System PRD (Client 100)</div>
+        </div>
+      </div>
+      <div class="space-y-3">
+        <div>
+          <label class="block text-xs font-bold text-slate-600 mb-1">User ID</label>
+          <input id="l_u" class="sap-input w-full uppercase" placeholder="e.g. ADMIN" autofocus>
+        </div>
+        <div>
+          <label class="block text-xs font-bold text-slate-600 mb-1">Password</label>
+          <input id="l_p" type="password" class="sap-input w-full" placeholder="••••••••">
+        </div>
+        <button onclick="handleLogon()" class="sap-btn sap-btn-primary w-full py-2 mt-2">Log On</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+async function handleLogon() {
+  const u = $('#l_u').value.trim(), p = $('#l_p').value;
+  if (!u || !p) return setMsg("Enter User and Password", true);
+  const fd = new FormData();
+  fd.append("username", u); fd.append("password", p);
+  try {
+    await api('/api/login', {method: 'POST', body: fd});
+    setMsg("RFC Connection Established.");
+    initSession();
+  } catch(e) {
+    setMsg(e, true);
+  }
+}
+
+async function logout() {
+  await api('/api/logout', {method: 'POST'});
+  location.reload();
+}
+
+async function initSession() {
+  try {
+    ME = await api('/api/me');
+    $('#user_display').textContent = `${ME.username.toUpperCase()} (${ME.role.toUpperCase()})`;
+    $('#lbl_client').textContent = ME.client;
+    $('#lbl_sys').textContent = ME.system;
+    $('#plant_info_tree').textContent = "Authorized Plants: " + (ME.plants.join(", ") || "ALL");
+    setMsg(`User ${ME.username} authenticated successfully.`);
+    loadUserTree();
+    goHome();
+  } catch(e) {
+    renderLogon();
+  }
+}
+
+// SAP OK-CODE COMMAND HANDLER
+function execCmd() {
+  let val = $('#cmd_box').value.trim();
+  if (!val) return;
+  $('#cmd_box').value = '';
+  if (val.startsWith('/n') || val.startsWith('/N')) {
+    val = val.substring(2).trim();
+  }
+  if (!val) {
+    goHome();
+    return;
+  }
+  val = val.toUpperCase();
+  openTcode(val);
+}
+
+function goHome() {
+  CURRENT_TCODE = null;
+  $('#stat_tcode').textContent = "SESSION_01";
+  $('#title_crumb').textContent = "SAP Easy Access - User Menu";
+  $('#sap_screen').innerHTML = `
+    <div class="p-8 flex-1 overflow-y-auto bg-slate-50">
+      <div class="max-w-4xl mx-auto">
+        <div class="border-b-2 border-sky-800 pb-3 mb-6 flex justify-between items-end">
+          <div>
+            <h1 class="text-xl font-bold text-slate-800">SAP Easy Access</h1>
+            <p class="text-xs text-slate-500">Enterprise Core - Thermocables ProTransfer System</p>
+          </div>
+          <div class="text-right text-xs">
+            <span class="bg-sky-100 text-sky-800 border border-sky-300 px-2 py-1 rounded">System PRD - Client 100</span>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+          <div class="border border-slate-300 p-4 bg-white rounded shadow-sm">
+            <div class="text-xs font-bold text-slate-500 uppercase">My Organization</div>
+            <div class="text-lg font-bold text-slate-800 mt-1">${esc(ME.company)}</div>
+            <div class="text-xs text-slate-500 mt-1">Dept: <b>${esc(ME.department)}</b></div>
+          </div>
+          <div class="border border-slate-300 p-4 bg-white rounded shadow-sm">
+            <div class="text-xs font-bold text-slate-500 uppercase">My Authorizations</div>
+            <div class="text-lg font-bold text-slate-800 mt-1">${ME.is_master ? 'SAP_ALL (MASTER)' : (ME.role === 'admin' ? 'ADMIN (S_ALL)' : 'OPERATOR')}</div>
+            <div class="text-xs text-slate-500 mt-1">Plants: ${esc(ME.plants.join(', ') || 'ALL')}</div>
+          </div>
+          <div class="border border-slate-300 p-4 bg-white rounded shadow-sm">
+            <div class="text-xs font-bold text-slate-500 uppercase">Command Shortcut</div>
+            <div class="text-xs text-slate-600 mt-2">Enter <code class="bg-slate-100 px-1 border rounded text-sky-700 font-bold">/nPROD</code> or <code class="bg-slate-100 px-1 border rounded text-sky-700 font-bold">/nSU01</code> in the top command bar.</div>
+          </div>
+        </div>
+
+        <h3 class="font-bold text-xs uppercase text-slate-600 mb-3 tracking-wider">Quick Transaction Launcher</h3>
+        <div id="quick_tiles" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+          <!-- Populated from T-Codes -->
+        </div>
+      </div>
+    </div>`;
+
+  renderQuickTiles();
+}
+
+async function loadUserTree() {
+  ALL_TCODES = await api('/api/se93/list');
+  let treeHtml = `
+    <div class="font-bold text-slate-700 py-1 flex items-center gap-1.5"><i class="ri-folder-star-line text-amber-600"></i> Favorites</div>
+    <div class="pl-4 space-y-0.5 border-l border-slate-300 ml-2 mb-2">
+      <div onclick="openTcode('PROD')" class="cursor-pointer hover:bg-slate-300 px-1.5 py-0.5 rounded flex items-center gap-1"><i class="ri-file-list-2-line text-blue-700"></i> PROD - Handover</div>
+      <div onclick="openTcode('GCH0')" class="cursor-pointer hover:bg-slate-300 px-1.5 py-0.5 rounded flex items-center gap-1"><i class="ri-shield-check-line text-green-700"></i> GCH0 - Green Card</div>
+    </div>
+
+    <div class="font-bold text-slate-700 py-1 flex items-center gap-1.5"><i class="ri-folder-line text-blue-600"></i> SAP Menu</div>
+    <div class="pl-4 space-y-0.5 border-l border-slate-300 ml-2">
+  `;
+
+  if (ME.is_master || ME.role === 'admin') {
+    treeHtml += `
+      <div class="font-bold text-slate-600 pt-1 text-[11px]"><i class="ri-shield-keyhole-line text-red-600"></i> Basis Administration</div>
+      <div class="pl-3 space-y-0.5 border-l border-slate-300 ml-1">
+        <div onclick="openTcode('SU01')" class="cursor-pointer hover:bg-slate-300 px-1.5 py-0.5 rounded flex items-center gap-1"><i class="ri-user-settings-line text-sky-700"></i> SU01 - User Master</div>
+        <div onclick="openTcode('PFCG')" class="cursor-pointer hover:bg-slate-300 px-1.5 py-0.5 rounded flex items-center gap-1"><i class="ri-lock-password-line text-sky-700"></i> PFCG - Authorizations</div>
+        <div onclick="openTcode('SE93')" class="cursor-pointer hover:bg-slate-300 px-1.5 py-0.5 rounded flex items-center gap-1"><i class="ri-code-box-line text-sky-700"></i> SE93 - Maintain T-Codes</div>
+        <div onclick="openTcode('SPRO')" class="cursor-pointer hover:bg-slate-300 px-1.5 py-0.5 rounded flex items-center gap-1"><i class="ri-building-line text-sky-700"></i> SPRO - Enterprise Config</div>
+      </div>
+    `;
+  }
+
+  treeHtml += `
+    <div class="font-bold text-slate-600 pt-1 text-[11px]"><i class="ri-apps-line text-indigo-600"></i> Logistics & Operations</div>
+    <div class="pl-3 space-y-0.5 border-l border-slate-300 ml-1">
+  `;
+
+  ALL_TCODES.filter(t => t.has_access).forEach(t => {
+    treeHtml += `<div onclick="openTcode('${t.code}')" class="cursor-pointer hover:bg-slate-300 px-1.5 py-0.5 rounded flex items-center justify-between">
+      <span><b class="text-sky-800">${t.code}</b> - ${esc(t.title)}</span>
+    </div>`;
+  });
+
+  treeHtml += `</div></div>`;
+  $('#tree_view').innerHTML = treeHtml;
+}
+
+function renderQuickTiles() {
+  const container = $('#quick_tiles');
+  if (!container) return;
+  const list = ALL_TCODES.filter(t => t.has_access);
+  container.innerHTML = list.map(t => `
+    <div onclick="openTcode('${t.code}')" class="bg-white border border-slate-300 hover:border-sky-600 p-3 rounded cursor-pointer shadow-sm hover:shadow transition-all">
+      <div class="flex justify-between items-start">
+        <span class="font-bold font-mono text-sky-800 text-sm bg-sky-50 px-1.5 py-0.5 border border-sky-200 rounded">${t.code}</span>
+        <span class="text-[10px] bg-slate-100 text-slate-600 px-1 rounded uppercase font-semibold">${t.module || 'ERP'}</span>
+      </div>
+      <div class="font-semibold text-slate-800 text-xs mt-2">${esc(t.title)}</div>
+      <div class="text-[11px] text-slate-500 mt-0.5 line-clamp-1">${esc(t.description || 'SAP Transaction Standard')}</div>
+      <div class="mt-3 flex justify-between items-center text-[10px] text-slate-400 border-t pt-1.5">
+        <span>${t.record_count} Records</span>
+        <span>${t.layout_count} ALV Layouts</span>
+      </div>
+    </div>
+  `).join('');
+}
+
+// SAP TRANSACTION ROUTER
+async function openTcode(code) {
+  code = code.toUpperCase().trim();
+  CURRENT_TCODE = code;
+  $('#stat_tcode').textContent = code;
+  setMsg(`Transaction ${code} executing...`);
+
+  // Handle Internal Standard Admin T-Codes
+  if (code === 'SU01') return renderSU01();
+  if (code === 'SE93') return renderSE93();
+  if (code === 'SPRO') return renderSPRO();
+  if (code === 'PFCG') return renderPFCG();
+
+  // Handle Dynamic Business T-Codes
+  const tc = ALL_TCODES.find(x => x.code === code);
+  if (!tc) {
+    setMsg(`Transaction ${code} does not exist in repository`, true);
+    return;
+  }
+  if (!tc.has_access) {
+    setMsg(`No authorization to start transaction ${code}`, true);
+    return;
+  }
+  renderBusinessTcode(tc);
+}
+
+// ==========================================
+// SAP SU01: USER MAINTENANCE
+// ==========================================
+async function renderSU01() {
+  if (!ME.is_master && ME.role !== 'admin') {
+    setMsg("Authorization S_USER_GRP missing", true);
+    return;
+  }
+  $('#title_crumb').textContent = "SU01: User Maintenance Master Record";
+  const users = await api('/api/su01/users');
+  const depts = (await api('/api/spro/overview')).departments;
+  const plants = (await api('/api/spro/overview')).plants;
+
+  $('#sap_screen').innerHTML = `
+    <div class="p-4 flex-1 flex flex-col overflow-hidden bg-slate-100">
+      <div class="bg-white border border-slate-400 p-2.5 mb-3 flex items-center justify-between rounded-sm">
+        <div class="flex items-center gap-2">
+          <button onclick="showCreateUserModal()" class="sap-btn sap-btn-primary"><i class="ri-user-add-line"></i> Create User (F5)</button>
+          <button onclick="renderSU01()" class="sap-btn"><i class="ri-refresh-line"></i> Refresh</button>
+        </div>
+        <span class="text-xs text-slate-600 font-semibold">User Master Records: <b>${users.length}</b></span>
+      </div>
+
+      <div class="flex-1 bg-white border border-slate-400 overflow-auto">
+        <table class="w-full sap-table border-collapse">
+          <thead>
+            <tr>
+              <th>User ID</th>
+              <th>Full Name</th>
+              <th>Role</th>
+              <th>Department</th>
+              <th>Assigned Plants</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${users.map(u => `
+              <tr>
+                <td class="font-mono font-bold text-sky-800">${esc(u.username)}</td>
+                <td>${esc(u.full_name)}</td>
+                <td><span class="px-1.5 py-0.5 rounded text-[10px] uppercase font-bold ${u.role==='master'?'bg-red-100 text-red-800 border border-red-300':(u.role==='admin'?'bg-amber-100 text-amber-800 border border-amber-300':'bg-slate-100 text-slate-700')}">${u.role}</span></td>
+                <td>${esc(u.department)}</td>
+                <td>${esc(u.plants || 'ALL')}</td>
+                <td><span class="px-1.5 py-0.2 rounded text-[10px] ${u.status==='approved'?'text-emerald-700 bg-emerald-50':'text-red-700 bg-red-50'}">${u.status}</span></td>
+                <td class="space-x-1">
+                  <button onclick="showEditUserModal('${esc(u.username)}')" class="sap-btn text-blue-700">Change</button>
+                  <button onclick="showResetPassModal('${esc(u.username)}')" class="sap-btn text-amber-700">Password</button>
+                  <button onclick="deleteUser('${esc(u.username)}')" class="sap-btn text-red-700 ${u.role==='master'?'opacity-30 cursor-not-allowed':''}">Delete</button>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+  setMsg("SU01: Ready.");
+}
+
+function showCreateUserModal() {
+  api('/api/spro/overview').then(data => {
+    openDialog(`
+      <div class="border-b border-slate-400 bg-slate-200 px-4 py-2 font-bold text-slate-800 flex justify-between">
+        <span>SU01 - Create User Master Record</span>
+        <button onclick="closeDialog()"><i class="ri-close-line"></i></button>
+      </div>
+      <div class="p-4 space-y-3">
+        <div class="grid grid-cols-2 gap-3">
+          <div><label class="block text-xs font-bold text-slate-600">User ID</label><input id="nu_u" class="sap-input w-full uppercase"></div>
+          <div><label class="block text-xs font-bold text-slate-600">Initial Password</label><input id="nu_p" type="password" class="sap-input w-full"></div>
+        </div>
+        <div><label class="block text-xs font-bold text-slate-600">Full Name</label><input id="nu_fn" class="sap-input w-full"></div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs font-bold text-slate-600">Department</label>
+            <select id="nu_d" class="sap-input w-full">
+              ${data.departments.map(d=>`<option value="${esc(d.name)}">${esc(d.name)}</option>`).join('')}
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs font-bold text-slate-600">Role Profile</label>
+            <select id="nu_r" class="sap-input w-full">
+              <option value="user">User (Standard)</option>
+              <option value="admin">Admin (S_ALL)</option>
+              ${ME.is_master ? '<option value="master">Master Superuser (SAP_ALL)</option>' : ''}
+            </select>
+          </div>
+        </div>
+        <div>
+          <label class="block text-xs font-bold text-slate-600">Plant Authorization (comma-separated)</label>
+          <input id="nu_pl" class="sap-input w-full" placeholder="e.g. 1000, 1400 (leave blank for ALL)">
+        </div>
+      </div>
+      <div class="border-t border-slate-300 p-3 bg-slate-100 flex justify-end gap-2">
+        <button onclick="submitCreateUser()" class="sap-btn sap-btn-primary">Save (Ctrl+S)</button>
+        <button onclick="closeDialog()" class="sap-btn">Cancel</button>
+      </div>
+    `);
+  });
+}
+
+async function submitCreateUser() {
+  const fd = new FormData();
+  fd.append("username", $('#nu_u').value);
+  fd.append("password", $('#nu_p').value);
+  fd.append("full_name", $('#nu_fn').value);
+  fd.append("department", $('#nu_d').value);
+  fd.append("role", $('#nu_r').value);
+  fd.append("plants", $('#nu_pl').value);
+  try {
+    await api('/api/su01/create', {method: 'POST', body: fd});
+    closeDialog();
+    renderSU01();
+    setMsg("User created successfully.");
+  } catch(e) {
+    alert("Error: " + e);
+  }
+}
+
+async function showEditUserModal(u) {
+  const users = await api('/api/su01/users');
+  const user = users.find(x => x.username === u);
+  const data = await api('/api/spro/overview');
+  openDialog(`
+    <div class="border-b border-slate-400 bg-slate-200 px-4 py-2 font-bold text-slate-800 flex justify-between">
+      <span>SU01 - Change User Master: ${esc(u)}</span>
+      <button onclick="closeDialog()"><i class="ri-close-line"></i></button>
+    </div>
+    <div class="p-4 space-y-3">
+      <div><label class="block text-xs font-bold text-slate-600">Full Name</label><input id="eu_fn" value="${esc(user.full_name)}" class="sap-input w-full"></div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-bold text-slate-600">Department</label>
+          <select id="eu_d" class="sap-input w-full">
+            ${data.departments.map(d=>`<option value="${esc(d.name)}" ${d.name===user.department?'selected':''}>${esc(d.name)}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs font-bold text-slate-600">Role</label>
+          <select id="eu_r" class="sap-input w-full">
+            <option value="user" ${user.role==='user'?'selected':''}>User</option>
+            <option value="admin" ${user.role==='admin'?'selected':''}>Admin</option>
+            ${ME.is_master ? `<option value="master" ${user.role==='master'?'selected':''}>Master</option>` : ''}
+          </select>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-bold text-slate-600">Plants</label>
+          <input id="eu_pl" value="${esc(user.plants||'')}" class="sap-input w-full">
+        </div>
+        <div>
+          <label class="block text-xs font-bold text-slate-600">Status</label>
+          <select id="eu_st" class="sap-input w-full">
+            <option value="approved" ${user.status==='approved'?'selected':''}>Approved / Unlocked</option>
+            <option value="locked" ${user.status==='locked'?'selected':''}>Locked</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="border-t border-slate-300 p-3 bg-slate-100 flex justify-end gap-2">
+      <button onclick="submitEditUser('${esc(u)}')" class="sap-btn sap-btn-primary">Update</button>
+      <button onclick="closeDialog()" class="sap-btn">Cancel</button>
+    </div>
+  `);
+}
+
+async function submitEditUser(u) {
+  const fd = new FormData();
+  fd.append("username", u);
+  fd.append("full_name", $('#eu_fn').value);
+  fd.append("department", $('#eu_d').value);
+  fd.append("role", $('#eu_r').value);
+  fd.append("plants", $('#eu_pl').value);
+  fd.append("status", $('#eu_st').value);
+  try {
+    await api('/api/su01/update', {method: 'POST', body: fd});
+    closeDialog();
+    renderSU01();
+    setMsg("User master record updated.");
+  } catch(e) {
+    alert("Error: " + e);
+  }
+}
+
+function showResetPassModal(u) {
+  const p = prompt(`Enter new password for ${u}:`);
+  if (!p) return;
+  const fd = new FormData();
+  fd.append("username", u);
+  fd.append("new_password", p);
+  api('/api/su01/reset-password', {method: 'POST', body: fd}).then(() => {
+    setMsg(`Password reset for ${u}`);
+  }).catch(e => alert(e));
+}
+
+async function deleteUser(u) {
+  if (!confirm(`Are you sure you want to delete user ${u}?`)) return;
+  const fd = new FormData(); fd.append("username", u);
+  try {
+    await api('/api/su01/delete', {method: 'POST', body: fd});
+    renderSU01();
+    setMsg(`User ${u} deleted.`);
+  } catch(e) {
+    alert(e);
+  }
+}
+
+// ==========================================
+// SAP SE93: TRANSACTION CODE MAINTENANCE
+// ==========================================
+async function renderSE93() {
+  if (!ME.is_master && ME.role !== 'admin') {
+    setMsg("Authorization S_DEVELOP missing", true);
+    return;
+  }
+  $('#title_crumb').textContent = "SE93: Maintain Transaction Repository";
+  const list = await api('/api/se93/list');
+
+  $('#sap_screen').innerHTML = `
+    <div class="p-4 flex-1 flex flex-col overflow-hidden bg-slate-100">
+      <div class="bg-white border border-slate-400 p-2.5 mb-3 flex items-center justify-between rounded-sm">
+        <div class="flex items-center gap-2">
+          <button onclick="showCreateTcodeModal()" class="sap-btn sap-btn-primary"><i class="ri-add-line"></i> Create T-Code (F5)</button>
+          <button onclick="renderSE93()" class="sap-btn"><i class="ri-refresh-line"></i> Refresh</button>
+        </div>
+        <span class="text-xs text-slate-600 font-semibold">Repository T-Codes: <b>${list.length}</b></span>
+      </div>
+
+      <div class="flex-1 bg-white border border-slate-400 overflow-auto">
+        <table class="w-full sap-table border-collapse">
+          <thead>
+            <tr>
+              <th>T-Code</th>
+              <th>Description / Title</th>
+              <th>Module</th>
+              <th>Authorized Depts</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${list.map(t => `
+              <tr>
+                <td class="font-mono font-bold text-sky-800">${esc(t.code)}</td>
+                <td>${esc(t.title)}</td>
+                <td><span class="font-mono bg-slate-100 px-1 border">${esc(t.module || 'ERP')}</span></td>
+                <td>${esc(t.allowed_depts)}</td>
+                <td><span class="text-[10px] ${t.active?'text-emerald-700':'text-red-700'}">${t.active?'ACTIVE':'INACTIVE'}</span></td>
+                <td class="space-x-1">
+                  <button onclick="openTcode('${esc(t.code)}')" class="sap-btn text-emerald-800">Execute</button>
+                  <button onclick="showEditTcodeModal('${esc(t.code)}')" class="sap-btn text-blue-800">Edit</button>
+                  <button onclick="deleteTcode('${esc(t.code)}')" class="sap-btn text-red-800">Delete</button>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+  setMsg("SE93: Ready.");
+}
+
+function showCreateTcodeModal() {
+  openDialog(`
+    <div class="border-b border-slate-400 bg-slate-200 px-4 py-2 font-bold text-slate-800 flex justify-between">
+      <span>SE93 - Create Transaction Code</span>
+      <button onclick="closeDialog()"><i class="ri-close-line"></i></button>
+    </div>
+    <div class="p-4 space-y-3">
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="block text-xs font-bold text-slate-600">T-Code</label><input id="nt_c" class="sap-input w-full uppercase" placeholder="e.g. ZPR0"></div>
+        <div><label class="block text-xs font-bold text-slate-600">Module (PP, QM, MM, FI)</label><input id="nt_m" class="sap-input w-full uppercase" value="PP"></div>
+      </div>
+      <div><label class="block text-xs font-bold text-slate-600">Transaction Title</label><input id="nt_t" class="sap-input w-full" placeholder="e.g. Cable Core Processing"></div>
+      <div><label class="block text-xs font-bold text-slate-600">Description</label><textarea id="nt_d" class="sap-input w-full" rows="2"></textarea></div>
+      <div><label class="block text-xs font-bold text-slate-600">Allowed Departments (comma separated)</label><input id="nt_ad" class="sap-input w-full" value="Production,Quality Control"></div>
+    </div>
+    <div class="border-t border-slate-300 p-3 bg-slate-100 flex justify-end gap-2">
+      <button onclick="submitCreateTcode()" class="sap-btn sap-btn-primary">Generate</button>
+      <button onclick="closeDialog()" class="sap-btn">Cancel</button>
+    </div>
+  `);
+}
+
+async function submitCreateTcode() {
+  const fd = new FormData();
+  fd.append("code", $('#nt_c').value);
+  fd.append("module", $('#nt_m').value);
+  fd.append("title", $('#nt_t').value);
+  fd.append("description", $('#nt_d').value);
+  fd.append("allowed_depts", $('#nt_ad').value);
+  try {
+    await api('/api/se93/create', {method: 'POST', body: fd});
+    closeDialog();
+    renderSE93();
+    loadUserTree();
+    setMsg("T-Code generated in SAP Repository.");
+  } catch(e) {
+    alert("Error: " + e);
+  }
+}
+
+async function showEditTcodeModal(code) {
+  const list = await api('/api/se93/list');
+  const t = list.find(x => x.code === code);
+  openDialog(`
+    <div class="border-b border-slate-400 bg-slate-200 px-4 py-2 font-bold text-slate-800 flex justify-between">
+      <span>SE93 - Maintain Transaction: ${esc(code)}</span>
+      <button onclick="closeDialog()"><i class="ri-close-line"></i></button>
+    </div>
+    <div class="p-4 space-y-3">
+      <div><label class="block text-xs font-bold text-slate-600">Title</label><input id="et_t" value="${esc(t.title)}" class="sap-input w-full"></div>
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="block text-xs font-bold text-slate-600">Module</label><input id="et_m" value="${esc(t.module||'ERP')}" class="sap-input w-full uppercase"></div>
+        <div>
+          <label class="block text-xs font-bold text-slate-600">Status</label>
+          <select id="et_st" class="sap-input w-full">
+            <option value="1" ${t.active? 'selected':''}>Active</option>
+            <option value="0" ${!t.active? 'selected':''}>Inactive</option>
+          </select>
+        </div>
+      </div>
+      <div><label class="block text-xs font-bold text-slate-600">Allowed Departments</label><input id="et_ad" value="${esc(t.allowed_depts)}" class="sap-input w-full"></div>
+      <div><label class="block text-xs font-bold text-slate-600">Description</label><textarea id="et_d" class="sap-input w-full">${esc(t.description||'')}</textarea></div>
+    </div>
+    <div class="border-t border-slate-300 p-3 bg-slate-100 flex justify-end gap-2">
+      <button onclick="submitEditTcode('${esc(code)}')" class="sap-btn sap-btn-primary">Save Changes</button>
+      <button onclick="closeDialog()" class="sap-btn">Cancel</button>
+    </div>
+  `);
+}
+
+async function submitEditTcode(code) {
+  const fd = new FormData();
+  fd.append("code", code);
+  fd.append("title", $('#et_t').value);
+  fd.append("module", $('#et_m').value);
+  fd.append("active", $('#et_st').value);
+  fd.append("allowed_depts", $('#et_ad').value);
+  fd.append("description", $('#et_d').value);
+  try {
+    await api('/api/se93/update', {method: 'POST', body: fd});
+    closeDialog();
+    renderSE93();
+    setMsg(`T-Code ${code} updated.`);
+  } catch(e) {
+    alert(e);
+  }
+}
+
+async function deleteTcode(code) {
+  if (!confirm(`Warning: Deleting ${code} permanently destroys all layouts and records linked to it. Continue?`)) return;
+  const fd = new FormData(); fd.append("code", code);
+  try {
+    await api('/api/se93/delete', {method: 'POST', body: fd});
+    renderSE93();
+    loadUserTree();
+    setMsg(`T-Code ${code} deleted.`);
+  } catch(e) {
+    alert(e);
+  }
+}
+
+// ==========================================
+// SAP SPRO: ENTERPRISE STRUCTURE (PLANTS / DEPTS)
+// ==========================================
+async function renderSPRO() {
+  if (!ME.is_master) {
+    setMsg("SPRO Configuration restricted to MASTER Administrator", true);
+    return;
+  }
+  $('#title_crumb').textContent = "SPRO: Customizing: Enterprise Structure";
+  const data = await api('/api/spro/overview');
+
+  $('#sap_screen').innerHTML = `
+    <div class="p-4 flex-1 flex flex-col overflow-hidden bg-slate-100">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 overflow-auto">
+        <!-- PLANTS MANAGER -->
+        <div class="bg-white border border-slate-400 flex flex-col rounded-sm">
+          <div class="bg-slate-200 border-b border-slate-300 p-2 font-bold text-xs flex justify-between items-center">
+            <span><i class="ri-building-line text-sky-800"></i> Define Plants</span>
+            <button onclick="showCreatePlantModal()" class="sap-btn sap-btn-primary">+ Add Plant</button>
+          </div>
+          <div class="flex-1 overflow-auto">
+            <table class="w-full sap-table border-collapse">
+              <thead><tr><th>Code</th><th>Plant Name</th><th>Status</th><th>Actions</th></tr></thead>
+              <tbody>
+                ${data.plants.map(p => `
+                  <tr>
+                    <td class="font-mono font-bold">${esc(p.code)}</td>
+                    <td>${esc(p.name)}</td>
+                    <td><span class="text-[10px] ${p.active?'text-emerald-700':'text-red-700'}">${p.active?'Active':'Disabled'}</span></td>
+                    <td><button onclick="deletePlant('${esc(p.code)}')" class="sap-btn text-red-700">Delete</button></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- DEPARTMENTS MANAGER -->
+        <div class="bg-white border border-slate-400 flex flex-col rounded-sm">
+          <div class="bg-slate-200 border-b border-slate-300 p-2 font-bold text-xs flex justify-between items-center">
+            <span><i class="ri-team-line text-sky-800"></i> Define Departments</span>
+            <button onclick="showCreateDeptModal()" class="sap-btn sap-btn-primary">+ Add Dept</button>
+          </div>
+          <div class="flex-1 overflow-auto">
+            <table class="w-full sap-table border-collapse">
+              <thead><tr><th>Department Name</th><th>Status</th><th>Actions</th></tr></thead>
+              <tbody>
+                ${data.departments.map(d => `
+                  <tr>
+                    <td class="font-bold">${esc(d.name)}</td>
+                    <td><span class="text-[10px] ${d.active?'text-emerald-700':'text-red-700'}">${d.active?'Active':'Disabled'}</span></td>
+                    <td><button onclick="deleteDept('${esc(d.name)}')" class="sap-btn text-red-700">Delete</button></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+  setMsg("SPRO: Ready.");
+}
+
+function showCreatePlantModal() {
+  const c = prompt("Enter 4-digit Plant Code (e.g. 1500):");
+  if (!c) return;
+  const n = prompt("Enter Plant Description:");
+  if (!n) return;
+  const fd = new FormData(); fd.append("code", c); fd.append("name", n);
+  api('/api/admin/plants/create', {method: 'POST', body: fd}).then(() => { renderSPRO(); setMsg("Plant configured."); }).catch(e => alert(e));
+}
+
+function deletePlant(code) {
+  if (!confirm(`Delete Plant ${code}?`)) return;
+  const fd = new FormData(); fd.append("code", code);
+  api('/api/admin/plants/delete', {method: 'POST', body: fd}).then(() => { renderSPRO(); setMsg("Plant removed."); }).catch(e => alert(e));
+}
+
+function showCreateDeptModal() {
+  const d = prompt("Enter Department Name:");
+  if (!d) return;
+  const fd = new FormData(); fd.append("name", d);
+  api('/api/admin/departments/create', {method: 'POST', body: fd}).then(() => { renderSPRO(); setMsg("Department created."); }).catch(e => alert(e));
+}
+
+function deleteDept(name) {
+  if (!confirm(`Delete Department ${name}?`)) return;
+  const fd = new FormData(); fd.append("name", name);
+  api('/api/admin/departments/delete', {method: 'POST', body: fd}).then(() => { renderSPRO(); setMsg("Department removed."); }).catch(e => alert(e));
+}
+
+// ==========================================
+// SAP PFCG: AUTHORIZATIONS & ROLES MATRIX
+// ==========================================
+async function renderPFCG() {
+  if (!ME.is_master && ME.role !== 'admin') {
+    setMsg("Authorization S_USER_AGR missing", true);
+    return;
+  }
+  $('#title_crumb').textContent = "PFCG: Role & Authorization Assignment Matrix";
+  const m = await api('/api/pfcg/matrix');
+
+  $('#sap_screen').innerHTML = `
+    <div class="p-4 flex-1 flex flex-col overflow-hidden bg-slate-100">
+      <div class="bg-white border border-slate-400 p-2.5 mb-3 flex items-center justify-between rounded-sm">
+        <span class="text-xs text-slate-700 font-bold">Explicit T-Code Grants to Users</span>
+        <div class="flex items-center gap-2">
+          <select id="pfcg_u" class="sap-input text-xs">${m.users.map(u=>`<option value="${esc(u.username)}">${esc(u.username)} (${esc(u.full_name)})</option>`).join('')}</select>
+          <select id="pfcg_t" class="sap-input text-xs">${m.tcodes.map(t=>`<option value="${esc(t.code)}">${esc(t.code)} - ${esc(t.title)}</option>`).join('')}</select>
+          <button onclick="grantAccess()" class="sap-btn sap-btn-primary">+ Grant T-Code</button>
+        </div>
+      </div>
+
+      <div class="flex-1 bg-white border border-slate-400 overflow-auto">
+        <table class="w-full sap-table border-collapse">
+          <thead><tr><th>User ID</th><th>Granted T-Code</th><th>Granted By</th><th>Timestamp</th><th>Action</th></tr></thead>
+          <tbody>
+            ${m.grants.map(g => `
+              <tr>
+                <td class="font-mono font-bold text-sky-800">${esc(g.username)}</td>
+                <td class="font-mono font-bold">${esc(g.tcode_code)}</td>
+                <td>${esc(g.granted_by)}</td>
+                <td>${esc(g.granted_at)}</td>
+                <td><button onclick="revokeAccess('${esc(g.username)}','${esc(g.tcode_code)}')" class="sap-btn text-red-700">Revoke</button></td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+  setMsg("PFCG: Ready.");
+}
+
+async function grantAccess() {
+  const u = $('#pfcg_u').value, t = $('#pfcg_t').value;
+  const fd = new FormData(); fd.append("username", u); fd.append("tcode", t);
+  await api('/api/pfcg/grant', {method: 'POST', body: fd});
+  renderPFCG();
+  setMsg("Authorization granted.");
+}
+
+async function revokeAccess(u, t) {
+  if (!confirm(`Revoke ${t} from ${u}?`)) return;
+  const fd = new FormData(); fd.append("username", u); fd.append("tcode", t);
+  await api('/api/pfcg/revoke', {method: 'POST', body: fd});
+  renderPFCG();
+  setMsg("Authorization revoked.");
+}
+
+// ==========================================
+// SAP BUSINESS T-CODE CONTROLLER & ALV GRID
+// ==========================================
+async function renderBusinessTcode(tc) {
+  $('#title_crumb').textContent = `${tc.code}: ${tc.title}`;
+  ACTIVE_LAYOUTS = await api(`/api/tcode/${tc.code}/layouts`);
+  CURRENT_LAYOUT = ACTIVE_LAYOUTS.find(l => l.is_default) || ACTIVE_LAYOUTS[0];
+
+  const sproData = await api('/api/spro/overview');
+  const allowedPlants = sproData.plants.filter(p => !ME.plants.length || ME.plants.includes(p.code));
+
+  $('#sap_screen').innerHTML = `
+    <div class="flex-1 flex flex-col overflow-hidden bg-slate-100">
+      <!-- SAP APPLICATION TOOLBAR -->
+      <div class="bg-[#f8fafc] border-b border-slate-300 p-2 flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <button onclick="showRecordModal()" class="sap-btn sap-btn-primary flex items-center gap-1"><i class="ri-add-line"></i> New Entry</button>
+          <div class="h-4 w-[1px] bg-slate-300"></div>
+
+          <!-- Plant Filter -->
+          <label class="text-xs font-bold text-slate-600 flex items-center gap-1">Plant:
+            <select id="rec_plant_filter" onchange="reloadRecords()" class="sap-input text-xs font-normal">
+              <option value="">(All Plants)</option>
+              ${allowedPlants.map(p=>`<option value="${esc(p.code)}">${esc(p.code)} - ${esc(p.name)}</option>`).join('')}
+            </select>
+          </label>
+
+          <div class="h-4 w-[1px] bg-slate-300"></div>
+
+          <!-- Layout Variants -->
+          <label class="text-xs font-bold text-slate-600 flex items-center gap-1">ALV Variant:
+            <select id="alv_variant_sel" onchange="switchLayout(this.value)" class="sap-input text-xs font-normal">
+              ${ACTIVE_LAYOUTS.map(l => `<option value="${esc(l.layout_code)}" ${CURRENT_LAYOUT && l.layout_code===CURRENT_LAYOUT.layout_code?'selected':''}>${esc(l.name)}</option>`).join('')}
+            </select>
+          </label>
+          <button onclick="showLayoutDesigner()" title="Change Layout Variant" class="sap-btn"><i class="ri-layout-masonry-line"></i> Layout Painter</button>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <a href="/api/tcode/${tc.code}/export" class="sap-btn flex items-center gap-1 text-emerald-800"><i class="ri-file-excel-2-line"></i> Export ALV</a>
+          <label class="sap-btn cursor-pointer flex items-center gap-1 text-sky-800">
+            <i class="ri-upload-2-line"></i> Import Spreadsheet
+            <input type="file" class="hidden" onchange="importSpreadsheet(event)">
+          </label>
+          <button onclick="reloadRecords()" class="sap-btn"><i class="ri-refresh-line"></i></button>
+        </div>
+      </div>
+
+      <!-- ALV TABLE CONTAINER -->
+      <div id="alv_container" class="flex-1 bg-white border-t border-slate-300 overflow-auto">
+        <!-- Records table inserted here -->
+      </div>
+    </div>
+  `;
+  reloadRecords();
+}
+
+async function switchLayout(lcode) {
+  CURRENT_LAYOUT = ACTIVE_LAYOUTS.find(l => l.layout_code === lcode);
+  reloadRecords();
+}
+
+async function reloadRecords() {
+  const p = $('#rec_plant_filter') ? $('#rec_plant_filter').value : '';
+  const recs = await api(`/api/tcode/${CURRENT_TCODE}/records?plant=${p}`);
+  const fields = CURRENT_LAYOUT ? CURRENT_LAYOUT.fields : [];
+
+  let html = `
+    <table class="w-full sap-table border-collapse">
+      <thead>
+        <tr>
+          <th style="width:50px;">Doc #</th>
+          <th style="width:80px;">Plant</th>
+          ${fields.map(f => `<th>${esc(f.label)}</th>`).join('')}
+          <th style="width:120px;">Created By</th>
+          <th style="width:130px;">Timestamp</th>
+          <th style="width:90px;">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+  `;
+
+  if (!recs.length) {
+    html += `<tr><td colspan="${fields.length + 5}" class="text-center py-8 text-slate-400">No records found matching criteria in database.</td></tr>`;
+  } else {
+    recs.forEach(r => {
+      html += `<tr>
+        <td class="font-mono text-slate-500 font-bold">${r.id}</td>
+        <td><span class="bg-slate-100 font-mono text-[11px] px-1 border rounded">${esc(r.plant || 'CORP')}</span></td>
+        ${fields.map(f => `<td>${esc(r.data[f.key] || '')}</td>`).join('')}
+        <td>${esc(r.created_by_name || r.created_by)}</td>
+        <td class="text-[11px] text-slate-500">${esc(r.created_at)}</td>
+        <td class="space-x-1">
+          <button onclick="editRecord(${r.id})" class="sap-btn text-blue-700">Edit</button>
+          <button onclick="deleteRecord(${r.id})" class="sap-btn text-red-700">Del</button>
+        </td>
+      </tr>`;
+    });
+  }
+
+  html += `</tbody></table>`;
+  $('#alv_container').innerHTML = html;
+  setMsg(`T-Code ${CURRENT_TCODE}: ${recs.length} records retrieved.`);
+}
+
+function showRecordModal(editId = null, existingData = {}, existingPlant = '') {
+  const fields = CURRENT_LAYOUT ? CURRENT_LAYOUT.fields : [];
+  openDialog(`
+    <div class="border-b border-slate-400 bg-slate-200 px-4 py-2 font-bold text-slate-800 flex justify-between">
+      <span>${editId ? 'Change Document Entry #' + editId : 'New Entry: ' + CURRENT_TCODE}</span>
+      <button onclick="closeDialog()"><i class="ri-close-line"></i></button>
+    </div>
+    <div class="p-4 space-y-3">
+      <div>
+        <label class="block text-xs font-bold text-slate-600 mb-1">Production Plant</label>
+        <input id="rec_f__plant" class="sap-input w-full font-mono" value="${esc(existingPlant || (ME.plants[0]||'1000'))}">
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        ${fields.map(f => `
+          <div class="col-span-${f.width||1}">
+            <label class="block text-xs font-bold text-slate-600 mb-1">${esc(f.label)} ${f.required ? '<span class="text-red-500">*</span>':''}</label>
+            ${f.type==='textarea' ?
+              `<textarea id="rec_f_${f.key}" class="sap-input w-full" rows="2">${esc(existingData[f.key]||'')}</textarea>` :
+              `<input type="${f.type==='number'?'number':(f.type==='date'?'date':'text')}" id="rec_f_${f.key}" value="${esc(existingData[f.key]||'')}" class="sap-input w-full">`
+            }
+          </div>
+        `).join('')}
+      </div>
+    </div>
+    <div class="border-t border-slate-300 p-3 bg-slate-100 flex justify-end gap-2">
+      <button onclick="submitRecord(${editId})" class="sap-btn sap-btn-primary">Post Document</button>
+      <button onclick="closeDialog()" class="sap-btn">Cancel</button>
+    </div>
+  `);
+}
+
+async function editRecord(rid) {
+  const recs = await api(`/api/tcode/${CURRENT_TCODE}/records`);
+  const r = recs.find(x => x.id === rid);
+  if (!r) return alert("Record not found");
+  showRecordModal(rid, r.data, r.plant);
+}
+
+async function submitRecord(rid) {
+  const fields = CURRENT_LAYOUT ? CURRENT_LAYOUT.fields : [];
+  const payload = { _plant: $('#rec_f__plant').value };
+  for (let f of fields) {
+    const el = $('#rec_f_' + f.key);
+    if (f.required && !el.value.trim()) {
+      alert(`Required field: ${f.label}`);
+      return;
+    }
+    payload[f.key] = el.value.trim();
+  }
+
+  const url = rid ? `/api/tcode/${CURRENT_TCODE}/records/${rid}` : `/api/tcode/${CURRENT_TCODE}/records`;
+  const method = rid ? 'PUT' : 'POST';
+
+  try {
+    await api(url, {
+      method,
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    closeDialog();
+    reloadRecords();
+    setMsg("Document posted successfully.");
+  } catch(e) {
+    alert(e);
+  }
+}
+
+async function deleteRecord(rid) {
+  if (!confirm(`Delete record entry #${rid}?`)) return;
+  try {
+    await api(`/api/tcode/${CURRENT_TCODE}/records/${rid}`, {method: 'DELETE'});
+    reloadRecords();
+    setMsg(`Record #${rid} deleted.`);
+  } catch(e) {
+    alert(e);
+  }
+}
+
+async function importSpreadsheet(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const fd = new FormData(); fd.append("file", file);
+  setMsg("Uploading and processing spreadsheet...");
+  try {
+    const res = await api(`/api/tcode/${CURRENT_TCODE}/import`, {method: 'POST', body: fd});
+    reloadRecords();
+    setMsg(`Successfully imported ${res.count} records into ${CURRENT_TCODE}.`);
+  } catch(err) {
+    alert(err);
+  }
+}
+
+// ==========================================
+// SAP SCREEN PAINTER & ALV LAYOUT DESIGNER
+// ==========================================
+function showLayoutDesigner() {
+  const fields = CURRENT_LAYOUT ? CURRENT_LAYOUT.fields : [];
+  openDialog(`
+    <div class="border-b border-slate-400 bg-slate-200 px-4 py-2 font-bold text-slate-800 flex justify-between">
+      <span>Screen Painter: ALV Layout Designer for ${CURRENT_TCODE}</span>
+      <button onclick="closeDialog()"><i class="ri-close-line"></i></button>
+    </div>
+    <div class="p-4 space-y-4">
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="block text-xs font-bold text-slate-600">Layout Name</label><input id="lay_name" value="${esc(CURRENT_LAYOUT.name)}" class="sap-input w-full"></div>
+        <div><label class="block text-xs font-bold text-slate-600">Variant Code</label><input id="lay_code" value="${esc(CURRENT_LAYOUT.layout_code)}" class="sap-input w-full font-mono uppercase"></div>
+      </div>
+
+      <div class="border border-slate-300 p-3 bg-slate-50 rounded">
+        <div class="flex justify-between items-center mb-2">
+          <span class="font-bold text-xs text-slate-700">Column Schema Fields</span>
+          <button onclick="addSchemaRow()" class="sap-btn sap-btn-primary">+ Add Column</button>
+        </div>
+        <div id="schema_rows" class="space-y-2 max-h-56 overflow-y-auto">
+          ${fields.map((f, idx) => `
+            <div class="flex items-center gap-2 schema-row bg-white p-1.5 border border-slate-300 rounded">
+              <input placeholder="field_key" value="${esc(f.key)}" class="sap-input w-28 font-mono text-xs skey">
+              <input placeholder="Column Label" value="${esc(f.label)}" class="sap-input flex-1 text-xs slbl">
+              <select class="sap-input text-xs stype">
+                <option value="text" ${f.type==='text'?'selected':''}>Text</option>
+                <option value="number" ${f.type==='number'?'selected':''}>Number</option>
+                <option value="date" ${f.type==='date'?'selected':''}>Date</option>
+                <option value="textarea" ${f.type==='textarea'?'selected':''}>Text Area</option>
+              </select>
+              <button onclick="this.parentElement.remove()" class="text-red-600 px-1"><i class="ri-delete-bin-line"></i></button>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    </div>
+    <div class="border-t border-slate-300 p-3 bg-slate-100 flex justify-between">
+      <div>
+        ${ME.is_master ? `<button onclick="makeLayoutDefault(${CURRENT_LAYOUT.id})" class="sap-btn">Set As Global Default</button>` : ''}
+      </div>
+      <div class="flex gap-2">
+        <button onclick="submitLayoutSave()" class="sap-btn sap-btn-primary">Save Variant</button>
+        <button onclick="closeDialog()" class="sap-btn">Cancel</button>
+      </div>
+    </div>
+  `);
+}
+
+function addSchemaRow() {
+  const div = document.createElement('div');
+  div.className = 'flex items-center gap-2 schema-row bg-white p-1.5 border border-slate-300 rounded';
+  div.innerHTML = `
+    <input placeholder="field_key" class="sap-input w-28 font-mono text-xs skey">
+    <input placeholder="Column Label" class="sap-input flex-1 text-xs slbl">
+    <select class="sap-input text-xs stype">
+      <option value="text">Text</option>
+      <option value="number">Number</option>
+      <option value="date">Date</option>
+      <option value="textarea">Text Area</option>
+    </select>
+    <button onclick="this.parentElement.remove()" class="text-red-600 px-1"><i class="ri-delete-bin-line"></i></button>
+  `;
+  $('#schema_rows').appendChild(div);
+}
+
+async function submitLayoutSave() {
+  const rows = document.querySelectorAll('.schema-row');
+  const fields = [];
+  rows.forEach(r => {
+    const key = r.querySelector('.skey').value.trim().toLowerCase().replace(/\\s+/g, '_');
+    const label = r.querySelector('.slbl').value.trim();
+    const type = r.querySelector('.stype').value;
+    if (key && label) {
+      fields.push({key, label, type, required: false, width: 1});
+    }
+  });
+
+  const payload = {
+    name: $('#lay_name').value.trim(),
+    layout_code: $('#lay_code').value.trim(),
+    fields
+  };
+
+  try {
+    await api(`/api/tcode/${CURRENT_TCODE}/layouts/save`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    closeDialog();
+    renderBusinessTcode(ALL_TCODES.find(x => x.code === CURRENT_TCODE));
+    setMsg("Layout variant saved.");
+  } catch(e) {
+    alert(e);
+  }
+}
+
+async function makeLayoutDefault(lid) {
+  await api(`/api/tcode/${CURRENT_TCODE}/layouts/${lid}/set-default`, {method: 'POST'});
+  closeDialog();
+  renderBusinessTcode(ALL_TCODES.find(x => x.code === CURRENT_TCODE));
+  setMsg("Layout set as client default.");
+}
+
+// DIALOG MODAL HELPERS
+function openDialog(content) {
+  $('#sap_dialog_body').innerHTML = content;
+  $('#sap_dialog').classList.remove('hidden');
+}
+
+function closeDialog() {
+  $('#sap_dialog').classList.add('hidden');
+  $('#sap_dialog_body').innerHTML = '';
+}
+
+function showHelp() {
+  alert("Thermocables SAP GUI Clone\\nSystem: PRD\\nClient: 100\\nUse command box for navigation (e.g. /nSU01, /nSE93, /nPROD).");
+}
+
+function openFind() {
+  const s = prompt("Search string across current screen:");
+  if (s) window.find(s);
+}
+
+// STARTUP ENTRYPOINT
+initSession();
+</script>
+</body>
+</html>
 """
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return HTMLResponse(HTML)
+    return HTMLResponse(HTML_SAP_UI)
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "V15 COMPLETE SECURE"}
+    return {"status": "UP", "rfc_engine": "ACTIVE", "system": "PRD", "client": "100"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
