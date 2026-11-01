@@ -1,7 +1,7 @@
-import io, json, sqlite3, secrets, datetime, os, html
+import io, json, sqlite3, secrets, datetime, os
 from pathlib import Path
 import bcrypt
-from fastapi import FastAPI, Request, Response, UploadFile, File, Form, HTTPException, Depends
+from fastapi import FastAPI, Request, Response, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import load_workbook, Workbook
@@ -66,26 +66,45 @@ def exec_write(sql: str, params=()):
     finally:
         conn.close()
 
-def exec_script(sql_script: str):
-    conn = get_conn()
-    try:
-        if USE_PG:
-            with conn.cursor() as cur:
-                cur.execute(sql_script)
-            conn.commit()
-        else:
-            conn.executescript(sql_script)
-            conn.commit()
-    finally:
-        conn.close()
-
 def now():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# --- INITIALIZATION & SEEDING ---
+# --- INITIALIZATION & AUTO-MIGRATION ---
 def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # 1. AUTO-MIGRATION: Cleanly upgrade outdated PostgreSQL tables from older app versions
     if USE_PG:
-        exec_script('''
+        try:
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'plants' AND column_name = 'code';")
+            if not cur.fetchone():
+                cur.execute("DROP TABLE IF EXISTS plants CASCADE;")
+
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'org' AND column_name = 'system_id';")
+            if not cur.fetchone():
+                cur.execute("DROP TABLE IF EXISTS org CASCADE;")
+
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'tcode_records' AND column_name = 'plant';")
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE tcode_records ADD COLUMN IF NOT EXISTS plant TEXT DEFAULT '';")
+
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'plants';")
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plants TEXT DEFAULT '';")
+
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'tcodes' AND column_name = 'module';")
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE tcodes ADD COLUMN IF NOT EXISTS module TEXT DEFAULT 'PP';")
+
+            conn.commit()
+        except Exception as e:
+            print("Auto-migration notice:", e)
+            conn.rollback()
+
+    # 2. CREATE STANDARD SAP SCHEMAS
+    if USE_PG:
+        cur.execute('''
         CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password_hash TEXT, full_name TEXT, role TEXT, department TEXT, plants TEXT DEFAULT '', status TEXT DEFAULT 'approved', created_at TEXT, updated_at TEXT);
         CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, username TEXT, expires TEXT);
         CREATE TABLE IF NOT EXISTS departments (name TEXT PRIMARY KEY, active INT DEFAULT 1, created_at TEXT);
@@ -98,7 +117,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS access_grants (id SERIAL PRIMARY KEY, username TEXT, tcode_code TEXT, granted_by TEXT, granted_at TEXT, UNIQUE(username, tcode_code));
         ''')
     else:
-        exec_script('''
+        cur.executescript('''
         CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password_hash TEXT, full_name TEXT, role TEXT, department TEXT, plants TEXT DEFAULT '', status TEXT DEFAULT 'approved', created_at TEXT, updated_at TEXT);
         CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, username TEXT, expires TEXT);
         CREATE TABLE IF NOT EXISTS departments (name TEXT PRIMARY KEY, active INT DEFAULT 1, created_at TEXT);
@@ -110,27 +129,33 @@ def init_db():
         CREATE TABLE IF NOT EXISTS tcode_layouts (id INTEGER PRIMARY KEY AUTOINCREMENT, tcode_code TEXT, layout_code TEXT UNIQUE, name TEXT, title TEXT, is_default INT DEFAULT 0, fields TEXT, layout_config TEXT, description TEXT, created_by TEXT, created_by_name TEXT, created_at TEXT, updated_at TEXT);
         CREATE TABLE IF NOT EXISTS access_grants (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, tcode_code TEXT, granted_by TEXT, granted_at TEXT, UNIQUE(username, tcode_code));
         ''')
+    conn.commit()
 
     cur_time = now()
-    # Seed Master Org info
-    if not fetch_one("SELECT 1 FROM org WHERE id=1"):
-        exec_write("INSERT INTO org VALUES (?,?,?,?)", (1, "Thermocables Enterprise Group", "PRD", "100"))
 
-    # Seed Departments
+    # Org Record
+    cur.execute(q("SELECT 1 FROM org WHERE id=1"))
+    if not cur.fetchone():
+        cur.execute(q("INSERT INTO org VALUES (?,?,?,?)"), (1, "Thermocables Enterprise Group", "PRD", "100"))
+
+    # Default Departments
     for d in ["Production", "Quality Control", "Final QC", "Commercial", "Planning", "Store", "Plant Maintenance"]:
-        if not fetch_one("SELECT 1 FROM departments WHERE name=?", (d,)):
-            exec_write("INSERT INTO departments VALUES (?,?,?)", (d, 1, cur_time))
+        cur.execute(q("SELECT 1 FROM departments WHERE name=?"), (d,))
+        if not cur.fetchone():
+            cur.execute(q("INSERT INTO departments VALUES (?,?,?)"), (d, 1, cur_time))
 
-    # Seed Plants
+    # Default Plants
     for p_code, p_name in [("1000", "Gooty Central Plant"), ("1400", "Plant 1400 Extrusion"), ("2000", "Hyderabad Cable Works"), ("CORP", "TCL Corporate HQ")]:
-        if not fetch_one("SELECT 1 FROM plants WHERE code=?", (p_code,)):
-            exec_write("INSERT INTO plants VALUES (?,?,?,?)", (p_code, p_name, 1, cur_time))
+        cur.execute(q("SELECT 1 FROM plants WHERE code=?"), (p_code,))
+        if not cur.fetchone():
+            cur.execute(q("INSERT INTO plants VALUES (?,?,?,?)"), (p_code, p_name, 1, cur_time))
 
-    # Seed Master Admin (Password: Admin@123)
-    if not fetch_one("SELECT 1 FROM users WHERE username='admin'"):
+    # Super Admin Account (Password: Admin@123)
+    cur.execute(q("SELECT 1 FROM users WHERE username='admin'"))
+    if not cur.fetchone():
         ph = bcrypt.hashpw("Admin@123".encode(), bcrypt.gensalt()).decode()
-        exec_write("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?)",
-                   ("admin", ph, "SAP Super Administrator", "master", "BASIS / IT", "1000,1400,2000,CORP", "approved", cur_time, cur_time))
+        cur.execute(q("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?)"),
+                    ("admin", ph, "SAP Super Administrator", "master", "BASIS / IT", "1000,1400,2000,CORP", "approved", cur_time, cur_time))
 
     # Standard Business T-Codes
     default_tcodes = [
@@ -143,9 +168,10 @@ def init_db():
     ]
 
     for code, title, desc, mod, depts in default_tcodes:
-        if not fetch_one("SELECT 1 FROM tcodes WHERE code=?", (code,)):
-            exec_write("INSERT INTO tcodes VALUES (?,?,?,?,?,?,?,?,?)",
-                       (code, title, desc, mod, depts, 1, cur_time, cur_time, "SAP_SYSTEM"))
+        cur.execute(q("SELECT 1 FROM tcodes WHERE code=?"), (code,))
+        if not cur.fetchone():
+            cur.execute(q("INSERT INTO tcodes VALUES (?,?,?,?,?,?,?,?,?)"),
+                        (code, title, desc, mod, depts, 1, cur_time, cur_time, "SAP_SYSTEM"))
             fields = json.dumps([
                 {"key": "job_no", "label": "Job / Production Order", "type": "text", "required": True, "width": 1},
                 {"key": "batch_no", "label": "Batch / Lot No", "type": "text", "required": True, "width": 1},
@@ -155,9 +181,12 @@ def init_db():
                 {"key": "operator", "label": "Plant Operator", "type": "text", "required": False, "width": 1},
                 {"key": "remarks", "label": "Engineering Remarks", "type": "textarea", "required": False, "width": 3}
             ])
-            exec_write("INSERT INTO tcode_schemas VALUES (?,?,?,?,?)", (code, fields, json.dumps({"columns": 3}), cur_time, "SAP_SYSTEM"))
-            exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                       (code, f"/1SAP/{code}_DEFAULT", "Standard SAP ALV", f"Standard Grid: {title}", 1, fields, json.dumps({"columns": 3}), "Default SAP Table View", "admin", "SAP Super Administrator", cur_time, cur_time))
+            cur.execute(q("INSERT INTO tcode_schemas VALUES (?,?,?,?,?)"), (code, fields, json.dumps({"columns": 3}), cur_time, "SAP_SYSTEM"))
+            cur.execute(q("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"),
+                        (code, f"/1SAP/{code}_DEFAULT", "Standard SAP ALV", f"Standard Grid: {title}", 1, fields, json.dumps({"columns": 3}), "Default SAP Table View", "admin", "SAP Super Administrator", cur_time, cur_time))
+
+    conn.commit()
+    conn.close()
 
 init_db()
 
@@ -202,11 +231,9 @@ def check_tcode_access(u, code: str):
     tc = fetch_one("SELECT * FROM tcodes WHERE code=? AND active=1", (code,))
     if not tc:
         return False
-    # Check department membership
     allowed = [x.strip() for x in (tc["allowed_depts"] or "").split(",") if x.strip()]
     if u["department"] in allowed:
         return True
-    # Check explicit PFCG grant
     grant = fetch_one("SELECT 1 FROM access_grants WHERE username=? AND tcode_code=?", (u["username"], code))
     return bool(grant)
 
@@ -241,7 +268,7 @@ def api_logout(res: Response, req: Request):
 @app.get("/api/me")
 def api_me(req: Request):
     u = need(req)
-    org_info = fetch_one("SELECT * FROM org WHERE id=1")
+    org_info = fetch_one("SELECT * FROM org WHERE id=1") or {}
     return {
         "username": u["username"],
         "full_name": u["full_name"],
@@ -424,7 +451,6 @@ def se93_create(req: Request, code: str = Form(...), title: str = Form(...), des
     exec_write("INSERT INTO tcodes VALUES (?,?,?,?,?,?,?,?,?)",
                (code, title.strip(), description.strip(), module.strip(), allowed_depts.strip(), 1, cur_time, cur_time, u["username"]))
 
-    # Default starter layout & schema
     starter_fields = json.dumps([
         {"key": "job_no", "label": "Job / Document No", "type": "text", "required": True, "width": 1},
         {"key": "batch_no", "label": "Batch / Heat Lot", "type": "text", "required": True, "width": 1},
@@ -689,16 +715,13 @@ HTML_SAP_UI = """<!DOCTYPE html>
 </head>
 <body class="h-screen flex flex-col select-none overflow-hidden">
 
-<!-- TOP SAP MENUBAR -->
 <div class="bg-[#1e293b] text-slate-200 text-xs px-3 py-1 flex items-center justify-between border-b border-slate-700">
   <div class="flex items-center gap-4">
     <span class="font-bold flex items-center gap-1.5 text-sky-400 tracking-wider"><i class="ri-instance-line"></i> SAP GUI 7.70</span>
     <span class="hover:bg-slate-700 px-2 py-0.5 rounded cursor-pointer" onclick="goHome()">Menu</span>
     <span class="hover:bg-slate-700 px-2 py-0.5 rounded cursor-pointer" onclick="goHome()">Edit</span>
     <span class="hover:bg-slate-700 px-2 py-0.5 rounded cursor-pointer" onclick="goHome()">Favorites</span>
-    <span class="hover:bg-slate-700 px-2 py-0.5 rounded cursor-pointer" onclick="goHome()">Extras</span>
     <span class="hover:bg-slate-700 px-2 py-0.5 rounded cursor-pointer" onclick="showHelp()">System</span>
-    <span class="hover:bg-slate-700 px-2 py-0.5 rounded cursor-pointer" onclick="showHelp()">Help</span>
   </div>
   <div id="sys_pill" class="text-[11px] text-slate-300 flex items-center gap-3">
     <span>Client: <b id="lbl_client">100</b></span>
@@ -708,61 +731,41 @@ HTML_SAP_UI = """<!DOCTYPE html>
   </div>
 </div>
 
-<!-- STANDARD SAP TOOLBAR WITH COMMAND OK-CODE FIELD -->
 <div class="bg-[#e9edf2] border-b border-slate-400 px-3 py-1.5 flex items-center justify-between">
   <div class="flex items-center gap-2">
-    <!-- SAP Command Field -->
     <div class="flex items-center bg-white border border-slate-500 rounded px-1.5 py-0.5 shadow-inner">
       <input id="cmd_box" placeholder="/n..." class="outline-none w-28 uppercase font-mono text-xs font-bold text-blue-900" onkeydown="if(event.key==='Enter') execCmd()">
       <button onclick="execCmd()" title="Enter (OK-Code)" class="text-green-700 hover:text-green-800 font-bold text-sm px-1"><i class="ri-checkbox-circle-fill"></i></button>
       <button onclick="$('#cmd_box').value=''" title="Clear" class="text-slate-400 hover:text-slate-600 text-xs px-0.5"><i class="ri-close-line"></i></button>
     </div>
-
     <div class="h-5 w-[1px] bg-slate-400 mx-1"></div>
-
-    <!-- Standard SAP Function Keys -->
     <button onclick="goHome()" title="Back (F3)" class="sap-btn flex items-center gap-1 text-emerald-800"><i class="ri-arrow-go-back-line"></i> Back</button>
     <button onclick="goHome()" title="Exit (Shift+F3)" class="sap-btn flex items-center gap-1 text-amber-800"><i class="ri-logout-box-r-line"></i> Exit</button>
     <button onclick="goHome()" title="Cancel (F12)" class="sap-btn flex items-center gap-1 text-red-800"><i class="ri-close-circle-line"></i> Cancel</button>
-
     <div class="h-5 w-[1px] bg-slate-400 mx-1"></div>
-
-    <button onclick="window.print()" title="Print (Ctrl+P)" class="sap-btn"><i class="ri-printer-line"></i></button>
-    <button onclick="openFind()" title="Find" class="sap-btn"><i class="ri-search-line"></i></button>
+    <button onclick="window.print()" title="Print" class="sap-btn"><i class="ri-printer-line"></i></button>
   </div>
-
   <div class="flex items-center gap-2">
     <span id="title_crumb" class="font-bold text-slate-700 text-xs uppercase tracking-wide">SAP Easy Access</span>
   </div>
 </div>
 
-<!-- MAIN SAP WORKSPACE -->
 <div class="flex-1 flex overflow-hidden">
-
-  <!-- LEFT SAP EASY ACCESS TREE -->
   <div id="tree_panel" class="w-72 bg-[#f1f5f9] border-r border-slate-400 flex flex-col justify-between">
     <div class="p-2 border-b border-slate-300 bg-slate-200 font-bold text-xs flex justify-between items-center text-slate-700">
       <span><i class="ri-folder-shared-line"></i> SAP Easy Access Menu</span>
       <button onclick="loadUserTree()" title="Refresh" class="hover:text-blue-700"><i class="ri-refresh-line"></i></button>
     </div>
-
-    <div id="tree_view" class="flex-1 overflow-y-auto p-2 text-xs space-y-1">
-      <!-- Generated dynamically -->
-    </div>
-
+    <div id="tree_view" class="flex-1 overflow-y-auto p-2 text-xs space-y-1"></div>
     <div class="p-2 bg-slate-200 border-t border-slate-300 text-[11px] text-slate-600">
       <div><b>Thermocables Limited</b></div>
       <div id="plant_info_tree" class="truncate text-slate-500">Plant: All Authorized</div>
     </div>
   </div>
 
-  <!-- RIGHT SAP TRANSACTION WORKSPACE -->
-  <div id="sap_screen" class="flex-1 bg-white flex flex-col overflow-hidden">
-    <!-- Active screen gets populated here -->
-  </div>
+  <div id="sap_screen" class="flex-1 bg-white flex flex-col overflow-hidden"></div>
 </div>
 
-<!-- BOTTOM SAP STATUS BAR -->
 <div class="bg-[#1e293b] text-slate-300 text-xs px-3 py-1 flex items-center justify-between border-t border-slate-700">
   <div class="flex items-center gap-2 truncate">
     <span id="status_icon" class="text-emerald-400"><i class="ri-checkbox-circle-fill"></i></span>
@@ -777,10 +780,8 @@ HTML_SAP_UI = """<!DOCTYPE html>
   </div>
 </div>
 
-<!-- MODAL DIALOG CONTAINER -->
 <div id="sap_dialog" class="hidden fixed inset-0 bg-slate-900/60 z-50 flex items-center justify-center p-4">
-  <div id="sap_dialog_body" class="bg-white border-2 border-slate-600 rounded-sm shadow-2xl max-h-[90vh] overflow-y-auto w-full max-w-3xl">
-  </div>
+  <div id="sap_dialog_body" class="bg-white border-2 border-slate-600 rounded-sm shadow-2xl max-h-[90vh] overflow-y-auto w-full max-w-3xl"></div>
 </div>
 
 <script>
@@ -791,7 +792,6 @@ let CURRENT_LAYOUT = null;
 let ALL_TCODES = [];
 const $ = s => document.querySelector(s);
 
-// UTILITY: Safe HTML Escaping (Prevents Stored XSS)
 function esc(str) {
   if (str === null || str === undefined) return '';
   return String(str).replace(/[&<>"']/g, function (s) {
@@ -831,7 +831,6 @@ async function api(path, opts = {}) {
   return await res.json();
 }
 
-// LOGON SCREEN
 function renderLogon() {
   $('#sap_screen').innerHTML = `
   <div class="h-full flex items-center justify-center bg-[#dbe4ee]">
@@ -892,7 +891,6 @@ async function initSession() {
   }
 }
 
-// SAP OK-CODE COMMAND HANDLER
 function execCmd() {
   let val = $('#cmd_box').value.trim();
   if (!val) return;
@@ -904,8 +902,7 @@ function execCmd() {
     goHome();
     return;
   }
-  val = val.toUpperCase();
-  openTcode(val);
+  openTcode(val.toUpperCase());
 }
 
 function goHome() {
@@ -927,25 +924,23 @@ function goHome() {
 
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
           <div class="border border-slate-300 p-4 bg-white rounded shadow-sm">
-            <div class="text-xs font-bold text-slate-500 uppercase">My Organization</div>
+            <div class="text-xs font-bold text-slate-500 uppercase">Organization</div>
             <div class="text-lg font-bold text-slate-800 mt-1">${esc(ME.company)}</div>
             <div class="text-xs text-slate-500 mt-1">Dept: <b>${esc(ME.department)}</b></div>
           </div>
           <div class="border border-slate-300 p-4 bg-white rounded shadow-sm">
-            <div class="text-xs font-bold text-slate-500 uppercase">My Authorizations</div>
+            <div class="text-xs font-bold text-slate-500 uppercase">Profile Role</div>
             <div class="text-lg font-bold text-slate-800 mt-1">${ME.is_master ? 'SAP_ALL (MASTER)' : (ME.role === 'admin' ? 'ADMIN (S_ALL)' : 'OPERATOR')}</div>
             <div class="text-xs text-slate-500 mt-1">Plants: ${esc(ME.plants.join(', ') || 'ALL')}</div>
           </div>
           <div class="border border-slate-300 p-4 bg-white rounded shadow-sm">
             <div class="text-xs font-bold text-slate-500 uppercase">Command Shortcut</div>
-            <div class="text-xs text-slate-600 mt-2">Enter <code class="bg-slate-100 px-1 border rounded text-sky-700 font-bold">/nPROD</code> or <code class="bg-slate-100 px-1 border rounded text-sky-700 font-bold">/nSU01</code> in the top command bar.</div>
+            <div class="text-xs text-slate-600 mt-2">Enter <code class="bg-slate-100 px-1 border rounded text-sky-700 font-bold">/nPROD</code> or <code class="bg-slate-100 px-1 border rounded text-sky-700 font-bold">/nSU01</code> in the command box.</div>
           </div>
         </div>
 
         <h3 class="font-bold text-xs uppercase text-slate-600 mb-3 tracking-wider">Quick Transaction Launcher</h3>
-        <div id="quick_tiles" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-          <!-- Populated from T-Codes -->
-        </div>
+        <div id="quick_tiles" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3"></div>
       </div>
     </div>`;
 
@@ -960,7 +955,6 @@ async function loadUserTree() {
       <div onclick="openTcode('PROD')" class="cursor-pointer hover:bg-slate-300 px-1.5 py-0.5 rounded flex items-center gap-1"><i class="ri-file-list-2-line text-blue-700"></i> PROD - Handover</div>
       <div onclick="openTcode('GCH0')" class="cursor-pointer hover:bg-slate-300 px-1.5 py-0.5 rounded flex items-center gap-1"><i class="ri-shield-check-line text-green-700"></i> GCH0 - Green Card</div>
     </div>
-
     <div class="font-bold text-slate-700 py-1 flex items-center gap-1.5"><i class="ri-folder-line text-blue-600"></i> SAP Menu</div>
     <div class="pl-4 space-y-0.5 border-l border-slate-300 ml-2">
   `;
@@ -1012,20 +1006,17 @@ function renderQuickTiles() {
   `).join('');
 }
 
-// SAP TRANSACTION ROUTER
 async function openTcode(code) {
   code = code.toUpperCase().trim();
   CURRENT_TCODE = code;
   $('#stat_tcode').textContent = code;
   setMsg(`Transaction ${code} executing...`);
 
-  // Handle Internal Standard Admin T-Codes
   if (code === 'SU01') return renderSU01();
   if (code === 'SE93') return renderSE93();
   if (code === 'SPRO') return renderSPRO();
   if (code === 'PFCG') return renderPFCG();
 
-  // Handle Dynamic Business T-Codes
   const tc = ALL_TCODES.find(x => x.code === code);
   if (!tc) {
     setMsg(`Transaction ${code} does not exist in repository`, true);
@@ -1038,9 +1029,7 @@ async function openTcode(code) {
   renderBusinessTcode(tc);
 }
 
-// ==========================================
-// SAP SU01: USER MAINTENANCE
-// ==========================================
+// SU01: USER MAINTENANCE
 async function renderSU01() {
   if (!ME.is_master && ME.role !== 'admin') {
     setMsg("Authorization S_USER_GRP missing", true);
@@ -1048,8 +1037,6 @@ async function renderSU01() {
   }
   $('#title_crumb').textContent = "SU01: User Maintenance Master Record";
   const users = await api('/api/su01/users');
-  const depts = (await api('/api/spro/overview')).departments;
-  const plants = (await api('/api/spro/overview')).plants;
 
   $('#sap_screen').innerHTML = `
     <div class="p-4 flex-1 flex flex-col overflow-hidden bg-slate-100">
@@ -1060,20 +1047,9 @@ async function renderSU01() {
         </div>
         <span class="text-xs text-slate-600 font-semibold">User Master Records: <b>${users.length}</b></span>
       </div>
-
       <div class="flex-1 bg-white border border-slate-400 overflow-auto">
         <table class="w-full sap-table border-collapse">
-          <thead>
-            <tr>
-              <th>User ID</th>
-              <th>Full Name</th>
-              <th>Role</th>
-              <th>Department</th>
-              <th>Assigned Plants</th>
-              <th>Status</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
+          <thead><tr><th>User ID</th><th>Full Name</th><th>Role</th><th>Department</th><th>Assigned Plants</th><th>Status</th><th>Actions</th></tr></thead>
           <tbody>
             ${users.map(u => `
               <tr>
@@ -1093,8 +1069,7 @@ async function renderSU01() {
           </tbody>
         </table>
       </div>
-    </div>
-  `;
+    </div>`;
   setMsg("SU01: Ready.");
 }
 
@@ -1114,9 +1089,7 @@ function showCreateUserModal() {
         <div class="grid grid-cols-2 gap-3">
           <div>
             <label class="block text-xs font-bold text-slate-600">Department</label>
-            <select id="nu_d" class="sap-input w-full">
-              ${data.departments.map(d=>`<option value="${esc(d.name)}">${esc(d.name)}</option>`).join('')}
-            </select>
+            <select id="nu_d" class="sap-input w-full">${data.departments.map(d=>`<option value="${esc(d.name)}">${esc(d.name)}</option>`).join('')}</select>
           </div>
           <div>
             <label class="block text-xs font-bold text-slate-600">Role Profile</label>
@@ -1135,8 +1108,7 @@ function showCreateUserModal() {
       <div class="border-t border-slate-300 p-3 bg-slate-100 flex justify-end gap-2">
         <button onclick="submitCreateUser()" class="sap-btn sap-btn-primary">Save (Ctrl+S)</button>
         <button onclick="closeDialog()" class="sap-btn">Cancel</button>
-      </div>
-    `);
+      </div>`);
   });
 }
 
@@ -1186,10 +1158,7 @@ async function showEditUserModal(u) {
         </div>
       </div>
       <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="block text-xs font-bold text-slate-600">Plants</label>
-          <input id="eu_pl" value="${esc(user.plants||'')}" class="sap-input w-full">
-        </div>
+        <div><label class="block text-xs font-bold text-slate-600">Plants</label><input id="eu_pl" value="${esc(user.plants||'')}" class="sap-input w-full"></div>
         <div>
           <label class="block text-xs font-bold text-slate-600">Status</label>
           <select id="eu_st" class="sap-input w-full">
@@ -1202,8 +1171,7 @@ async function showEditUserModal(u) {
     <div class="border-t border-slate-300 p-3 bg-slate-100 flex justify-end gap-2">
       <button onclick="submitEditUser('${esc(u)}')" class="sap-btn sap-btn-primary">Update</button>
       <button onclick="closeDialog()" class="sap-btn">Cancel</button>
-    </div>
-  `);
+    </div>`);
 }
 
 async function submitEditUser(u) {
@@ -1247,9 +1215,7 @@ async function deleteUser(u) {
   }
 }
 
-// ==========================================
-// SAP SE93: TRANSACTION CODE MAINTENANCE
-// ==========================================
+// SE93: TRANSACTION CODES & REPOSITORY
 async function renderSE93() {
   if (!ME.is_master && ME.role !== 'admin') {
     setMsg("Authorization S_DEVELOP missing", true);
@@ -1267,19 +1233,9 @@ async function renderSE93() {
         </div>
         <span class="text-xs text-slate-600 font-semibold">Repository T-Codes: <b>${list.length}</b></span>
       </div>
-
       <div class="flex-1 bg-white border border-slate-400 overflow-auto">
         <table class="w-full sap-table border-collapse">
-          <thead>
-            <tr>
-              <th>T-Code</th>
-              <th>Description / Title</th>
-              <th>Module</th>
-              <th>Authorized Depts</th>
-              <th>Status</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
+          <thead><tr><th>T-Code</th><th>Description / Title</th><th>Module</th><th>Authorized Depts</th><th>Status</th><th>Actions</th></tr></thead>
           <tbody>
             ${list.map(t => `
               <tr>
@@ -1298,8 +1254,7 @@ async function renderSE93() {
           </tbody>
         </table>
       </div>
-    </div>
-  `;
+    </div>`;
   setMsg("SE93: Ready.");
 }
 
@@ -1312,7 +1267,7 @@ function showCreateTcodeModal() {
     <div class="p-4 space-y-3">
       <div class="grid grid-cols-2 gap-3">
         <div><label class="block text-xs font-bold text-slate-600">T-Code</label><input id="nt_c" class="sap-input w-full uppercase" placeholder="e.g. ZPR0"></div>
-        <div><label class="block text-xs font-bold text-slate-600">Module (PP, QM, MM, FI)</label><input id="nt_m" class="sap-input w-full uppercase" value="PP"></div>
+        <div><label class="block text-xs font-bold text-slate-600">Module</label><input id="nt_m" class="sap-input w-full uppercase" value="PP"></div>
       </div>
       <div><label class="block text-xs font-bold text-slate-600">Transaction Title</label><input id="nt_t" class="sap-input w-full" placeholder="e.g. Cable Core Processing"></div>
       <div><label class="block text-xs font-bold text-slate-600">Description</label><textarea id="nt_d" class="sap-input w-full" rows="2"></textarea></div>
@@ -1321,8 +1276,7 @@ function showCreateTcodeModal() {
     <div class="border-t border-slate-300 p-3 bg-slate-100 flex justify-end gap-2">
       <button onclick="submitCreateTcode()" class="sap-btn sap-btn-primary">Generate</button>
       <button onclick="closeDialog()" class="sap-btn">Cancel</button>
-    </div>
-  `);
+    </div>`);
 }
 
 async function submitCreateTcode() {
@@ -1369,8 +1323,7 @@ async function showEditTcodeModal(code) {
     <div class="border-t border-slate-300 p-3 bg-slate-100 flex justify-end gap-2">
       <button onclick="submitEditTcode('${esc(code)}')" class="sap-btn sap-btn-primary">Save Changes</button>
       <button onclick="closeDialog()" class="sap-btn">Cancel</button>
-    </div>
-  `);
+    </div>`);
 }
 
 async function submitEditTcode(code) {
@@ -1404,9 +1357,7 @@ async function deleteTcode(code) {
   }
 }
 
-// ==========================================
-// SAP SPRO: ENTERPRISE STRUCTURE (PLANTS / DEPTS)
-// ==========================================
+// SPRO: ENTERPRISE STRUCTURE (PLANTS / DEPTS)
 async function renderSPRO() {
   if (!ME.is_master) {
     setMsg("SPRO Configuration restricted to MASTER Administrator", true);
@@ -1418,7 +1369,6 @@ async function renderSPRO() {
   $('#sap_screen').innerHTML = `
     <div class="p-4 flex-1 flex flex-col overflow-hidden bg-slate-100">
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 overflow-auto">
-        <!-- PLANTS MANAGER -->
         <div class="bg-white border border-slate-400 flex flex-col rounded-sm">
           <div class="bg-slate-200 border-b border-slate-300 p-2 font-bold text-xs flex justify-between items-center">
             <span><i class="ri-building-line text-sky-800"></i> Define Plants</span>
@@ -1440,8 +1390,6 @@ async function renderSPRO() {
             </table>
           </div>
         </div>
-
-        <!-- DEPARTMENTS MANAGER -->
         <div class="bg-white border border-slate-400 flex flex-col rounded-sm">
           <div class="bg-slate-200 border-b border-slate-300 p-2 font-bold text-xs flex justify-between items-center">
             <span><i class="ri-team-line text-sky-800"></i> Define Departments</span>
@@ -1463,8 +1411,7 @@ async function renderSPRO() {
           </div>
         </div>
       </div>
-    </div>
-  `;
+    </div>`;
   setMsg("SPRO: Ready.");
 }
 
@@ -1496,9 +1443,7 @@ function deleteDept(name) {
   api('/api/admin/departments/delete', {method: 'POST', body: fd}).then(() => { renderSPRO(); setMsg("Department removed."); }).catch(e => alert(e));
 }
 
-// ==========================================
-// SAP PFCG: AUTHORIZATIONS & ROLES MATRIX
-// ==========================================
+// PFCG: AUTHORIZATIONS MATRIX
 async function renderPFCG() {
   if (!ME.is_master && ME.role !== 'admin') {
     setMsg("Authorization S_USER_AGR missing", true);
@@ -1517,7 +1462,6 @@ async function renderPFCG() {
           <button onclick="grantAccess()" class="sap-btn sap-btn-primary">+ Grant T-Code</button>
         </div>
       </div>
-
       <div class="flex-1 bg-white border border-slate-400 overflow-auto">
         <table class="w-full sap-table border-collapse">
           <thead><tr><th>User ID</th><th>Granted T-Code</th><th>Granted By</th><th>Timestamp</th><th>Action</th></tr></thead>
@@ -1534,8 +1478,7 @@ async function renderPFCG() {
           </tbody>
         </table>
       </div>
-    </div>
-  `;
+    </div>`;
   setMsg("PFCG: Ready.");
 }
 
@@ -1555,9 +1498,7 @@ async function revokeAccess(u, t) {
   setMsg("Authorization revoked.");
 }
 
-// ==========================================
-// SAP BUSINESS T-CODE CONTROLLER & ALV GRID
-// ==========================================
+// BUSINESS T-CODES & ALV GRID
 async function renderBusinessTcode(tc) {
   $('#title_crumb').textContent = `${tc.code}: ${tc.title}`;
   ACTIVE_LAYOUTS = await api(`/api/tcode/${tc.code}/layouts`);
@@ -1568,23 +1509,17 @@ async function renderBusinessTcode(tc) {
 
   $('#sap_screen').innerHTML = `
     <div class="flex-1 flex flex-col overflow-hidden bg-slate-100">
-      <!-- SAP APPLICATION TOOLBAR -->
       <div class="bg-[#f8fafc] border-b border-slate-300 p-2 flex items-center justify-between">
         <div class="flex items-center gap-2">
           <button onclick="showRecordModal()" class="sap-btn sap-btn-primary flex items-center gap-1"><i class="ri-add-line"></i> New Entry</button>
           <div class="h-4 w-[1px] bg-slate-300"></div>
-
-          <!-- Plant Filter -->
           <label class="text-xs font-bold text-slate-600 flex items-center gap-1">Plant:
             <select id="rec_plant_filter" onchange="reloadRecords()" class="sap-input text-xs font-normal">
               <option value="">(All Plants)</option>
               ${allowedPlants.map(p=>`<option value="${esc(p.code)}">${esc(p.code)} - ${esc(p.name)}</option>`).join('')}
             </select>
           </label>
-
           <div class="h-4 w-[1px] bg-slate-300"></div>
-
-          <!-- Layout Variants -->
           <label class="text-xs font-bold text-slate-600 flex items-center gap-1">ALV Variant:
             <select id="alv_variant_sel" onchange="switchLayout(this.value)" class="sap-input text-xs font-normal">
               ${ACTIVE_LAYOUTS.map(l => `<option value="${esc(l.layout_code)}" ${CURRENT_LAYOUT && l.layout_code===CURRENT_LAYOUT.layout_code?'selected':''}>${esc(l.name)}</option>`).join('')}
@@ -1592,7 +1527,6 @@ async function renderBusinessTcode(tc) {
           </label>
           <button onclick="showLayoutDesigner()" title="Change Layout Variant" class="sap-btn"><i class="ri-layout-masonry-line"></i> Layout Painter</button>
         </div>
-
         <div class="flex items-center gap-2">
           <a href="/api/tcode/${tc.code}/export" class="sap-btn flex items-center gap-1 text-emerald-800"><i class="ri-file-excel-2-line"></i> Export ALV</a>
           <label class="sap-btn cursor-pointer flex items-center gap-1 text-sky-800">
@@ -1602,13 +1536,8 @@ async function renderBusinessTcode(tc) {
           <button onclick="reloadRecords()" class="sap-btn"><i class="ri-refresh-line"></i></button>
         </div>
       </div>
-
-      <!-- ALV TABLE CONTAINER -->
-      <div id="alv_container" class="flex-1 bg-white border-t border-slate-300 overflow-auto">
-        <!-- Records table inserted here -->
-      </div>
-    </div>
-  `;
+      <div id="alv_container" class="flex-1 bg-white border-t border-slate-300 overflow-auto"></div>
+    </div>`;
   reloadRecords();
 }
 
@@ -1634,8 +1563,7 @@ async function reloadRecords() {
           <th style="width:90px;">Actions</th>
         </tr>
       </thead>
-      <tbody>
-  `;
+      <tbody>`;
 
   if (!recs.length) {
     html += `<tr><td colspan="${fields.length + 5}" class="text-center py-8 text-slate-400">No records found matching criteria in database.</td></tr>`;
@@ -1687,8 +1615,7 @@ function showRecordModal(editId = null, existingData = {}, existingPlant = '') {
     <div class="border-t border-slate-300 p-3 bg-slate-100 flex justify-end gap-2">
       <button onclick="submitRecord(${editId})" class="sap-btn sap-btn-primary">Post Document</button>
       <button onclick="closeDialog()" class="sap-btn">Cancel</button>
-    </div>
-  `);
+    </div>`);
 }
 
 async function editRecord(rid) {
@@ -1752,9 +1679,7 @@ async function importSpreadsheet(e) {
   }
 }
 
-// ==========================================
-// SAP SCREEN PAINTER & ALV LAYOUT DESIGNER
-// ==========================================
+// SCREEN PAINTER & ALV LAYOUT DESIGNER
 function showLayoutDesigner() {
   const fields = CURRENT_LAYOUT ? CURRENT_LAYOUT.fields : [];
   openDialog(`
@@ -1767,14 +1692,13 @@ function showLayoutDesigner() {
         <div><label class="block text-xs font-bold text-slate-600">Layout Name</label><input id="lay_name" value="${esc(CURRENT_LAYOUT.name)}" class="sap-input w-full"></div>
         <div><label class="block text-xs font-bold text-slate-600">Variant Code</label><input id="lay_code" value="${esc(CURRENT_LAYOUT.layout_code)}" class="sap-input w-full font-mono uppercase"></div>
       </div>
-
       <div class="border border-slate-300 p-3 bg-slate-50 rounded">
         <div class="flex justify-between items-center mb-2">
           <span class="font-bold text-xs text-slate-700">Column Schema Fields</span>
           <button onclick="addSchemaRow()" class="sap-btn sap-btn-primary">+ Add Column</button>
         </div>
         <div id="schema_rows" class="space-y-2 max-h-56 overflow-y-auto">
-          ${fields.map((f, idx) => `
+          ${fields.map(f => `
             <div class="flex items-center gap-2 schema-row bg-white p-1.5 border border-slate-300 rounded">
               <input placeholder="field_key" value="${esc(f.key)}" class="sap-input w-28 font-mono text-xs skey">
               <input placeholder="Column Label" value="${esc(f.label)}" class="sap-input flex-1 text-xs slbl">
@@ -1798,8 +1722,7 @@ function showLayoutDesigner() {
         <button onclick="submitLayoutSave()" class="sap-btn sap-btn-primary">Save Variant</button>
         <button onclick="closeDialog()" class="sap-btn">Cancel</button>
       </div>
-    </div>
-  `);
+    </div>`);
 }
 
 function addSchemaRow() {
@@ -1858,7 +1781,6 @@ async function makeLayoutDefault(lid) {
   setMsg("Layout set as client default.");
 }
 
-// DIALOG MODAL HELPERS
 function openDialog(content) {
   $('#sap_dialog_body').innerHTML = content;
   $('#sap_dialog').classList.remove('hidden');
@@ -1870,15 +1792,9 @@ function closeDialog() {
 }
 
 function showHelp() {
-  alert("Thermocables SAP GUI Clone\\nSystem: PRD\\nClient: 100\\nUse command box for navigation (e.g. /nSU01, /nSE93, /nPROD).");
+  alert("Thermocables SAP GUI\\nSystem: PRD (Client 100)\\nCommand examples: /nSU01, /nSE93, /nSPRO, /nPFCG, /nPROD.");
 }
 
-function openFind() {
-  const s = prompt("Search string across current screen:");
-  if (s) window.find(s);
-}
-
-// STARTUP ENTRYPOINT
 initSession();
 </script>
 </body>
