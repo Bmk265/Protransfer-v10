@@ -2013,7 +2013,7 @@ async function openSendModal() {
       </div>
 
       <div>
-        <label class="block text-xs font-semibold text-slate-700 mb-1">Dispatch Instructions / Remarks</label>
+        <label class="block text-xs font-semibold text-slate-700 mb-1">Special Instructions / Remarks</label>
         <textarea id="send_remarks" class="w-full border border-slate-300 rounded-xl p-2.5 text-xs" rows="2" placeholder="e.g. Urgent dispatch for 11kV core test, complete handover by 2 PM..."></textarea>
       </div>
 
@@ -2039,10 +2039,10 @@ async function openSendModal() {
     </div>
 
     <div class="px-6 py-4 bg-slate-50 border-t border-slate-200 flex justify-between items-center rounded-b-2xl">
-      <div class="text-xs text-slate-500 font-medium">Dispatches immediately to recipient's login inbox</div>
+      <div class="text-xs text-slate-500 font-medium">Delivering instantly to recipients inbox directly.</div>
       <div class="flex gap-2">
         <button onclick="closeDialog()" class="btn-secondary px-4 py-2 rounded-xl text-xs font-semibold">Cancel</button>
-        <button onclick="submitSendNote()" class="btn-primary px-5 py-2 rounded-xl text-xs font-bold shadow-md shadow-indigo-600/30">Confirm & Dispatch</button>
+        <button onclick="submitSendNote()" class="btn-primary px-5 py-2 rounded-xl text-xs font-bold shadow-md shadow-indigo-600/30">Confirm & Send</button>
       </div>
     </div>`);
 
