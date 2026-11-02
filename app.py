@@ -123,25 +123,32 @@ def init_db():
 
     if USE_PG:
         try:
+            # 1. Check if 'tcodes' has legacy 'color' column from old build
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'tcodes' AND column_name = 'color';")
+            if cur.fetchone():
+                cur.execute("DROP TABLE IF EXISTS tcodes CASCADE;")
+                cur.execute("DROP TABLE IF EXISTS tcode_schemas CASCADE;")
+                cur.execute("DROP TABLE IF EXISTS tcode_layouts CASCADE;")
+
+            # 2. Check if 'users' has legacy 'sub_department' column from old build
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'sub_department';")
+            if cur.fetchone():
+                cur.execute("DROP TABLE IF EXISTS users CASCADE;")
+
+            # 3. Check if 'plants' has 'code' column
             cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'plants' AND column_name = 'code';")
             if not cur.fetchone():
                 cur.execute("DROP TABLE IF EXISTS plants CASCADE;")
 
+            # 4. Check if 'org' has 'system_id' column
             cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'org' AND column_name = 'system_id';")
             if not cur.fetchone():
                 cur.execute("DROP TABLE IF EXISTS org CASCADE;")
 
+            # 5. Check missing plant column in tcode_records
             cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'tcode_records' AND column_name = 'plant';")
             if not cur.fetchone():
                 cur.execute("ALTER TABLE tcode_records ADD COLUMN IF NOT EXISTS plant TEXT DEFAULT '';")
-
-            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'plants';")
-            if not cur.fetchone():
-                cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plants TEXT DEFAULT '';")
-
-            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'tcodes' AND column_name = 'module';")
-            if not cur.fetchone():
-                cur.execute("ALTER TABLE tcodes ADD COLUMN IF NOT EXISTS module TEXT DEFAULT 'PROD';")
 
             conn.commit()
         except Exception as e:
@@ -232,22 +239,22 @@ def init_db():
 
     cur_time = now()
 
-    # Org Record
+    # Org Record (Explicit Column Names)
     cur.execute(q("SELECT 1 FROM org WHERE id=1"))
     if not cur.fetchone():
-        cur.execute(q("INSERT INTO org VALUES (?,?,?,?)"), (1, "Thermocables Enterprise Group", "NX-01", "GLOBAL"))
+        cur.execute(q("INSERT INTO org (id, name, system_id, client) VALUES (?,?,?,?)"), (1, "Thermocables Enterprise Group", "NX-01", "GLOBAL"))
 
-    # Default Departments
+    # Default Departments (Explicit Column Names)
     for d in ["Production", "Final Testing", "Quality Control", "Commercial", "Store", "Planning", "Engineering"]:
         cur.execute(q("SELECT 1 FROM departments WHERE name=?"), (d,))
         if not cur.fetchone():
-            cur.execute(q("INSERT INTO departments VALUES (?,?,?)"), (d, 1, cur_time))
+            cur.execute(q("INSERT INTO departments (name, active, created_at) VALUES (?,?,?)"), (d, 1, cur_time))
 
-    # Default Plants
+    # Default Plants (Explicit Column Names)
     for p_code, p_name in [("1000", "Gooty Central Plant"), ("1400", "Extrusion Unit 1400"), ("2000", "Hyderabad Works"), ("CORP", "Corporate Headquarters")]:
         cur.execute(q("SELECT 1 FROM plants WHERE code=?"), (p_code,))
         if not cur.fetchone():
-            cur.execute(q("INSERT INTO plants VALUES (?,?,?,?)"), (p_code, p_name, 1, cur_time))
+            cur.execute(q("INSERT INTO plants (code, name, active, created_at) VALUES (?,?,?,?)"), (p_code, p_name, 1, cur_time))
 
     # Master Admin Guarantee
     ph = bcrypt.hashpw("Admin@123".encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
@@ -255,10 +262,10 @@ def init_db():
     if cur.fetchone():
         cur.execute(q("UPDATE users SET password_hash=?, status='approved', role='master' WHERE username='admin'"), (ph,))
     else:
-        cur.execute(q("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?)"),
+        cur.execute(q("INSERT INTO users (username, password_hash, full_name, role, department, plants, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"),
                     ("admin", ph, "Master System Administrator", "master", "IT & Systems", "1000,1400,2000,CORP", "approved", cur_time, cur_time))
 
-    # Sample Department Users for smooth dispatch testing
+    # Sample Department Users for testing
     sample_users = [
         ("prod_user", "Production Supervisor", "Production", "1000"),
         ("testing_lead", "Final Testing Incharge", "Final Testing", "1000"),
@@ -268,10 +275,10 @@ def init_db():
     for su_name, su_full, su_dept, su_pl in sample_users:
         cur.execute(q("SELECT 1 FROM users WHERE username=?"), (su_name,))
         if not cur.fetchone():
-            cur.execute(q("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?)"),
+            cur.execute(q("INSERT INTO users (username, password_hash, full_name, role, department, plants, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"),
                         (su_name, ph, su_full, "user", su_dept, su_pl, "approved", cur_time, cur_time))
 
-    # Default Functional Modules including TN01
+    # Default Functional Modules including TN01 (Explicit Column Names)
     default_modules = [
         ("TN01", "Transfer Note & Handover Sheet", "Inter-department material handover & batch transfer note", "MM", "Production,Final Testing,Commercial,Store,Quality Control,Planning"),
         ("PROD", "Production Handover Report", "Manufacturing batch & lot transfer logs", "PROD", "Production,Quality Control"),
@@ -285,7 +292,7 @@ def init_db():
     for code, title, desc, mod, depts in default_modules:
         cur.execute(q("SELECT 1 FROM tcodes WHERE code=?"), (code,))
         if not cur.fetchone():
-            cur.execute(q("INSERT INTO tcodes VALUES (?,?,?,?,?,?,?,?,?)"),
+            cur.execute(q("INSERT INTO tcodes (code, title, description, module, allowed_depts, active, created_at, updated_at, created_by) VALUES (?,?,?,?,?,?,?,?,?)"),
                         (code, title, desc, mod, depts, 1, cur_time, cur_time, "SYSTEM"))
 
     conn.commit()
@@ -347,7 +354,7 @@ def check_tcode_access(u, code: str):
     return bool(grant)
 
 # --- FASTAPI APP ---
-app = FastAPI(title="Nexus Core ERP - Industrial Operations Suite", version="3.4.0")
+app = FastAPI(title="Nexus Core ERP - Industrial Operations Suite", version="3.4.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- AUTH APIS ---
@@ -362,7 +369,7 @@ def api_login(res: Response, username: str = Form(...), password: str = Form(...
 
     token = secrets.token_hex(32)
     exp = (datetime.datetime.now() + datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
-    exec_write("INSERT INTO sessions VALUES (?,?,?)", (token, username, exp))
+    exec_write("INSERT INTO sessions (token, username, expires) VALUES (?,?,?)", (token, username, exp))
 
     res.set_cookie("nexus_session", token, httponly=True, samesite="lax", max_age=86400 * 7)
     return {
@@ -416,7 +423,7 @@ def spro_create_plant(req: Request, code: str = Form(...), name: str = Form(...)
     code = code.upper().strip()
     if fetch_one("SELECT 1 FROM plants WHERE code=?", (code,)):
         raise HTTPException(400, f"Facility code '{code}' already exists.")
-    exec_write("INSERT INTO plants VALUES (?,?,?,?)", (code, name.strip(), 1, now()))
+    exec_write("INSERT INTO plants (code, name, active, created_at) VALUES (?,?,?,?)", (code, name.strip(), 1, now()))
     return {"ok": True}
 
 @app.post("/api/admin/plants/delete")
@@ -431,7 +438,7 @@ def spro_create_dept(req: Request, name: str = Form(...)):
     name = name.strip()
     if fetch_one("SELECT 1 FROM departments WHERE name=?", (name,)):
         raise HTTPException(400, "Department already exists.")
-    exec_write("INSERT INTO departments VALUES (?,?,?)", (name, 1, now()))
+    exec_write("INSERT INTO departments (name, active, created_at) VALUES (?,?,?)", (name, 1, now()))
     return {"ok": True}
 
 @app.post("/api/admin/departments/delete")
@@ -458,7 +465,7 @@ def su01_create_user(req: Request, username: str = Form(...), password: str = Fo
 
     ph = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     cur_time = now()
-    exec_write("INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?)",
+    exec_write("INSERT INTO users (username, password_hash, full_name, role, department, plants, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
                (username, ph, full_name.strip(), role, department.strip(), plants.strip(), "approved", cur_time, cur_time))
     return {"ok": True}
 
@@ -583,7 +590,6 @@ async def se93_auto_create(
     data_rows = []
 
     try:
-        # Excel format (.xlsx, .xls)
         if filename.endswith(".xlsx") or filename.endswith(".xls"):
             wb = load_workbook(io.BytesIO(contents), data_only=True)
             ws = wb.active
@@ -592,7 +598,6 @@ async def se93_auto_create(
                 headers = [str(h).strip() for h in rows[0] if h is not None and str(h).strip()]
                 data_rows = rows[1:]
 
-        # CSV format (.csv)
         elif filename.endswith(".csv"):
             text = contents.decode("utf-8", errors="ignore")
             reader = csv.reader(io.StringIO(text))
@@ -601,7 +606,6 @@ async def se93_auto_create(
                 headers = [str(h).strip() for h in rows[0] if str(h).strip()]
                 data_rows = rows[1:]
 
-        # JSON format (.json)
         elif filename.endswith(".json"):
             parsed = json.loads(contents.decode("utf-8", errors="ignore"))
             if isinstance(parsed, list) and len(parsed) > 0 and isinstance(parsed[0], dict):
@@ -619,7 +623,6 @@ async def se93_auto_create(
     if not headers:
         raise HTTPException(400, "No valid column headers found in the uploaded file.")
 
-    # Infer types per column
     fields = []
     col_samples = {idx: [] for idx in range(len(headers))}
     for r in data_rows[:25]:
@@ -644,13 +647,13 @@ async def se93_auto_create(
 
     cur_time = now()
 
-    # 1. Register T-Code in Repository
-    exec_write("INSERT INTO tcodes VALUES (?,?,?,?,?,?,?,?,?)",
+    # 1. Register T-Code with Explicit Column Names
+    exec_write("INSERT INTO tcodes (code, title, description, module, allowed_depts, active, created_at, updated_at, created_by) VALUES (?,?,?,?,?,?,?,?,?)",
                (code, title.strip() or f"{code} Module", description.strip(), module.strip(), allowed_depts.strip(), 1, cur_time, cur_time, u["username"]))
 
     # 2. Register Generated Schema
     fields_json = json.dumps(fields)
-    exec_write("INSERT INTO tcode_schemas VALUES (?,?,?,?,?)",
+    exec_write("INSERT INTO tcode_schemas (code, fields, layout, updated_at, updated_by) VALUES (?,?,?,?,?)",
                (code, fields_json, json.dumps({"columns": 3}), cur_time, u["username"]))
 
     # 3. Create Default ALV Grid Layout
@@ -658,7 +661,7 @@ async def se93_auto_create(
     exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                (code, layout_code, "Default Grid", f"{title or code} Data View", 1, fields_json, json.dumps({"columns": 3}), "Auto-generated from uploaded file", u["username"], u["full_name"], cur_time, cur_time))
 
-    # 4. Optional: Import sample rows if present in template
+    # 4. Optional: Import rows present in template
     imported_count = 0
     if import_sample_data and data_rows:
         conn = get_conn()
@@ -1172,7 +1175,6 @@ HTML_MODERN_UI = """<!DOCTYPE html>
 
 <div id="app_root" class="h-full flex flex-col">
 
-  <!-- TOP HEADER -->
   <header class="h-14 bg-slate-900/90 backdrop-blur border-b border-slate-800 px-4 flex items-center justify-between z-10 shrink-0">
     <div class="flex items-center gap-4">
       <div class="flex items-center gap-2.5 cursor-pointer" onclick="goHome()">
@@ -1186,7 +1188,6 @@ HTML_MODERN_UI = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- GLOBAL JUMP BAR -->
       <div class="relative ml-4">
         <i class="ri-search-line absolute left-3 top-2.5 text-slate-400 text-xs"></i>
         <input id="cmd_box" placeholder="Jump to module (e.g. TN01, PROD, PLN0, SE93)..." 
@@ -1208,7 +1209,6 @@ HTML_MODERN_UI = """<!DOCTYPE html>
     </div>
   </header>
 
-  <!-- BODY: SIDEBAR + WORKSPACE -->
   <div class="flex-1 flex overflow-hidden">
     
     <aside id="sidebar" class="w-64 bg-slate-950 border-r border-slate-800 flex flex-col justify-between shrink-0">
@@ -1280,7 +1280,6 @@ HTML_MODERN_UI = """<!DOCTYPE html>
 
 </div>
 
-<!-- DIALOG MODAL -->
 <div id="app_dialog" class="hidden fixed inset-0 bg-slate-950/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
   <div id="app_dialog_body" class="bg-white text-slate-800 rounded-2xl shadow-2xl border border-slate-200 max-h-[90vh] overflow-y-auto w-full max-w-4xl"></div>
 </div>
@@ -1566,7 +1565,6 @@ function showAutoCreateTcodeModal() {
     </div>
 
     <div class="p-6 space-y-4">
-      <!-- FILE UPLOAD DROPZONE -->
       <div class="border-2 border-dashed border-indigo-300 bg-indigo-50/40 hover:bg-indigo-50/80 p-5 rounded-2xl text-center cursor-pointer transition-colors" onclick="$('#auto_file').click()">
         <i class="ri-file-upload-line text-3xl text-indigo-600 mb-1"></i>
         <div class="text-xs font-bold text-slate-700">Click to upload Excel / CSV File (.xlsx, .xls, .csv, .json)</div>
@@ -1622,7 +1620,6 @@ function handleAutoFileChosen(input) {
   badge.textContent = `Selected: ${file.name} (${Math.round(file.size/1024)} KB)`;
   badge.classList.remove('hidden');
 
-  // Auto-suggest T-Code and Title based on file name
   const rawName = file.name.replace(/\\.[^/.]+$/, "").replace(/[^a-zA-Z0-9 ]/g, " ");
   const cleanTitle = rawName.trim().replace(/\\s+/g, " ");
 
@@ -1705,7 +1702,6 @@ async function renderTN01() {
 function renderTN01Main(activeTab = "sheet") {
   $('#main_screen').innerHTML = `
     <div class="flex-1 flex flex-col bg-slate-900 overflow-hidden select-text">
-      <!-- TN01 TOP BAR & TABS -->
       <div class="p-3 bg-slate-950 border-b border-slate-800 flex items-center justify-between shrink-0">
         <div class="flex items-center gap-3">
           <div class="flex items-center gap-2">
@@ -1718,7 +1714,6 @@ function renderTN01Main(activeTab = "sheet") {
 
           <div class="h-6 w-[1px] bg-slate-800 mx-2"></div>
 
-          <!-- PRIMARY 4 BUTTONS / TABS -->
           <div class="flex items-center bg-slate-900 border border-slate-800 rounded-xl p-1 gap-1 text-xs font-semibold">
             <button onclick="switchTN01Tab('sheet')" class="px-3 py-1.5 rounded-lg flex items-center gap-1.5 ${activeTab==='sheet'?'bg-indigo-600 text-white shadow':'text-slate-400 hover:text-white'}">
               <i class="ri-table-line"></i> Excel Sheet
@@ -1745,7 +1740,6 @@ function renderTN01Main(activeTab = "sheet") {
         </div>
       </div>
 
-      <!-- TN01 CONTENT CONTAINER -->
       <div id="tn01_content" class="flex-1 overflow-hidden flex flex-col bg-slate-900"></div>
     </div>`;
 
@@ -1766,7 +1760,6 @@ function renderTN01SheetTab() {
   }
 
   $('#tn01_content').innerHTML = `
-    <!-- SPREADSHEET TOOLBAR -->
     <div class="p-2 bg-slate-900 border-b border-slate-800 flex items-center justify-between text-xs shrink-0">
       <div class="flex items-center gap-2">
         <label class="font-bold text-slate-400 text-xs flex items-center gap-1.5">Preset Route:
@@ -1794,7 +1787,6 @@ function renderTN01SheetTab() {
       </div>
     </div>
 
-    <!-- EXCEL GRID TABLE CONTAINER -->
     <div id="grid_table_container" class="flex-1 overflow-auto bg-slate-950 p-2 select-text" tabindex="0"></div>
 
     <div class="p-2 bg-slate-950 border-t border-slate-800 text-slate-400 text-[11px] flex justify-between items-center font-mono shrink-0">
@@ -2187,11 +2179,9 @@ async function viewTransferNote(nid) {
       <div class="flex justify-between items-center">
         <span class="text-xs font-bold text-slate-700">Batch Rows (${note.entry_count} Entries):</span>
         <div class="flex gap-2">
-          <!-- COPY FOR EXCEL -->
           <button onclick="copyReceivedForExcel(${nid})" class="btn-secondary text-xs px-3 py-1.5 rounded-lg flex items-center gap-1 text-emerald-700 font-semibold border-emerald-300">
             <i class="ri-file-copy-line"></i> Copy for Excel
           </button>
-          <!-- LOAD INTO WORKSPACE -->
           <button onclick="loadNoteIntoWorkspace(${nid})" class="btn-primary text-xs px-3 py-1.5 rounded-lg flex items-center gap-1 font-semibold">
             <i class="ri-download-cloud-2-line"></i> Load into My Workspace
           </button>
@@ -2666,7 +2656,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "3.4.0"}
+    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "3.4.1"}
 
 if __name__ == "__main__":
     import uvicorn
