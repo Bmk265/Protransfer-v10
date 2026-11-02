@@ -92,7 +92,6 @@ def infer_field_type(sample_values):
         if len(s) > 70 or '\n' in s:
             is_long, is_num, is_date = True, False, False
             break
-        # Preserve leading-zero codes as text
         if len(s) > 1 and s[0] == '0' and s.isdigit():
             is_num = False
         else:
@@ -305,7 +304,7 @@ def check_tcode_access(u, code: str):
     return bool(fetch_one("SELECT 1 FROM access_grants WHERE username=? AND tcode_code=?", (u["username"], code)))
 
 # --- FASTAPI APP ---
-app = FastAPI(title="Nexus Core ERP", version="3.6.0")
+app = FastAPI(title="Nexus Core ERP", version="3.6.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- AUTH APIS ---
@@ -951,9 +950,17 @@ def tn01_receive(req: Request, nid: int):
     return {"ok": True, "received_at": cur_time}
 
 @app.get("/api/tn01/history")
-def tn01_get_history(req: Request, plant: str = "", route: str = "", status: str = ""):
-    need(req)
-    sql, params = "SELECT * FROM transfer_notes WHERE 1=1", []
+def tn01_get_history(req: Request, plant: str = "", route: str = "", status: str = "",
+                     from_dept: str = "", to_dept: str = "", date_from: str = "", date_to: str = ""):
+    u = need(req)
+    sql = "SELECT * FROM transfer_notes WHERE 1=1"
+    params = []
+
+    # Non-admin users only see notes they sent or received
+    if not (is_master(u) or u["role"] == "admin"):
+        sql += " AND (from_user = ? OR to_user = ? OR from_dept = ? OR to_dept = ?)"
+        params.extend([u["username"], u["username"], u["department"], u["department"]])
+
     if plant:
         sql += " AND (from_plant = ? OR to_plant = ?)"
         params.extend([plant, plant])
@@ -963,7 +970,23 @@ def tn01_get_history(req: Request, plant: str = "", route: str = "", status: str
     if status:
         sql += " AND status = ?"
         params.append(status)
-    sql += " ORDER BY id DESC LIMIT 150"
+
+    # Admin-only extra filters
+    if (is_master(u) or u["role"] == "admin"):
+        if from_dept:
+            sql += " AND from_dept = ?"
+            params.append(from_dept)
+        if to_dept:
+            sql += " AND to_dept = ?"
+            params.append(to_dept)
+        if date_from:
+            sql += " AND created_at >= ?"
+            params.append(date_from + " 00:00:00")
+        if date_to:
+            sql += " AND created_at <= ?"
+            params.append(date_to + " 23:59:59")
+
+    sql += " ORDER BY id DESC LIMIT 300"
     return fetch_all(sql, tuple(params))
 
 @app.get("/api/tn01/note/{nid}")
@@ -976,6 +999,74 @@ def tn01_get_note(req: Request, nid: int):
     try: note["sheet_data"] = json.loads(note["sheet_data"])
     except: note["sheet_data"] = []
     return note
+
+@app.get("/api/tn01/export/{nid}")
+def tn01_export_excel(req: Request, nid: int):
+    u = need(req)
+    note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
+    if not note:
+        raise HTTPException(404, "Note not found")
+
+    is_sender = (u["username"] == note["from_user"]) or (u["department"] == note["from_dept"])
+    is_receiver = (u["username"] == note["to_user"]) or (u["department"] == note["to_dept"])
+    if not (is_sender or is_receiver or is_master(u) or u["role"] == "admin"):
+        raise HTTPException(403, "You do not have permission to export this note.")
+
+    try:
+        headers = json.loads(note["sheet_headers"])
+    except Exception:
+        headers = []
+    try:
+        data_rows = json.loads(note["sheet_data"])
+    except Exception:
+        data_rows = []
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Transfer_Note"
+
+    org = fetch_one("SELECT * FROM org WHERE id=1") or {}
+    ws.append([org.get("name", "Thermocables Limited")])
+    ws.append([f"TRANSFER NOTE {note['note_no']} — {note['route']}"])
+    ws.append([f"From: {note['from_plant']} - {note['from_dept']}  |  To: {note['to_plant']} - {note['to_dept']}"])
+    ws.append([f"Sender: {note['from_user_name']}  |  Receiver: {note['to_user_name']}  |  Status: {note['status'].upper()}"])
+    ws.append([f"Created: {note['created_at']}  |  Received: {note['received_at'] or 'Pending'}"])
+    ws.append([])
+
+    ws.append(headers)
+    for row in data_rows:
+        ws.append(row)
+
+    ws.append([])
+    ws.append(["Handovered By: ________________", "", "Received By: ________________", "", "QC/Incharge: ________________"])
+
+    from openpyxl.styles import Font, Alignment, PatternFill
+    bold = Font(bold=True)
+    header_fill = PatternFill("solid", fgColor="1E293B")
+    header_font = Font(bold=True, color="FFFFFF")
+    center = Alignment(horizontal="center")
+
+    ws["A1"].font = Font(bold=True, size=14)
+    ws["A2"].font = bold
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=7, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center
+
+    for col_idx, h in enumerate(headers, start=1):
+        width = max(14, min(40, len(str(h)) + 4))
+        ws.column_dimensions[ws.cell(row=7, column=col_idx).column_letter].width = width
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    filename = f"TransferNote_{note['note_no']}.xlsx"
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 @app.get("/api/tn01/print/{nid}", response_class=HTMLResponse)
 def tn01_print_preview(req: Request, nid: int):
@@ -2465,7 +2556,7 @@ async function viewTransferNote(nid) {
       <div class="flex justify-between items-center">
         <span class="text-xs font-bold text-slate-700">Batches (${note.entry_count} rows):</span>
         <div class="flex gap-2">
-          <button onclick="copyReceivedForExcel(${nid})" class="btn-secondary text-xs px-3 py-1.5 rounded-lg flex items-center gap-1 text-emerald-700 font-semibold border-emerald-300"><i class="ri-file-copy-line"></i> Copy for Excel</button>
+          <a href="/api/tn01/export/${nid}" class="btn-secondary text-xs px-3 py-1.5 rounded-lg flex items-center gap-1 text-emerald-700 font-semibold border-emerald-300"><i class="ri-file-excel-2-line"></i> Export as Excel</a>
           <button onclick="loadNoteIntoWorkspace(${nid})" class="btn-primary text-xs px-3 py-1.5 rounded-lg flex items-center gap-1 font-semibold"><i class="ri-download-cloud-2-line"></i> Load into Workspace</button>
         </div>
       </div>
@@ -2482,13 +2573,6 @@ async function viewTransferNote(nid) {
     </div>`);
 }
 
-async function copyReceivedForExcel(nid) {
-  const note = await api(`/api/tn01/note/${nid}`);
-  let tsv = note.sheet_headers.join('\\t') + '\\n';
-  note.sheet_data.forEach(r => { tsv += r.join('\\t') + '\\n'; });
-  navigator.clipboard.writeText(tsv).then(() => { alert("Copied! Paste into Excel with Ctrl+V."); });
-}
-
 async function loadNoteIntoWorkspace(nid) {
   const note = await api(`/api/tn01/note/${nid}`);
   TN01_HEADERS = [...note.sheet_headers];
@@ -2499,34 +2583,114 @@ async function loadNoteIntoWorkspace(nid) {
 }
 
 async function renderTN01HistoryTab() {
-  const history = await api(`/api/tn01/history`);
+  const isAdmin = (ME.is_master || ME.role === 'admin');
+  const hist = await api('/api/tn01/history');
+  const spro = isAdmin ? await api('/api/spro/overview') : null;
+
   $('#tn01_content').innerHTML = `
     <div class="p-6 flex-1 flex flex-col overflow-hidden">
+      <div class="flex items-center justify-between pb-3 border-b border-slate-800 shrink-0">
+        <div>
+          <h2 class="text-base font-bold text-white">${isAdmin ? "All Transfer Notes (Admin View)" : "My Transfer Notes"}</h2>
+          <p class="text-xs text-slate-400">${isAdmin ? "Full history across departments — apply filters below" : "Showing notes sent by or addressed to your department"}</p>
+        </div>
+        <button onclick="renderTN01HistoryTab()" class="btn-secondary text-xs px-3 py-1.5 rounded-lg"><i class="ri-refresh-line"></i> Refresh</button>
+      </div>
+
+      ${isAdmin ? `
+      <div class="mt-3 mb-3 bg-slate-950 border border-slate-800 rounded-xl p-3 grid grid-cols-1 md:grid-cols-6 gap-2 shrink-0">
+        <div>
+          <label class="block text-[10px] font-semibold text-slate-400 mb-1">From Dept</label>
+          <select id="f_from" class="w-full bg-slate-800 border border-slate-700 text-xs rounded-lg px-2 py-1.5 text-white">
+            <option value="">— Any —</option>
+            ${spro.departments.map(d => `<option value="${esc(d.name)}">${esc(d.name)}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label class="block text-[10px] font-semibold text-slate-400 mb-1">To Dept</label>
+          <select id="f_to" class="w-full bg-slate-800 border border-slate-700 text-xs rounded-lg px-2 py-1.5 text-white">
+            <option value="">— Any —</option>
+            ${spro.departments.map(d => `<option value="${esc(d.name)}">${esc(d.name)}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label class="block text-[10px] font-semibold text-slate-400 mb-1">Status</label>
+          <select id="f_status" class="w-full bg-slate-800 border border-slate-700 text-xs rounded-lg px-2 py-1.5 text-white">
+            <option value="">— Any —</option>
+            <option value="sent">Sent</option>
+            <option value="received">Received</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-[10px] font-semibold text-slate-400 mb-1">Date From</label>
+          <input type="date" id="f_from_date" class="w-full bg-slate-800 border border-slate-700 text-xs rounded-lg px-2 py-1.5 text-white">
+        </div>
+        <div>
+          <label class="block text-[10px] font-semibold text-slate-400 mb-1">Date To</label>
+          <input type="date" id="f_to_date" class="w-full bg-slate-800 border border-slate-700 text-xs rounded-lg px-2 py-1.5 text-white">
+        </div>
+        <div class="flex items-end gap-1">
+          <button onclick="applyHistoryFilters()" class="btn-primary text-xs font-bold px-3 py-1.5 rounded-lg flex-1"><i class="ri-filter-line"></i> Filter</button>
+          <button onclick="renderTN01HistoryTab()" class="btn-secondary text-xs font-semibold px-2 py-1.5 rounded-lg">Reset</button>
+        </div>
+      </div>` : ''}
+
       <div class="flex-1 mt-2 bg-slate-950 border border-slate-800 rounded-2xl overflow-auto">
         <table class="w-full text-left custom-table">
           <thead><tr><th>Note #</th><th>Route</th><th>From</th><th>To</th><th>Batches</th><th>Sender</th><th>Timestamp</th><th>Status</th><th>Actions</th></tr></thead>
-          <tbody class="text-slate-300">
-            ${!history.length ? `<tr><td colspan="9" class="text-center py-10 text-slate-500">No records found.</td></tr>` : ''}
-            ${history.map(h => `
-              <tr class="border-b border-slate-800/60">
-                <td class="font-mono font-bold text-indigo-400">${esc(h.note_no)}</td>
-                <td class="font-semibold text-white">${esc(h.route)}</td>
-                <td>${esc(h.from_plant)} - ${esc(h.from_dept)}</td>
-                <td>${esc(h.to_plant)} - ${esc(h.to_dept)}</td>
-                <td class="font-mono font-bold">${h.entry_count}</td>
-                <td>${esc(h.from_user_name)}</td>
-                <td class="font-mono text-xs text-slate-400">${esc(h.created_at)}</td>
-                <td><span class="text-[10px] font-bold px-2 py-0.5 rounded-full ${h.status==='received'?'bg-emerald-950 text-emerald-300':'bg-amber-950 text-amber-300'}">${h.status.toUpperCase()}</span></td>
-                <td class="space-x-1">
-                  <button onclick="viewTransferNote(${h.id})" class="text-xs text-indigo-400 font-semibold">View</button>
-                  <a href="/api/tn01/print/${h.id}" target="_blank" class="text-xs text-emerald-400 font-semibold ml-2">PDF</a>
-                </td>
-              </tr>
-            `).join('')}
+          <tbody id="hist_tbody" class="text-slate-300">
+            ${renderHistoryRows(hist)}
           </tbody>
         </table>
       </div>
     </div>`;
+
+  if (isAdmin) {
+    window._HIST_ALL = hist;
+  }
+}
+
+function renderHistoryRows(hist) {
+  if (!hist.length) {
+    return `<tr><td colspan="9" class="text-center py-10 text-slate-500">No records found.</td></tr>`;
+  }
+  return hist.map(h => `
+    <tr class="border-b border-slate-800/60">
+      <td class="font-mono font-bold text-indigo-400">${esc(h.note_no)}</td>
+      <td class="font-semibold text-white">${esc(h.route)}</td>
+      <td>${esc(h.from_plant)} - ${esc(h.from_dept)}</td>
+      <td>${esc(h.to_plant)} - ${esc(h.to_dept)}</td>
+      <td class="font-mono font-bold">${h.entry_count}</td>
+      <td>${esc(h.from_user_name)}</td>
+      <td class="font-mono text-xs text-slate-400">${esc(h.created_at)}</td>
+      <td><span class="text-[10px] font-bold px-2 py-0.5 rounded-full ${h.status==='received'?'bg-emerald-950 text-emerald-300':'bg-amber-950 text-amber-300'}">${h.status.toUpperCase()}</span></td>
+      <td class="space-x-1">
+        <button onclick="viewTransferNote(${h.id})" class="text-xs text-indigo-400 font-semibold">View</button>
+        <a href="/api/tn01/print/${h.id}" target="_blank" class="text-xs text-slate-400 font-semibold ml-2">PDF</a>
+        <a href="/api/tn01/export/${h.id}" class="text-xs text-emerald-400 font-semibold ml-2">Excel</a>
+      </td>
+    </tr>
+  `).join('');
+}
+
+async function applyHistoryFilters() {
+  const from_dept = $('#f_from') ? $('#f_from').value : '';
+  const to_dept = $('#f_to') ? $('#f_to').value : '';
+  const status = $('#f_status') ? $('#f_status').value : '';
+  const date_from = $('#f_from_date') ? $('#f_from_date').value : '';
+  const date_to = $('#f_to_date') ? $('#f_to_date').value : '';
+
+  const qs = new URLSearchParams();
+  if (from_dept) qs.set('from_dept', from_dept);
+  if (to_dept) qs.set('to_dept', to_dept);
+  if (status) qs.set('status', status);
+  if (date_from) qs.set('date_from', date_from);
+  if (date_to) qs.set('date_to', date_to);
+
+  const hist = await api('/api/tn01/history?' + qs.toString());
+  const tbody = $('#hist_tbody');
+  if (tbody) tbody.innerHTML = renderHistoryRows(hist);
+  setMsg(`Filtered: ${hist.length} note(s)`);
 }
 
 async function renderTN01FormatTab() {
@@ -2720,7 +2884,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "3.6.0"}
+    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "3.6.1"}
 
 if __name__ == "__main__":
     import uvicorn
