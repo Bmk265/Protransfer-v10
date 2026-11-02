@@ -616,11 +616,11 @@ def se93_delete(req: Request, code: str = Form(...)):
 
 # --- TN01 ROUTES & PRESETS ---
 TN01_PRESET_ROUTES = {
-    "PROD_TO_QC": {"title": "Production to Final Testing", "route": "Production ➔ Final Testing", "from_dept": "Production", "to_dept": "Final Testing", "columns": ["Sr. No.", "Job / Prod Order #", "Batch / Heat Lot", "Cable Description / Spec", "Drum / Coil #", "Length (Mtrs)", "Operator Name", "Production Remarks"]},
+    "PROD_TO_QC": {"title": "Production to Final Testing", "route": "Production ➔ Final Testing", "from_dept": "Production", "to_dept": "Final Testing", "columns": ["Sr. No.", "Job No. #", "Customer Name", "Material Description", "Specified Length #", "Entry Length", "Drum Size", "PDrum Code", "Batch No. "]},
     "QC_TO_COMM": {"title": "Final Testing to Commercial", "route": "Final Testing ➔ Commercial", "from_dept": "Final Testing", "to_dept": "Commercial", "columns": ["Sr. No.", "Job / Prod Order #", "Batch / Heat Lot", "Cable Description / Spec", "Drum #", "Tested Length (Mtrs)", "HV Test Result", "Insulation Resistance", "QC Inspector", "Release Status"]},
     "PROD_TO_STORE": {"title": "Production to Store", "route": "Production ➔ Store", "from_dept": "Production", "to_dept": "Store", "columns": ["Sr. No.", "Work Order #", "Item Code / Material", "Batch / Heat Lot", "Quantity (Mtrs/Kgs)", "Weight (Kgs)", "Drum / Pack #", "Handover Person", "Remarks"]},
     "QC_TO_PROD": {"title": "Final Testing to Production (Rework/Reject)", "route": "Final Testing ➔ Production", "from_dept": "Final Testing", "to_dept": "Production", "columns": ["Sr. No.", "Job Order #", "Batch / Heat Lot", "Cable Size", "Defect Observed", "Length (Mtrs)", "QC Engineer", "Rework Instructions"]},
-    "COMM_TO_QC": {"title": "Commercial to Final Testing (Inspection Request)", "route": "Commercial ➔ Final Testing", "from_dept": "Commercial", "to_dept": "Final Testing", "columns": ["Sr. No.", "Customer Name", "Order / PO #", "Item Description", "Ordered Qty", "Inspection Agency", "Target Dispatch Date", "Special Testing Notes"]},
+    "COMM_TO_QC": {"title": "Commercial to Final Testing (Inspection Request)", "route": "Commercial ➔ Final Testing", "from_dept": "Commercial", "to_dept": "Final Testing", "columns": ["Sr. No.", "Customer Name", "Order / PO #", "Item Description", "Ordered Qty", "Inspection Agency", "Target Date", "Special Testing Notes"]},
     "STORE_TO_PROD": {"title": "Store to Production (Raw Material Issue)", "route": "Store ➔ Production", "from_dept": "Store", "to_dept": "Production", "columns": ["Sr. No.", "Material Code", "Material Description", "Lot / GRN #", "Issued Qty", "UOM", "Issued By", "Received For Work Order"]}
 }
 
@@ -1644,7 +1644,7 @@ function renderTN01Main(activeTab = "sheet") {
         <div class="flex items-center gap-3">
           <div class="flex items-center gap-2">
             <span class="font-mono font-bold text-xs bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 px-2.5 py-1 rounded-lg">TN01</span>
-            <div><h2 class="text-sm font-bold text-white">Transfer Note & Handover System</h2><p class="text-[10px] text-slate-400">Inter-department batch inspection & dispatch slips</p></div>
+            <div><h2 class="text-sm font-bold text-white">Transfer Note & Handover System</h2><p class="text-[10px] text-slate-400">Inter-department transfer slips</p></div>
           </div>
           <div class="h-6 w-[1px] bg-slate-800 mx-2"></div>
           <div class="flex items-center bg-slate-900 border border-slate-800 rounded-xl p-1 gap-1 text-xs font-semibold">
@@ -1822,7 +1822,7 @@ async function openSendModal() {
 
   openDialog(`
     <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50 rounded-t-2xl">
-      <div><h3 class="font-bold text-slate-800 text-sm">Transfer Dispatch & Handover Note</h3><p class="text-xs text-slate-500">Route: ${activeRoute.route}</p></div>
+      <div><h3 class="font-bold text-slate-800 text-sm">Transfer & Handover Note</h3><p class="text-xs text-slate-500">Route: ${activeRoute.route}</p></div>
       <button onclick="closeDialog()"><i class="ri-close-line text-lg"></i></button>
     </div>
     <div class="p-6 space-y-4">
@@ -1842,7 +1842,7 @@ async function openSendModal() {
         </div>
       </div>
       <div><label class="block text-xs font-semibold text-slate-700 mb-1">Remarks</label>
-        <textarea id="send_remarks" class="w-full border border-slate-300 rounded-xl p-2 text-xs" rows="2" placeholder="Dispatch notes..."></textarea>
+        <textarea id="send_remarks" class="w-full border border-slate-300 rounded-xl p-2 text-xs" rows="2" placeholder="Any remarks..."></textarea>
       </div>
     </div>
     <div class="px-6 py-4 bg-slate-50 border-t border-slate-200 flex justify-end gap-2 rounded-b-2xl">
@@ -1870,7 +1870,7 @@ async function submitSendNote() {
   try {
     const res = await api('/api/tn01/send', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
     closeDialog();
-    alert(`Transfer Dispatched! Note #: ${res.note_no}`);
+    alert(`Transfer Sheet Sent! Note #: ${res.note_no}`);
     switchTN01Tab('history');
   } catch(e) { alert(e); }
 }
