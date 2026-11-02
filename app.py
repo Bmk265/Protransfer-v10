@@ -92,10 +92,14 @@ def infer_field_type(sample_values):
         if len(s) > 70 or '\n' in s:
             is_long, is_num, is_date = True, False, False
             break
-        try:
-            float(s.replace(',', ''))
-        except ValueError:
+        # Preserve leading-zero codes as text
+        if len(s) > 1 and s[0] == '0' and s.isdigit():
             is_num = False
+        else:
+            try:
+                float(s.replace(',', ''))
+            except ValueError:
+                is_num = False
         if not any(re.match(p, s) for p in date_patterns):
             is_date = False
     return "date" if is_date else ("number" if is_num else ("textarea" if is_long else "text"))
@@ -151,6 +155,10 @@ def init_db():
         status TEXT DEFAULT 'sent', remarks TEXT DEFAULT '', created_at TEXT,
         received_at TEXT DEFAULT '', received_by TEXT DEFAULT '', received_by_name TEXT DEFAULT ''
     );
+    CREATE TABLE IF NOT EXISTS module_specs (
+        id SERIAL PRIMARY KEY, tcode_code TEXT, version INT,
+        action TEXT, spec TEXT, applied_by TEXT, applied_at TEXT, note TEXT
+    );
     ''' if USE_PG else '''
     CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password_hash TEXT, full_name TEXT, role TEXT, department TEXT, plants TEXT DEFAULT '', status TEXT DEFAULT 'approved', created_at TEXT, updated_at TEXT);
     CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, username TEXT, expires TEXT);
@@ -170,6 +178,10 @@ def init_db():
         status TEXT DEFAULT 'sent', remarks TEXT DEFAULT '', created_at TEXT,
         received_at TEXT DEFAULT '', received_by TEXT DEFAULT '', received_by_name TEXT DEFAULT ''
     );
+    CREATE TABLE IF NOT EXISTS module_specs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, tcode_code TEXT, version INT,
+        action TEXT, spec TEXT, applied_by TEXT, applied_at TEXT, note TEXT
+    );
     '''
 
     if USE_PG:
@@ -188,24 +200,20 @@ def init_db():
 
     cur_time = now()
 
-    # Seed Master Org
     cur.execute(q("SELECT 1 FROM org WHERE id=1"))
     if not cur.fetchone():
-        cur.execute(q("INSERT INTO org (id, name, system_id, client) VALUES (?,?,?,?)"), (1, "Thermocables Enterprise Group", "NX-01", "GLOBAL"))
+        cur.execute(q("INSERT INTO org (id, name, system_id, client) VALUES (?,?,?,?)"), (1, "Thermocables Limited", "NX-01", "GLOBAL"))
 
-    # Seed Departments
     for d in ["Production", "Final Testing", "Quality Control", "Commercial", "Store", "Planning", "Engineering"]:
         cur.execute(q("SELECT 1 FROM departments WHERE name=?"), (d,))
         if not cur.fetchone():
             cur.execute(q("INSERT INTO departments (name, active, created_at) VALUES (?,?,?)"), (d, 1, cur_time))
 
-    # Seed Plants
     for p_code, p_name in [("1000", "Gooty Central Plant"), ("1400", "Extrusion Unit 1400"), ("2000", "Hyderabad Works"), ("CORP", "Corporate Headquarters")]:
         cur.execute(q("SELECT 1 FROM plants WHERE code=?"), (p_code,))
         if not cur.fetchone():
             cur.execute(q("INSERT INTO plants (code, name, active, created_at) VALUES (?,?,?,?)"), (p_code, p_name, 1, cur_time))
 
-    # Master Admin Guarantee
     ph = bcrypt.hashpw("Admin@123".encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     cur.execute(q("SELECT username FROM users WHERE username='admin'"))
     if cur.fetchone():
@@ -214,7 +222,6 @@ def init_db():
         cur.execute(q("INSERT INTO users (username, password_hash, full_name, role, department, plants, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"),
                     ("admin", ph, "Master System Administrator", "master", "IT & Systems", "1000,1400,2000,CORP", "approved", cur_time, cur_time))
 
-    # Sample Users
     sample_users = [
         ("prod_user", "Production Supervisor", "Production", "1000"),
         ("testing_lead", "Final Testing Incharge", "Final Testing", "1000"),
@@ -227,7 +234,6 @@ def init_db():
             cur.execute(q("INSERT INTO users (username, password_hash, full_name, role, department, plants, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"),
                         (su_name, ph, su_full, "user", su_dept, su_pl, "approved", cur_time, cur_time))
 
-    # Seed Default Modules
     default_modules = [
         ("TN01", "Transfer Note & Handover Sheet", "Inter-department material handover & batch transfer note", "MM", "Production,Final Testing,Commercial,Store,Quality Control,Planning"),
         ("PROD", "Production Handover Report", "Manufacturing batch & lot transfer logs", "PROD", "Production,Quality Control"),
@@ -299,7 +305,7 @@ def check_tcode_access(u, code: str):
     return bool(fetch_one("SELECT 1 FROM access_grants WHERE username=? AND tcode_code=?", (u["username"], code)))
 
 # --- FASTAPI APP ---
-app = FastAPI(title="Nexus Core ERP", version="3.5.0")
+app = FastAPI(title="Nexus Core ERP", version="3.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- AUTH APIS ---
@@ -336,7 +342,7 @@ def api_me(req: Request):
         "username": u["username"], "full_name": u["full_name"], "role": u["role"],
         "department": u["department"], "plants": [p for p in (u["plants"] or "").split(",") if p],
         "is_master": is_master(u), "system": org_info.get("system_id", "NX-01"),
-        "client": org_info.get("client", "GLOBAL"), "company": org_info.get("name", "Thermocables Group")
+        "client": org_info.get("client", "GLOBAL"), "company": org_info.get("name", "Thermocables Limited")
     }
 
 # --- SYSTEM UNITS, PLANTS & DEPTS (SPRO) ---
@@ -609,18 +615,246 @@ def se93_delete(req: Request, code: str = Form(...)):
     code = code.upper().strip()
     exec_write("DELETE FROM tcodes WHERE code=?", (code,))
     exec_write("DELETE FROM tcode_schemas WHERE code=?", (code,))
-    exec_write("DELETE FROM tcode_layouts WHERE code=?", (code,))
-    exec_write("DELETE FROM tcode_records WHERE code=?", (code,))
-    exec_write("DELETE FROM access_grants WHERE code=?", (code,))
+    exec_write("DELETE FROM tcode_layouts WHERE tcode_code=?", (code,))
+    exec_write("DELETE FROM tcode_records WHERE tcode_code=?", (code,))
+    exec_write("DELETE FROM access_grants WHERE tcode_code=?", (code,))
     return {"ok": True}
+
+# =========================================================================
+# --- AI CODE STUDIO : DECLARATIVE MODULE INSTALLER (PASTE-TO-BUILD) ---
+# =========================================================================
+VALID_TYPES = {"text", "number", "date", "textarea", "select", "email", "tel"}
+RESERVED_CODES = {"TN01", "SU01", "SPRO", "SE93", "PFCG", "STUDIO"}
+
+def _validate_spec(spec: dict):
+    errors = []
+    if not isinstance(spec, dict):
+        return None, ["Spec must be a JSON object."]
+
+    action = (spec.get("action") or "upsert").lower()
+    if action not in ("upsert", "delete"):
+        errors.append("action must be 'upsert' or 'delete'.")
+
+    code = str(spec.get("code") or "").upper().strip()
+    if not re.match(r'^[A-Z][A-Z0-9_]{1,10}$', code):
+        errors.append("code must be 2-11 chars, start with a letter, A-Z/0-9/_ only.")
+    if code in RESERVED_CODES:
+        errors.append(f"'{code}' is a reserved system module.")
+
+    clean = {"action": action, "code": code}
+
+    if action == "delete":
+        return clean, errors
+
+    clean["title"] = str(spec.get("title") or code).strip()[:120]
+    clean["description"] = str(spec.get("description") or "").strip()[:500]
+    clean["module"] = str(spec.get("module") or "CUSTOM").strip()[:16].upper()
+    depts = spec.get("allowed_depts") or ""
+    if isinstance(depts, list):
+        depts = ",".join(str(d).strip() for d in depts)
+    clean["allowed_depts"] = str(depts).strip()
+
+    fields = spec.get("fields") or []
+    if not isinstance(fields, list) or not fields:
+        errors.append("fields must be a non-empty array.")
+        return clean, errors
+
+    clean_fields, seen = [], set()
+    for i, f in enumerate(fields):
+        if not isinstance(f, dict):
+            errors.append(f"fields[{i}] must be an object."); continue
+        key = re.sub(r'[^a-z0-9_]', '_', str(f.get("key") or f.get("label") or f"col_{i+1}").lower().strip())
+        key = re.sub(r'_+', '_', key).strip('_') or f"col_{i+1}"
+        if key in seen:
+            errors.append(f"duplicate field key '{key}'."); continue
+        seen.add(key)
+        ftype = str(f.get("type") or "text").lower()
+        if ftype not in VALID_TYPES:
+            errors.append(f"field '{key}' has invalid type '{ftype}'."); ftype = "text"
+        clean_fields.append({
+            "key": key,
+            "label": str(f.get("label") or key).strip()[:120],
+            "type": ftype,
+            "required": bool(f.get("required", False)),
+            "width": 2 if ftype == "textarea" else int(f.get("width", 1) or 1),
+            "options": f.get("options") if ftype == "select" else None,
+        })
+    clean["fields"] = clean_fields
+
+    seeds = spec.get("seed_rows") or []
+    if not isinstance(seeds, list):
+        errors.append("seed_rows must be an array.")
+        seeds = []
+    clean["seed_rows"] = [r for r in seeds if isinstance(r, dict)][:500]
+
+    presets = spec.get("presets") or []
+    clean["presets"] = [p for p in presets if isinstance(p, dict)][:50]
+    return clean, errors
+
+def _apply_spec(clean: dict, user: dict, note: str = ""):
+    code, action = clean["code"], clean["action"]
+    cur_time = now()
+    existing = fetch_one("SELECT code FROM tcodes WHERE code=?", (code,))
+
+    if action == "delete":
+        if not existing:
+            raise HTTPException(404, f"Module '{code}' does not exist.")
+        exec_write("DELETE FROM tcodes WHERE code=?", (code,))
+        exec_write("DELETE FROM tcode_schemas WHERE code=?", (code,))
+        exec_write("DELETE FROM tcode_layouts WHERE tcode_code=?", (code,))
+        exec_write("DELETE FROM tcode_records WHERE tcode_code=?", (code,))
+        exec_write("DELETE FROM access_grants WHERE tcode_code=?", (code,))
+        summary = {"action": "delete", "code": code}
+    else:
+        fields_json = json.dumps(clean["fields"])
+        layout_cfg = json.dumps({"columns": 3})
+        if existing:
+            exec_write(
+                "UPDATE tcodes SET title=?, description=?, module=?, allowed_depts=?, "
+                "updated_at=?, created_by=? WHERE code=?",
+                (clean["title"], clean["description"], clean["module"],
+                 clean["allowed_depts"], cur_time, user["username"], code))
+            exec_write(
+                "UPDATE tcode_schemas SET fields=?, layout=?, updated_at=?, updated_by=? WHERE code=?",
+                (fields_json, layout_cfg, cur_time, user["username"], code))
+            dl = fetch_one("SELECT id FROM tcode_layouts WHERE tcode_code=? AND is_default=1", (code,))
+            if dl:
+                exec_write(
+                    "UPDATE tcode_layouts SET fields=?, layout_config=?, updated_at=? WHERE id=?",
+                    (fields_json, layout_cfg, cur_time, dl["id"]))
+            else:
+                exec_write(
+                    "INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, "
+                    "fields, layout_config, description, created_by, created_by_name, created_at, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (code, f"GRID_{code}_01", "Default Grid", clean["title"], 1, fields_json,
+                     layout_cfg, "Managed by AI Studio", user["username"], user["full_name"],
+                     cur_time, cur_time))
+            summary = {"action": "updated", "code": code}
+        else:
+            exec_write(
+                "INSERT INTO tcodes (code, title, description, module, allowed_depts, active, "
+                "created_at, updated_at, created_by) VALUES (?,?,?,?,?,?,?,?,?)",
+                (code, clean["title"], clean["description"], clean["module"],
+                 clean["allowed_depts"], 1, cur_time, cur_time, user["username"]))
+            exec_write(
+                "INSERT INTO tcode_schemas (code, fields, layout, updated_at, updated_by) VALUES (?,?,?,?,?)",
+                (code, fields_json, layout_cfg, cur_time, user["username"]))
+            exec_write(
+                "INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, "
+                "fields, layout_config, description, created_by, created_by_name, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (code, f"GRID_{code}_01", "Default Grid", clean["title"], 1, fields_json,
+                 layout_cfg, "Created via AI Studio", user["username"], user["full_name"],
+                 cur_time, cur_time))
+            summary = {"action": "created", "code": code}
+
+        seeded = 0
+        field_keys = {f["key"] for f in clean["fields"]}
+        for row in clean["seed_rows"]:
+            rec = {k: row[k] for k in row if k in field_keys}
+            if not rec:
+                continue
+            plant = str(row.get("plant") or (user.get("plants") or "1000").split(",")[0].strip() or "1000")
+            exec_write(
+                "INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, "
+                "created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                (code, plant, json.dumps(rec, default=json_serial), "active",
+                 user["username"], user["full_name"], cur_time, cur_time))
+            seeded += 1
+        summary["seeded_rows"] = seeded
+
+    prev = fetch_one("SELECT COALESCE(MAX(version),0) as v FROM module_specs WHERE tcode_code=?", (code,))
+    version = (prev["v"] if prev else 0) + 1
+    exec_write(
+        "INSERT INTO module_specs (tcode_code, version, action, spec, applied_by, applied_at, note) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (code, version, action, json.dumps(clean), user["username"], cur_time, note or ""))
+    summary["version"] = version
+    return summary
+
+
+@app.post("/api/studio/validate")
+def studio_validate(req: Request, payload: dict):
+    need_master(req)
+    clean, errors = _validate_spec(payload.get("spec", payload))
+    existing = bool(clean and clean.get("code") and fetch_one("SELECT 1 FROM tcodes WHERE code=?", (clean["code"],)))
+    return {"ok": not errors, "errors": errors, "clean": clean, "will_overwrite": existing}
+
+
+@app.post("/api/studio/apply")
+def studio_apply(req: Request, payload: dict):
+    user = need_master(req)
+    clean, errors = _validate_spec(payload.get("spec", payload))
+    if errors:
+        raise HTTPException(400, "Spec invalid: " + "; ".join(errors))
+    summary = _apply_spec(clean, user, note=str(payload.get("note", "") or ""))
+    return {"ok": True, **summary}
+
+
+@app.get("/api/studio/history")
+def studio_history(req: Request, code: str = ""):
+    need_master(req)
+    sql = "SELECT id, tcode_code, version, action, applied_by, applied_at, note FROM module_specs"
+    params = []
+    if code:
+        sql += " WHERE tcode_code=?"
+        params.append(code.upper().strip())
+    sql += " ORDER BY id DESC LIMIT 200"
+    return fetch_all(sql, tuple(params))
+
+
+@app.get("/api/studio/spec/{code}")
+def studio_get_spec(req: Request, code: str):
+    need_master(req)
+    code = code.upper().strip()
+    tc = fetch_one("SELECT * FROM tcodes WHERE code=?", (code,))
+    if not tc:
+        raise HTTPException(404, "Module not found.")
+    schema = fetch_one("SELECT fields FROM tcode_schemas WHERE code=?", (code,))
+    try:
+        fields = json.loads(schema["fields"]) if schema else []
+    except Exception:
+        fields = []
+    return {
+        "action": "upsert",
+        "code": code,
+        "title": tc["title"],
+        "description": tc["description"] or "",
+        "module": tc["module"] or "CUSTOM",
+        "allowed_depts": tc["allowed_depts"] or "",
+        "fields": [{"key": f.get("key"), "label": f.get("label"),
+                    "type": f.get("type", "text"), "required": f.get("required", False),
+                    "width": f.get("width", 1)} for f in fields],
+        "seed_rows": [], "presets": [],
+    }
+
+
+@app.post("/api/studio/rollback/{msid}")
+def studio_rollback(req: Request, msid: int):
+    user = need_master(req)
+    row = fetch_one("SELECT * FROM module_specs WHERE id=?", (msid,))
+    if not row:
+        raise HTTPException(404, "History entry not found.")
+    try:
+        prev_spec = json.loads(row["spec"])
+    except Exception:
+        raise HTTPException(400, "Stored spec is corrupt.")
+    prev_spec["action"] = "upsert" if row["action"] != "delete" else "delete"
+    clean, errors = _validate_spec(prev_spec)
+    if errors:
+        raise HTTPException(400, "Cannot rollback: " + "; ".join(errors))
+    summary = _apply_spec(clean, user, note=f"Rollback to v{row['version']}")
+    return {"ok": True, **summary}
+
 
 # --- TN01 ROUTES & PRESETS ---
 TN01_PRESET_ROUTES = {
-    "PROD_TO_QC": {"title": "Production to Final Testing", "route": "Production ➔ Final Testing", "from_dept": "Production", "to_dept": "Final Testing", "columns": ["Sr. No.", "Job / Prod Order #", "Batch / Heat Lot", "Cable Description / Spec", "Drum / Coil #", "Length (Mtrs)", "Operator Name", "Production Remarks"]},
+    "PROD_TO_QC": {"title": "Production to Final Testing", "route": "Production ➔ Final Testing", "from_dept": "Production", "to_dept": "Final Testing", "columns": ["Sr. No.", "Job No.", "Customer Name", "Material Description", "Specified Length", "Entry Length", "Drum Size", "Drum Code", "Batch No. "]},
     "QC_TO_COMM": {"title": "Final Testing to Commercial", "route": "Final Testing ➔ Commercial", "from_dept": "Final Testing", "to_dept": "Commercial", "columns": ["Sr. No.", "Job / Prod Order #", "Batch / Heat Lot", "Cable Description / Spec", "Drum #", "Tested Length (Mtrs)", "HV Test Result", "Insulation Resistance", "QC Inspector", "Release Status"]},
     "PROD_TO_STORE": {"title": "Production to Store", "route": "Production ➔ Store", "from_dept": "Production", "to_dept": "Store", "columns": ["Sr. No.", "Work Order #", "Item Code / Material", "Batch / Heat Lot", "Quantity (Mtrs/Kgs)", "Weight (Kgs)", "Drum / Pack #", "Handover Person", "Remarks"]},
     "QC_TO_PROD": {"title": "Final Testing to Production (Rework/Reject)", "route": "Final Testing ➔ Production", "from_dept": "Final Testing", "to_dept": "Production", "columns": ["Sr. No.", "Job Order #", "Batch / Heat Lot", "Cable Size", "Defect Observed", "Length (Mtrs)", "QC Engineer", "Rework Instructions"]},
-    "COMM_TO_QC": {"title": "Commercial to Final Testing (Inspection Request)", "route": "Commercial ➔ Final Testing", "from_dept": "Commercial", "to_dept": "Final Testing", "columns": ["Sr. No.", "Customer Name", "Order / PO #", "Item Description", "Ordered Qty", "Inspection Agency", "Target Dispatch Date", "Special Testing Notes"]},
+    "COMM_TO_QC": {"title": "Commercial to Final Testing (Inspection Request)", "route": "Commercial ➔ Final Testing", "from_dept": "Commercial", "to_dept": "Final Testing", "columns": ["Sr. No.", "Customer Name", "Order / PO #", "Item Description", "Ordered Qty", "Inspection Agency", "Target Date", "Special Testing Notes"]},
     "STORE_TO_PROD": {"title": "Store to Production (Raw Material Issue)", "route": "Store ➔ Production", "from_dept": "Store", "to_dept": "Production", "columns": ["Sr. No.", "Material Code", "Material Description", "Lot / GRN #", "Issued Qty", "UOM", "Issued By", "Received For Work Order"]}
 }
 
@@ -771,7 +1005,7 @@ def tn01_print_preview(req: Request, nid: int):
         <button onclick="window.print()" style="background:#4f46e5; color:white; border:none; padding:8px 16px; border-radius:6px; cursor:pointer; font-weight:bold;">Print / Save PDF</button>
       </div>
       <div class="header">
-        <h2 style="margin:0;">{org.get('name', 'Thermocables Group')}</h2>
+        <h2 style="margin:0;">{org.get('name', 'Thermocables Limited')}</h2>
         <h4 style="margin:4px 0 0; color:#4f46e5;">INTER-DEPARTMENT MATERIAL TRANSFER & HANDOVER NOTE (TN01)</h4>
         <div style="font-family:monospace; font-weight:bold; margin-top:4px;">{note['note_no']} | Date: {note['created_at']}</div>
       </div>
@@ -787,8 +1021,8 @@ def tn01_print_preview(req: Request, nid: int):
       </div>
       <table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table>
       <div class="signs">
-        <div class="sign-box">Dispatched By ({note['from_user_name']})</div>
-        <div class="sign-box">Inspection / Quality Check</div>
+        <div class="sign-box">Handovered By ({note['from_user_name']})</div>
+        <div class="sign-box">Production | Quality Incharge</div>
         <div class="sign-box">Received By ({note['received_by_name'] or note['to_user_name']})</div>
       </div>
     </body></html>""")
@@ -898,11 +1132,11 @@ HTML_MODERN_UI = """<!DOCTYPE html>
     <div class="flex items-center gap-4">
       <div class="flex items-center gap-2.5 cursor-pointer" onclick="goHome()">
         <div class="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white shadow-md shadow-indigo-600/30"><i class="ri-pulse-fill text-lg"></i></div>
-        <div class="font-bold text-sm tracking-tight text-white flex items-center gap-1.5">Nexus Core <span class="text-[10px] bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono px-1.5 py-0.5 rounded">v3.5</span></div>
+        <div class="font-bold text-sm tracking-tight text-white flex items-center gap-1.5">Nexus Core <span class="text-[10px] bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono px-1.5 py-0.5 rounded">v3.6</span></div>
       </div>
       <div class="relative ml-4">
         <i class="ri-search-line absolute left-3 top-2.5 text-slate-400 text-xs"></i>
-        <input id="cmd_box" placeholder="Jump to module (e.g. TN01, SU01, SPRO, SE93)..." class="bg-slate-800/80 border border-slate-700 rounded-lg pl-8 pr-16 py-1.5 text-xs text-slate-100 w-80 font-mono focus:outline-none focus:border-indigo-500" onkeydown="if(event.key==='Enter') execCmd()">
+        <input id="cmd_box" placeholder="Jump to module (e.g. TN01, SU01, SPRO, SE93, STUDIO)..." class="bg-slate-800/80 border border-slate-700 rounded-lg pl-8 pr-16 py-1.5 text-xs text-slate-100 w-96 font-mono focus:outline-none focus:border-indigo-500" onkeydown="if(event.key==='Enter') execCmd()">
       </div>
     </div>
     <div id="nav_right" class="flex items-center gap-3">
@@ -933,6 +1167,10 @@ HTML_MODERN_UI = """<!DOCTYPE html>
             <span>Administration</span><i class="ri-shield-keyhole-line text-xs"></i>
           </div>
           <div class="space-y-0.5">
+            <button onclick="openTcode('STUDIO')" class="w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-white flex items-center justify-between">
+              <span class="flex items-center gap-2"><i class="ri-robot-2-line text-emerald-400"></i> AI Code Studio</span>
+              <span class="text-[9px] bg-emerald-900 text-emerald-300 px-1 rounded">NEW</span>
+            </button>
             <button onclick="openTcode('SU01')" class="w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-white flex items-center justify-between">
               <span class="flex items-center gap-2"><i class="ri-user-settings-line text-indigo-400"></i> User Directory (SU01)</span>
               <span class="text-[9px] bg-indigo-900 text-indigo-300 px-1 rounded">IAM</span>
@@ -957,7 +1195,7 @@ HTML_MODERN_UI = """<!DOCTYPE html>
         </div>
       </div>
       <div class="p-3 border-t border-slate-800 bg-slate-950/60 text-[11px]">
-        <div class="font-bold text-slate-300 truncate" id="side_company">Thermocables Group</div>
+        <div class="font-bold text-slate-300 truncate" id="side_company">Thermocables Limited</div>
         <div class="text-slate-500 truncate" id="side_plant">Facilities: Authorized</div>
       </div>
     </aside>
@@ -1093,7 +1331,7 @@ function goHome() {
           </div>
           <div class="bg-slate-800/60 border border-slate-700 rounded-2xl p-5">
             <div class="text-xs font-semibold text-slate-400 uppercase">Quick Jump</div>
-            <div class="text-xs text-slate-300 mt-2 font-mono">Launch <b class="text-indigo-400">SU01</b> for Users, <b class="text-indigo-400">SPRO</b> for Plants, or <b class="text-indigo-400">TN01</b> for Handover.</div>
+            <div class="text-xs text-slate-300 mt-2 font-mono">Launch <b class="text-indigo-400">STUDIO</b> to paste AI-generated modules, <b class="text-indigo-400">SU01</b> for Users, or <b class="text-indigo-400">TN01</b> for Handover.</div>
           </div>
         </div>
         <div>
@@ -1142,12 +1380,13 @@ async function openTcode(code) {
   if (code === 'SPRO') return renderSPRO();
   if (code === 'SE93') return renderSE93();
   if (code === 'PFCG') return renderPFCG();
+  if (code === 'STUDIO') return renderStudio();
 
   renderStandardModule(code);
 }
 
 // =========================================================================
-// --- SU01: USER DIRECTORY & IAM (COMPLETE WITH ALL ACTIONS) ---
+// --- SU01: USER DIRECTORY & IAM ---
 // =========================================================================
 async function renderSU01() {
   if (!ME.is_master && ME.role !== 'admin') return setMsg("Permission denied", true);
@@ -1362,7 +1601,7 @@ async function deleteUser(u) {
 }
 
 // =========================================================================
-// --- SPRO: COMPLETE PLANTS, DEPTS & ENTERPRISE MANAGEMENT ---
+// --- SPRO: PLANTS, DEPTS & ENTERPRISE MANAGEMENT ---
 // =========================================================================
 async function renderSPRO() {
   if (!ME.is_master && ME.role !== 'admin') return setMsg("Permission denied", true);
@@ -1378,7 +1617,6 @@ async function renderSPRO() {
         <button onclick="renderSPRO()" class="btn-secondary text-xs px-3 py-1.5 rounded-xl"><i class="ri-refresh-line"></i> Refresh</button>
       </div>
 
-      <!-- ORG INFO STRIP -->
       <div class="mt-4 bg-slate-950 border border-slate-800 p-4 rounded-2xl flex items-center justify-between shrink-0">
         <div>
           <div class="text-[10px] text-slate-400 uppercase font-semibold">Corporate Enterprise Identity</div>
@@ -1387,9 +1625,7 @@ async function renderSPRO() {
         ${ME.is_master ? `<button onclick="showEditOrgModal('${esc(data.org.name)}','${esc(data.org.system_id)}','${esc(data.org.client)}')" class="btn-secondary text-xs px-3 py-1.5 rounded-xl">Edit Identity</button>` : ''}
       </div>
 
-      <!-- PLANTS & DEPARTMENTS SPLIT VIEW -->
       <div class="grid grid-cols-1 md:grid-cols-2 gap-6 flex-1 mt-4 overflow-auto">
-        <!-- PLANTS / FACILITIES -->
         <div class="bg-slate-950 border border-slate-800 rounded-2xl flex flex-col overflow-hidden">
           <div class="p-3.5 border-b border-slate-800 flex justify-between items-center bg-slate-900/60">
             <div>
@@ -1420,7 +1656,6 @@ async function renderSPRO() {
           </div>
         </div>
 
-        <!-- DEPARTMENTS -->
         <div class="bg-slate-950 border border-slate-800 rounded-2xl flex flex-col overflow-hidden">
           <div class="p-3.5 border-b border-slate-800 flex justify-between items-center bg-slate-900/60">
             <div>
@@ -1575,7 +1810,7 @@ async function deleteDept(name) {
 }
 
 // =========================================================================
-// --- PFCG & TN01 FUNCTIONS ---
+// --- PFCG: ACCESS CONTROL ---
 // =========================================================================
 async function renderPFCG() {
   if (!ME.is_master && ME.role !== 'admin') return setMsg("Permission denied", true);
@@ -1629,7 +1864,311 @@ async function revokeAccess(u, t) {
   setMsg("Permission revoked");
 }
 
-// TN01 WORKSPACE
+// =========================================================================
+// --- SE93: MODULE STUDIO (file upload based) ---
+// =========================================================================
+async function renderSE93() {
+  if (!ME.is_master && ME.role !== 'admin') return setMsg("Permission denied", true);
+  const list = await api('/api/se93/list');
+  $('#main_screen').innerHTML = `
+    <div class="flex-1 flex flex-col bg-slate-900 p-6 overflow-hidden select-text">
+      <div class="flex items-center justify-between pb-5 border-b border-slate-800 shrink-0">
+        <div>
+          <h2 class="text-lg font-bold text-white tracking-tight">Module Studio (SE93) — Auto-Create from File</h2>
+          <p class="text-xs text-slate-400">Upload an Excel/CSV/JSON template to auto-detect columns and create a new T-code</p>
+        </div>
+        <div class="flex gap-2">
+          <button onclick="openTcode('STUDIO')" class="btn-secondary text-xs px-3 py-2 rounded-xl flex items-center gap-1.5"><i class="ri-robot-2-line text-emerald-400"></i> Prefer AI Studio?</button>
+          <button onclick="renderSE93()" class="btn-secondary text-xs px-3 py-2 rounded-xl"><i class="ri-refresh-line"></i></button>
+        </div>
+      </div>
+
+      <div class="mt-4 grid grid-cols-1 lg:grid-cols-3 gap-4 flex-1 overflow-hidden">
+        <div class="lg:col-span-1 bg-slate-950 border border-slate-800 rounded-2xl p-4 overflow-auto">
+          <h3 class="text-sm font-bold text-white mb-3 flex items-center gap-1.5"><i class="ri-upload-cloud-2-line text-indigo-400"></i> Upload Template</h3>
+          <form id="se93_form" onsubmit="submitSE93(event)" class="space-y-3">
+            <div><label class="block text-[11px] font-semibold text-slate-400 mb-1">T-Code</label><input name="code" required placeholder="e.g. DISP1" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white font-mono uppercase"></div>
+            <div><label class="block text-[11px] font-semibold text-slate-400 mb-1">Title</label><input name="title" required placeholder="Dispatch Log" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"></div>
+            <div><label class="block text-[11px] font-semibold text-slate-400 mb-1">Description</label><input name="description" placeholder="Optional" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"></div>
+            <div><label class="block text-[11px] font-semibold text-slate-400 mb-1">Module</label><input name="module" value="PROD" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white font-mono uppercase"></div>
+            <div><label class="block text-[11px] font-semibold text-slate-400 mb-1">Allowed Departments (CSV)</label><input name="allowed_depts" value="Production,Quality Control" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"></div>
+            <div><label class="block text-[11px] font-semibold text-slate-400 mb-1">Import Sample Data?</label>
+              <select name="import_sample_data" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white">
+                <option value="1">Yes</option><option value="0">No</option>
+              </select>
+            </div>
+            <div><label class="block text-[11px] font-semibold text-slate-400 mb-1">Template File (.xlsx/.csv/.json)</label><input name="file" type="file" required class="w-full text-xs text-slate-300 file:mr-2 file:bg-indigo-600 file:text-white file:border-0 file:rounded file:px-2 file:py-1 file:text-xs"></div>
+            <button type="submit" class="btn-primary w-full text-xs font-bold py-2 rounded-xl">Create Module</button>
+          </form>
+        </div>
+
+        <div class="lg:col-span-2 bg-slate-950 border border-slate-800 rounded-2xl overflow-hidden flex flex-col">
+          <div class="p-3 border-b border-slate-800 bg-slate-900/60 flex justify-between items-center">
+            <span class="text-xs font-bold text-white uppercase tracking-wider">Existing Modules (${list.length})</span>
+          </div>
+          <div class="flex-1 overflow-auto">
+            <table class="w-full text-left custom-table">
+              <thead><tr><th>Code</th><th>Title</th><th>Module</th><th>Layouts</th><th>Records</th><th>Action</th></tr></thead>
+              <tbody class="text-slate-300">
+                ${list.map(t => `
+                  <tr class="border-b border-slate-800/60">
+                    <td class="font-mono font-bold text-indigo-400">${esc(t.code)}</td>
+                    <td class="font-medium text-white">${esc(t.title)}</td>
+                    <td class="text-xs text-slate-400 uppercase">${esc(t.module||'-')}</td>
+                    <td class="font-mono">${t.layout_count}</td>
+                    <td class="font-mono">${t.record_count}</td>
+                    <td class="space-x-2">
+                      <button onclick="openTcode('${esc(t.code)}')" class="text-xs text-indigo-400 font-semibold">Open</button>
+                      <button onclick="loadStudioExisting('${esc(t.code)}')" class="text-xs text-emerald-400 font-semibold">Edit in Studio</button>
+                      ${ME.is_master ? `<button onclick="deleteSE93('${esc(t.code)}')" class="text-xs text-red-400 font-semibold">Delete</button>` : ''}
+                    </td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function submitSE93(ev) {
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  try {
+    const res = await fetch('/api/se93/auto-create', {method: 'POST', body: fd, headers: {'Authorization': 'Bearer ' + (localStorage.getItem("nexus_token")||'')}});
+    const data = await res.json();
+    if (!res.ok) throw (data.detail || "Failed");
+    alert(`Module ${data.code} created with ${data.columns_count} columns and ${data.imported_count} sample rows.`);
+    renderSE93();
+    loadModules();
+  } catch(e) { alert("Error: " + e); }
+}
+
+async function deleteSE93(code) {
+  if (!confirm(`Delete module ${code} and all its data?`)) return;
+  const fd = new FormData(); fd.append("code", code);
+  try {
+    await api('/api/se93/delete', {method: 'POST', body: fd});
+    renderSE93();
+    loadModules();
+    setMsg(`Module ${code} deleted`);
+  } catch(e) { alert(e); }
+}
+
+// =========================================================================
+// --- AI CODE STUDIO : paste JSON to create/modify/delete modules ---
+// =========================================================================
+const STUDIO_EXAMPLE = {
+  action: "upsert",
+  code: "DISP0",
+  title: "Dispatch & Delivery Challan",
+  description: "Outward material dispatch log",
+  module: "SD",
+  allowed_depts: "Commercial,Store,Planning",
+  fields: [
+    { key: "sr_no",        label: "Sr. No.",             type: "text",   width: 1 },
+    { key: "challan_no",   label: "Challan No.",         type: "text",   required: true },
+    { key: "customer",     label: "Customer",            type: "text" },
+    { key: "invoice_no",   label: "Invoice No.",         type: "text" },
+    { key: "dispatch_date",label: "Dispatch Date",       type: "date" },
+    { key: "qty",          label: "Quantity (Mtrs/Kgs)", type: "number" },
+    { key: "vehicle_no",   label: "Vehicle No.",         type: "text" },
+    { key: "transporter",  label: "Transporter",         type: "text" },
+    { key: "remarks",      label: "Remarks",             type: "textarea", width: 2 }
+  ],
+  seed_rows: [], presets: []
+};
+
+async function renderStudio() {
+  if (!ME.is_master) return setMsg("Master Administrator only", true);
+  const hist = await api('/api/studio/history');
+
+  $('#main_screen').innerHTML = `
+    <div class="flex-1 flex flex-col bg-slate-900 p-6 overflow-hidden select-text">
+      <div class="flex items-center justify-between pb-5 border-b border-slate-800 shrink-0">
+        <div>
+          <h2 class="text-lg font-bold text-white tracking-tight flex items-center gap-2">
+            <i class="ri-robot-2-line text-emerald-400"></i> AI Code Studio — Paste-to-Build
+          </h2>
+          <p class="text-xs text-slate-400">Paste a JSON module spec generated by AI. Create, update, or delete T-codes live — no source edits.</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <button onclick="loadStudioExample()" class="btn-secondary text-xs px-3 py-1.5 rounded-xl"><i class="ri-magic-line"></i> Load Example</button>
+          <button onclick="renderStudio()" class="btn-secondary text-xs px-3 py-1.5 rounded-xl"><i class="ri-refresh-line"></i> Refresh</button>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 flex-1 mt-4 overflow-hidden">
+        <div class="flex flex-col bg-slate-950 border border-slate-800 rounded-2xl overflow-hidden">
+          <div class="p-3 border-b border-slate-800 bg-slate-900/60 flex justify-between items-center">
+            <span class="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
+              <i class="ri-code-s-slash-line text-indigo-400"></i> Module Spec (JSON)
+            </span>
+            <div class="flex gap-1.5">
+              <button onclick="studioValidate()" class="text-[11px] font-semibold px-2.5 py-1 rounded-lg bg-amber-950/40 border border-amber-800/60 text-amber-300">Validate</button>
+              <button onclick="studioCopyCurrent()" class="text-[11px] font-semibold px-2.5 py-1 rounded-lg bg-slate-800 border border-slate-700 text-slate-300">Copy</button>
+              <button onclick="studioFormat()" class="text-[11px] font-semibold px-2.5 py-1 rounded-lg bg-slate-800 border border-slate-700 text-slate-300">Prettify</button>
+            </div>
+          </div>
+          <textarea id="studio_json" spellcheck="false"
+            class="flex-1 bg-slate-950 text-emerald-300 font-mono text-[11.5px] leading-relaxed p-3 outline-none resize-none"
+            placeholder='Paste module JSON here...'></textarea>
+          <div class="p-3 border-t border-slate-800 bg-slate-900/60 flex items-center justify-between">
+            <span id="studio_status" class="text-[11px] font-mono text-slate-500">Idle</span>
+            <div class="flex gap-2">
+              <button onclick="studioApply(false)" class="btn-primary text-xs font-bold px-4 py-1.5 rounded-lg flex items-center gap-1">
+                <i class="ri-play-fill"></i> Apply Spec
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex flex-col gap-4 overflow-hidden">
+          <div id="studio_preview" class="bg-slate-950 border border-slate-800 rounded-2xl p-4 overflow-auto flex-1 min-h-[200px]">
+            <div class="text-xs text-slate-500 text-center pt-10">Validate a spec to see live preview.</div>
+          </div>
+          <div class="bg-slate-950 border border-slate-800 rounded-2xl overflow-hidden" style="max-height:44%;">
+            <div class="p-2.5 border-b border-slate-800 bg-slate-900/60 text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
+              <i class="ri-history-line text-indigo-400"></i> Version History
+            </div>
+            <div class="overflow-auto" style="max-height:200px;">
+              <table class="w-full text-left custom-table">
+                <thead><tr><th>v</th><th>Module</th><th>Action</th><th>By</th><th>When</th><th></th></tr></thead>
+                <tbody class="text-slate-300">
+                  ${!hist.length ? `<tr><td colspan="6" class="text-center py-6 text-slate-500 text-xs">No installs yet.</td></tr>` :
+                    hist.map(h => `<tr class="border-b border-slate-800/60">
+                      <td class="font-mono text-indigo-400 font-bold">v${h.version}</td>
+                      <td class="font-mono font-bold text-white">${esc(h.tcode_code)}</td>
+                      <td><span class="text-[10px] px-1.5 py-0.5 rounded ${h.action==='delete'?'bg-red-950 text-red-300':'bg-emerald-950 text-emerald-300'}">${h.action}</span></td>
+                      <td class="text-xs">${esc(h.applied_by)}</td>
+                      <td class="text-xs font-mono text-slate-500">${esc(h.applied_at)}</td>
+                      <td>
+                        <button onclick="studioRollback(${h.id})" class="text-[11px] text-amber-400 font-semibold">Rollback</button>
+                        <button onclick="studioLoadExisting('${esc(h.tcode_code)}')" class="text-[11px] text-indigo-400 font-semibold ml-2">Load</button>
+                      </td>
+                    </tr>`).join('')}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function loadStudioExample() {
+  $('#studio_json').value = JSON.stringify(STUDIO_EXAMPLE, null, 2);
+  setStudioStatus("Example loaded — tweak and Apply.", false);
+}
+
+function setStudioStatus(msg, isErr) {
+  const el = $('#studio_status');
+  if (!el) return;
+  el.textContent = msg;
+  el.className = "text-[11px] font-mono " + (isErr ? "text-red-400" : "text-emerald-400");
+}
+
+function studioFormat() {
+  try {
+    const v = JSON.parse($('#studio_json').value);
+    $('#studio_json').value = JSON.stringify(v, null, 2);
+    setStudioStatus("Formatted OK.", false);
+  } catch(e) { setStudioStatus("Invalid JSON: " + e.message, true); }
+}
+
+function studioCopyCurrent() {
+  navigator.clipboard.writeText($('#studio_json').value);
+  setStudioStatus("Copied to clipboard.", false);
+}
+
+async function studioValidate() {
+  let spec;
+  try { spec = JSON.parse($('#studio_json').value); }
+  catch(e) { setStudioStatus("Invalid JSON: " + e.message, true); return null; }
+
+  try {
+    const res = await api('/api/studio/validate', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({spec})
+    });
+    if (!res.ok) {
+      setStudioStatus("Errors: " + res.errors.join(" | "), true);
+      renderStudioPreview(res.clean, res.errors);
+      return res;
+    }
+    setStudioStatus(res.will_overwrite ? "Valid — will UPDATE existing module." : "Valid — will CREATE new module.", false);
+    renderStudioPreview(res.clean, []);
+    return res;
+  } catch(e) { setStudioStatus("Error: " + e, true); return null; }
+}
+
+function renderStudioPreview(clean, errors) {
+  const box = $('#studio_preview');
+  if (!box) return;
+  if (!clean || errors.length) {
+    box.innerHTML = `<div class="text-xs text-red-400 whitespace-pre-wrap">${esc(errors.join("\\n"))}</div>`;
+    return;
+  }
+  if (clean.action === "delete") {
+    box.innerHTML = `<div class="text-sm"><b class="text-red-400">DELETE MODULE:</b> <span class="font-mono text-white">${esc(clean.code)}</span></div>
+      <div class="text-xs text-slate-400 mt-2">All schemas, layouts, records, and grants for this code will be removed.</div>`;
+    return;
+  }
+  box.innerHTML = `
+    <div class="mb-3">
+      <div class="text-[10px] uppercase font-bold text-slate-500">Preview</div>
+      <div class="text-base font-bold text-white">${esc(clean.title)} <span class="font-mono text-indigo-400 text-xs">[${esc(clean.code)}]</span></div>
+      <div class="text-xs text-slate-400 mt-0.5">${esc(clean.description || '—')}</div>
+      <div class="text-[11px] text-slate-500 mt-1">Module: <b class="text-slate-300">${esc(clean.module)}</b> · Depts: <span class="text-slate-300">${esc(clean.allowed_depts || 'none')}</span></div>
+    </div>
+    <div class="text-[10px] uppercase font-bold text-slate-500 mb-1">Columns (${clean.fields.length})</div>
+    <table class="w-full text-left text-[11px]">
+      <thead><tr class="bg-slate-900 text-slate-400"><th class="p-1.5">Key</th><th class="p-1.5">Label</th><th class="p-1.5">Type</th></tr></thead>
+      <tbody>${clean.fields.map(f => `<tr class="border-b border-slate-800"><td class="p-1.5 font-mono text-indigo-400">${esc(f.key)}</td><td class="p-1.5 text-white">${esc(f.label)}</td><td class="p-1.5 text-slate-400">${esc(f.type)}</td></tr>`).join('')}</tbody>
+    </table>`;
+}
+
+async function studioApply() {
+  let spec;
+  try { spec = JSON.parse($('#studio_json').value); }
+  catch(e) { setStudioStatus("Invalid JSON: " + e.message, true); return; }
+
+  if (!confirm(`Apply spec for module ${spec.code}? This will ${spec.action==='delete'?'DELETE':'install/update'} it now.`)) return;
+
+  try {
+    const res = await api('/api/studio/apply', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({spec})
+    });
+    setStudioStatus(`OK — ${res.action} ${res.code} (v${res.version})`, false);
+    await loadModules();
+    renderStudio();
+  } catch(e) { setStudioStatus("Error: " + e, true); alert(e); }
+}
+
+async function studioRollback(msid) {
+  if (!confirm(`Rollback this version? A new version will be created from the stored spec.`)) return;
+  try {
+    const res = await api(`/api/studio/rollback/${msid}`, {method: 'POST'});
+    setStudioStatus(`Rolled back — ${res.action} ${res.code} (v${res.version})`, false);
+    await loadModules();
+    renderStudio();
+  } catch(e) { alert(e); }
+}
+
+async function studioLoadExisting(code) {
+  try {
+    const spec = await api(`/api/studio/spec/${code}`);
+    $('#studio_json').value = JSON.stringify(spec, null, 2);
+    setStudioStatus(`Loaded current spec of ${code}. Edit and re-apply to update.`, false);
+    await studioValidate();
+  } catch(e) { alert(e); }
+}
+
+// =========================================================================
+// --- TN01 WORKSPACE ---
+// =========================================================================
 let TN01_ROUTES = {}, TN01_ACTIVE_ROUTE = "PROD_TO_QC", TN01_HEADERS = [], TN01_ROWS = [], TN01_UNDO_STACK = [], TN01_REDO_STACK = [], TN01_ACTIVE_CELL = { r: 0, c: 1 };
 
 async function renderTN01() {
@@ -1644,7 +2183,7 @@ function renderTN01Main(activeTab = "sheet") {
         <div class="flex items-center gap-3">
           <div class="flex items-center gap-2">
             <span class="font-mono font-bold text-xs bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 px-2.5 py-1 rounded-lg">TN01</span>
-            <div><h2 class="text-sm font-bold text-white">Transfer Note & Handover System</h2><p class="text-[10px] text-slate-400">Inter-department batch inspection & dispatch slips</p></div>
+            <div><h2 class="text-sm font-bold text-white">Transfer Note & Handover System</h2><p class="text-[10px] text-slate-400">Inter-department batch transfer slips</p></div>
           </div>
           <div class="h-6 w-[1px] bg-slate-800 mx-2"></div>
           <div class="flex items-center bg-slate-900 border border-slate-800 rounded-xl p-1 gap-1 text-xs font-semibold">
@@ -1822,7 +2361,7 @@ async function openSendModal() {
 
   openDialog(`
     <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50 rounded-t-2xl">
-      <div><h3 class="font-bold text-slate-800 text-sm">Transfer Dispatch & Handover Note</h3><p class="text-xs text-slate-500">Route: ${activeRoute.route}</p></div>
+      <div><h3 class="font-bold text-slate-800 text-sm">Transfer & Handover Note</h3><p class="text-xs text-slate-500">Route: ${activeRoute.route}</p></div>
       <button onclick="closeDialog()"><i class="ri-close-line text-lg"></i></button>
     </div>
     <div class="p-6 space-y-4">
@@ -1842,12 +2381,12 @@ async function openSendModal() {
         </div>
       </div>
       <div><label class="block text-xs font-semibold text-slate-700 mb-1">Remarks</label>
-        <textarea id="send_remarks" class="w-full border border-slate-300 rounded-xl p-2 text-xs" rows="2" placeholder="Dispatch notes..."></textarea>
+        <textarea id="send_remarks" class="w-full border border-slate-300 rounded-xl p-2 text-xs" rows="2" placeholder="Write something here..."></textarea>
       </div>
     </div>
     <div class="px-6 py-4 bg-slate-50 border-t border-slate-200 flex justify-end gap-2 rounded-b-2xl">
       <button onclick="closeDialog()" class="btn-secondary px-4 py-2 rounded-xl text-xs font-semibold">Cancel</button>
-      <button onclick="submitSendNote()" class="btn-primary px-5 py-2 rounded-xl text-xs font-bold">Confirm & Dispatch</button>
+      <button onclick="submitSendNote()" class="btn-primary px-5 py-2 rounded-xl text-xs font-bold">Confirm & Send</button>
     </div>`);
   updateSuggestedUsers();
 }
@@ -1870,7 +2409,7 @@ async function submitSendNote() {
   try {
     const res = await api('/api/tn01/send', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
     closeDialog();
-    alert(`Transfer Dispatched! Note #: ${res.note_no}`);
+    alert(`Transfer note shared! Note #: ${res.note_no}`);
     switchTN01Tab('history');
   } catch(e) { alert(e); }
 }
@@ -1960,8 +2499,7 @@ async function loadNoteIntoWorkspace(nid) {
 }
 
 async function renderTN01HistoryTab() {
-  const p = $('#hist_p') ? $('#hist_p').value : '';
-  const history = await api(`/api/tn01/history?plant=${p}`);
+  const history = await api(`/api/tn01/history`);
   $('#tn01_content').innerHTML = `
     <div class="p-6 flex-1 flex flex-col overflow-hidden">
       <div class="flex-1 mt-2 bg-slate-950 border border-slate-800 rounded-2xl overflow-auto">
@@ -2061,7 +2599,9 @@ async function deleteLayoutTN01(lid) {
   renderTN01FormatTab();
 }
 
-// STANDARD MODULE (PROD, GCH0, AUTO-CREATED MODULES)
+// =========================================================================
+// --- STANDARD MODULE (auto-created or manual) ---
+// =========================================================================
 async function renderStandardModule(code) {
   const layouts = await api(`/api/tcode/${code}/layouts`);
   const activeLayout = layouts.find(l => l.is_default) || layouts[0];
@@ -2180,7 +2720,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "3.5.0"}
+    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "3.6.0"}
 
 if __name__ == "__main__":
     import uvicorn
