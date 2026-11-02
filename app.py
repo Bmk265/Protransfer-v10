@@ -2014,7 +2014,7 @@ async function openSendModal() {
 
       <div>
         <label class="block text-xs font-semibold text-slate-700 mb-1">Special Instructions / Remarks</label>
-        <textarea id="send_remarks" class="w-full border border-slate-300 rounded-xl p-2.5 text-xs" rows="2" placeholder="e.g. Urgent dispatch for 11kV core test, complete handover by 2 PM..."></textarea>
+        <textarea id="send_remarks" class="w-full border border-slate-300 rounded-xl p-2.5 text-xs" rows="2" placeholder="e.g. Please do clearly UD by today itself as readiness for the below jobs is today. Please do needful."></textarea>
       </div>
 
       <div>
