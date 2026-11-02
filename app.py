@@ -5,6 +5,8 @@ from fastapi import FastAPI, Request, Response, UploadFile, File, Form, HTTPExce
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 # --- DATABASE ENGINE SETUP ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -80,8 +82,7 @@ def infer_field_type(sample_values):
     is_num, is_date, is_long = True, True, False
     date_patterns = [r'^\d{4}-\d{2}-\d{2}', r'^\d{2}/\d{2}/\d{4}', r'^\d{2}-\d{2}-\d{4}']
     for v in sample_values:
-        if v is None or v == "":
-            continue
+        if v is None or v == "": continue
         if isinstance(v, (datetime.datetime, datetime.date)):
             is_num = False
             continue
@@ -92,13 +93,143 @@ def infer_field_type(sample_values):
         if len(s) > 70 or '\n' in s:
             is_long, is_num, is_date = True, False, False
             break
-        try:
-            float(s.replace(',', ''))
-        except ValueError:
-            is_num = False
-        if not any(re.match(p, s) for p in date_patterns):
-            is_date = False
+        try: float(s.replace(',', ''))
+        except ValueError: is_num = False
+        if not any(re.match(p, s) for p in date_patterns): is_date = False
     return "date" if is_date else ("number" if is_num else ("textarea" if is_long else "text"))
+
+# --- PROFESSIONAL FORMATTED EXCEL WORKBOOK GENERATOR (TN01) ---
+def build_formatted_tn01_excel(note_dict, org_name="Thermocables Enterprise Group"):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Transfer Note"
+    ws.views.sheetView[0].showGridLines = True
+
+    headers = note_dict.get("sheet_headers", [])
+    data_rows = note_dict.get("sheet_data", [])
+    col_count = max(len(headers), 6)
+
+    # Styles
+    f_title = Font(name="Segoe UI", size=14, bold=True, color="FFFFFF")
+    f_sub = Font(name="Segoe UI", size=10, bold=True, color="1E1B4B")
+    f_meta_lbl = Font(name="Segoe UI", size=9, bold=True, color="475569")
+    f_meta_val = Font(name="Segoe UI", size=9, bold=False, color="0F172A")
+    f_th = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF")
+    f_td = Font(name="Segoe UI", size=9, color="1E293B")
+    f_sign = Font(name="Segoe UI", size=9, bold=True, color="334155")
+
+    fill_title = PatternFill(start_color="0F172A", end_color="0F172A", fill_type="solid")
+    fill_sub = PatternFill(start_color="EEF2FF", end_color="EEF2FF", fill_type="solid")
+    fill_meta = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+    fill_th = PatternFill(start_color="334155", end_color="334155", fill_type="solid")
+    fill_zebra = PatternFill(start_color="F1F5F9", end_color="F1F5F9", fill_type="solid")
+
+    thin_border = Border(
+        left=Side(style='thin', color='CBD5E1'),
+        right=Side(style='thin', color='CBD5E1'),
+        top=Side(style='thin', color='CBD5E1'),
+        bottom=Side(style='thin', color='CBD5E1')
+    )
+
+    # Row 1: Corporate Header Banner
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=col_count)
+    c1 = ws.cell(row=1, column=1, value=org_name.upper())
+    c1.font = f_title
+    c1.fill = fill_title
+    c1.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
+
+    # Row 2: Subtitle
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=col_count)
+    c2 = ws.cell(row=2, column=1, value="INTER-DEPARTMENT MATERIAL TRANSFER & HANDOVER NOTE (TN01)")
+    c2.font = f_sub
+    c2.fill = fill_sub
+    c2.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[2].height = 20
+
+    # Rows 4 to 7: Metadata Block
+    meta_pairs = [
+        ("Transfer Note #:", note_dict.get("note_no", "DRAFT"), "Date / Time:", note_dict.get("created_at", now())),
+        ("Routing Path:", note_dict.get("route", "General Transfer"), "Total Batches:", f"{note_dict.get('entry_count', len(data_rows))} Entries"),
+        ("Origin Facility & Dept:", f"{note_dict.get('from_plant', '')} - {note_dict.get('from_dept', '')}", "Dispatched By:", f"{note_dict.get('from_user_name', '')} ({note_dict.get('from_user', '')})"),
+        ("Target Facility & Dept:", f"{note_dict.get('to_plant', '')} - {note_dict.get('to_dept', '')}", "Assigned Recipient:", f"{note_dict.get('to_user_name', '')} ({note_dict.get('to_user', 'Dept Pool')})")
+    ]
+
+    r_curr = 4
+    for m1, v1, m2, v2 in meta_pairs:
+        ws.cell(row=r_curr, column=1, value=m1).font = f_meta_lbl
+        ws.cell(row=r_curr, column=2, value=v1).font = f_meta_val
+        ws.cell(row=r_curr, column=4, value=m2).font = f_meta_lbl
+        ws.cell(row=r_curr, column=5, value=v2).font = f_meta_val
+        for c_idx in range(1, col_count + 1):
+            cell = ws.cell(row=r_curr, column=c_idx)
+            cell.fill = fill_meta
+            cell.border = thin_border
+        r_curr += 1
+
+    # Row 9: Table Column Headers
+    r_curr += 1
+    ws.row_dimensions[r_curr].height = 22
+    for c_idx, h in enumerate(headers, start=1):
+        cell = ws.cell(row=r_curr, column=c_idx, value=str(h).upper())
+        cell.font = f_th
+        cell.fill = fill_th
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = thin_border
+
+    # Data Rows
+    r_curr += 1
+    for row_idx, r_data in enumerate(data_rows):
+        ws.row_dimensions[r_curr].height = 18
+        for c_idx in range(len(headers)):
+            val = r_data[c_idx] if c_idx < len(r_data) else ""
+            cell = ws.cell(row=r_curr, column=c_idx + 1, value=val)
+            cell.font = f_td
+            cell.border = thin_border
+            if row_idx % 2 == 1:
+                cell.fill = fill_zebra
+            if c_idx == 0:
+                cell.alignment = Alignment(horizontal="center")
+            else:
+                cell.alignment = Alignment(horizontal="left")
+        r_curr += 1
+
+    # Remarks row
+    remarks = note_dict.get("remarks", "")
+    if remarks:
+        r_curr += 1
+        ws.merge_cells(start_row=r_curr, start_column=1, end_row=r_curr, end_column=col_count)
+        c_rem = ws.cell(row=r_curr, column=1, value=f"Dispatch Remarks / Instructions: {remarks}")
+        c_rem.font = Font(name="Segoe UI", size=9, italic=True, color="334155")
+        c_rem.fill = PatternFill(start_color="FEF3C7", end_color="FEF3C7", fill_type="solid")
+
+    # Signatures
+    r_curr += 3
+    sign_cols = [
+        (1, f"Dispatched By: {note_dict.get('from_user_name', '')}"),
+        (max(2, col_count // 2), "Inspected / Cleared By (QC)"),
+        (col_count, f"Received By: {note_dict.get('received_by_name') or note_dict.get('to_user_name', '')}")
+    ]
+    for c_idx, s_text in sign_cols:
+        cell = ws.cell(row=r_curr, column=c_idx, value=s_text)
+        cell.font = f_sign
+        cell.border = Border(top=Side(style='medium', color='0F172A'))
+        cell.alignment = Alignment(horizontal="center")
+
+    # Auto-adjust column widths
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            if cell.row in [1, 2]: continue
+            if cell.value:
+                max_len = max(max_len, len(str(cell.value)))
+        ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio
 
 # --- INITIALIZATION & AUTO-MIGRATION ---
 def init_db():
@@ -172,10 +303,8 @@ def init_db():
     );
     '''
 
-    if USE_PG:
-        cur.execute(schema_sql)
-    else:
-        cur.executescript(schema_sql)
+    if USE_PG: cur.execute(schema_sql)
+    else: cur.executescript(schema_sql)
     conn.commit()
 
     if USE_PG:
@@ -183,15 +312,14 @@ def init_db():
             cur.execute("SELECT setval(pg_get_serial_sequence('tcode_records', 'id'), COALESCE((SELECT MAX(id)+1 FROM tcode_records), 1), false);")
             cur.execute("SELECT setval(pg_get_serial_sequence('transfer_notes', 'id'), COALESCE((SELECT MAX(id)+1 FROM transfer_notes), 1), false);")
             conn.commit()
-        except Exception:
-            conn.rollback()
+        except Exception: conn.rollback()
 
     cur_time = now()
 
     # Seed Master Org
     cur.execute(q("SELECT 1 FROM org WHERE id=1"))
     if not cur.fetchone():
-        cur.execute(q("INSERT INTO org (id, name, system_id, client) VALUES (?,?,?,?)"), (1, "Thermocables Limited", "NX-01", "GLOBAL"))
+        cur.execute(q("INSERT INTO org (id, name, system_id, client) VALUES (?,?,?,?)"), (1, "Thermocables Enterprise Group", "NX-01", "GLOBAL"))
 
     # Seed Departments
     for d in ["Production", "Final Testing", "Quality Control", "Commercial", "Store", "Planning", "Engineering"]:
@@ -227,7 +355,7 @@ def init_db():
             cur.execute(q("INSERT INTO users (username, password_hash, full_name, role, department, plants, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"),
                         (su_name, ph, su_full, "user", su_dept, su_pl, "approved", cur_time, cur_time))
 
-    # Seed Default Modules
+    # Default Modules
     default_modules = [
         ("TN01", "Transfer Note & Handover Sheet", "Inter-department material handover & batch transfer note", "MM", "Production,Final Testing,Commercial,Store,Quality Control,Planning"),
         ("PROD", "Production Handover Report", "Manufacturing batch & lot transfer logs", "PROD", "Production,Quality Control"),
@@ -237,7 +365,6 @@ def init_db():
         ("QCH0", "Stage QC to Final Clearance", "Clearance release slips before shipment", "QC", "Quality Control,Final Testing"),
         ("STD0", "Inventory Transfer Orders", "Inter-plant and store material movements", "INV", "Store,Planning,Production")
     ]
-
     for code, title, desc, mod, depts in default_modules:
         cur.execute(q("SELECT 1 FROM tcodes WHERE code=?"), (code,))
         if not cur.fetchone():
@@ -251,24 +378,16 @@ init_db()
 
 # --- AUTH HELPERS ---
 def get_user(req: Request):
-    token = None
-    auth_header = req.headers.get("Authorization")
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header.split(" ")[1].strip()
-    if not token:
-        token = req.cookies.get("nexus_session") or req.cookies.get("sap_session")
-    if not token:
-        return None
+    token = req.headers.get("Authorization", "").replace("Bearer ", "").strip() or req.cookies.get("nexus_session") or req.cookies.get("sap_session")
+    if not token: return None
     s = fetch_one("SELECT * FROM sessions WHERE token=?", (token,))
-    if not s:
-        return None
+    if not s: return None
     u = fetch_one("SELECT * FROM users WHERE username=?", (s["username"],))
     return u if (u and u["status"] == "approved") else None
 
 def need(req: Request):
     u = get_user(req)
-    if not u:
-        raise HTTPException(401, "Authentication required. Please sign in.")
+    if not u: raise HTTPException(401, "Authentication required. Please sign in.")
     return u
 
 def is_master(u):
@@ -276,30 +395,25 @@ def is_master(u):
 
 def need_admin(req: Request):
     u = need(req)
-    if u["role"] not in ["admin", "master"]:
-        raise HTTPException(403, "Access restricted to Administrators.")
+    if u["role"] not in ["admin", "master"]: raise HTTPException(403, "Access restricted to Administrators.")
     return u
 
 def need_master(req: Request):
     u = need(req)
-    if not is_master(u):
-        raise HTTPException(403, "Master Administrator clearance required.")
+    if not is_master(u): raise HTTPException(403, "Master Administrator clearance required.")
     return u
 
 def check_tcode_access(u, code: str):
     code = code.upper().strip()
-    if is_master(u) or u["role"] == "admin":
-        return True
+    if is_master(u) or u["role"] == "admin": return True
     tc = fetch_one("SELECT * FROM tcodes WHERE code=? AND active=1", (code,))
-    if not tc:
-        return False
+    if not tc: return False
     allowed = [x.strip() for x in (tc["allowed_depts"] or "").split(",") if x.strip()]
-    if u["department"] in allowed:
-        return True
+    if u["department"] in allowed: return True
     return bool(fetch_one("SELECT 1 FROM access_grants WHERE username=? AND tcode_code=?", (u["username"], code)))
 
 # --- FASTAPI APP ---
-app = FastAPI(title="Nexus Core ERP", version="3.5.0")
+app = FastAPI(title="Nexus Core ERP", version="3.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- AUTH APIS ---
@@ -309,23 +423,18 @@ def api_login(res: Response, username: str = Form(...), password: str = Form(...
     u = fetch_one("SELECT * FROM users WHERE username=?", (username,))
     if not u or not bcrypt.checkpw(password.encode('utf-8'), u["password_hash"].encode('utf-8')):
         raise HTTPException(401, "Invalid username or password.")
-    if u["status"] != "approved":
-        raise HTTPException(403, "Account is locked or pending approval.")
-
+    if u["status"] != "approved": raise HTTPException(403, "Account is locked.")
     token = secrets.token_hex(32)
     exp = (datetime.datetime.now() + datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
     exec_write("INSERT INTO sessions (token, username, expires) VALUES (?,?,?)", (token, username, exp))
-
     res.set_cookie("nexus_session", token, httponly=True, samesite="lax", max_age=86400 * 7)
     return {"ok": True, "token": token, "user": {"username": u["username"], "full_name": u["full_name"], "role": u["role"]}}
 
 @app.post("/api/logout")
 def api_logout(res: Response, req: Request):
     token = req.headers.get("Authorization", "").replace("Bearer ", "").strip() or req.cookies.get("nexus_session")
-    if token:
-        exec_write("DELETE FROM sessions WHERE token=?", (token,))
+    if token: exec_write("DELETE FROM sessions WHERE token=?", (token,))
     res.delete_cookie("nexus_session")
-    res.delete_cookie("sap_session")
     return {"ok": True}
 
 @app.get("/api/me")
@@ -336,7 +445,7 @@ def api_me(req: Request):
         "username": u["username"], "full_name": u["full_name"], "role": u["role"],
         "department": u["department"], "plants": [p for p in (u["plants"] or "").split(",") if p],
         "is_master": is_master(u), "system": org_info.get("system_id", "NX-01"),
-        "client": org_info.get("client", "GLOBAL"), "company": org_info.get("name", "Thermocables Limited")
+        "client": org_info.get("client", "GLOBAL"), "company": org_info.get("name", "Thermocables Group")
     }
 
 # --- SYSTEM UNITS, PLANTS & DEPTS (SPRO) ---
@@ -359,16 +468,14 @@ def spro_update_org(req: Request, name: str = Form(...), system_id: str = Form(.
 def spro_create_plant(req: Request, code: str = Form(...), name: str = Form(...)):
     need_master(req)
     code = code.upper().strip()
-    if fetch_one("SELECT 1 FROM plants WHERE code=?", (code,)):
-        raise HTTPException(400, f"Plant code '{code}' already exists.")
+    if fetch_one("SELECT 1 FROM plants WHERE code=?", (code,)): raise HTTPException(400, "Plant code exists.")
     exec_write("INSERT INTO plants (code, name, active, created_at) VALUES (?,?,?,?)", (code, name.strip(), 1, now()))
     return {"ok": True}
 
 @app.post("/api/admin/plants/update")
 def spro_update_plant(req: Request, code: str = Form(...), name: str = Form(...), active: int = Form(1)):
     need_master(req)
-    code = code.upper().strip()
-    exec_write("UPDATE plants SET name=?, active=? WHERE code=?", (name.strip(), active, code))
+    exec_write("UPDATE plants SET name=?, active=? WHERE code=?", (name.strip(), active, code.upper().strip()))
     return {"ok": True}
 
 @app.post("/api/admin/plants/delete")
@@ -380,10 +487,8 @@ def spro_delete_plant(req: Request, code: str = Form(...)):
 @app.post("/api/admin/departments/create")
 def spro_create_dept(req: Request, name: str = Form(...)):
     need_master(req)
-    name = name.strip()
-    if fetch_one("SELECT 1 FROM departments WHERE name=?", (name,)):
-        raise HTTPException(400, "Department already exists.")
-    exec_write("INSERT INTO departments (name, active, created_at) VALUES (?,?,?)", (name, 1, now()))
+    if fetch_one("SELECT 1 FROM departments WHERE name=?", (name.strip(),)): raise HTTPException(400, "Dept exists.")
+    exec_write("INSERT INTO departments (name, active, created_at) VALUES (?,?,?)", (name.strip(), 1, now()))
     return {"ok": True}
 
 @app.post("/api/admin/departments/delete")
@@ -403,11 +508,8 @@ def su01_create_user(req: Request, username: str = Form(...), password: str = Fo
                      department: str = Form(...), plants: str = Form(""), role: str = Form("user")):
     caller = need_admin(req)
     username = username.lower().strip()
-    if role == "master" and not is_master(caller):
-        raise HTTPException(403, "Only Master Admins can create superuser accounts.")
-    if fetch_one("SELECT 1 FROM users WHERE username=?", (username,)):
-        raise HTTPException(400, f"User '{username}' already exists.")
-
+    if role == "master" and not is_master(caller): raise HTTPException(403, "Master Admin only.")
+    if fetch_one("SELECT 1 FROM users WHERE username=?", (username,)): raise HTTPException(400, "User exists.")
     ph = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     cur_time = now()
     exec_write("INSERT INTO users (username, password_hash, full_name, role, department, plants, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -420,13 +522,9 @@ def su01_update_user(req: Request, username: str = Form(...), full_name: str = F
     caller = need_admin(req)
     username = username.lower().strip()
     target = fetch_one("SELECT * FROM users WHERE username=?", (username,))
-    if not target:
-        raise HTTPException(404, "User not found")
-    if is_master(target) and not is_master(caller):
-        raise HTTPException(403, "Cannot modify a Master Administrator.")
-    if role == "master" and not is_master(caller):
-        raise HTTPException(403, "Cannot grant Master privileges.")
-
+    if not target: raise HTTPException(404, "Not found")
+    if is_master(target) and not is_master(caller): raise HTTPException(403, "Cannot edit Master.")
+    if role == "master" and not is_master(caller): raise HTTPException(403, "Cannot grant Master.")
     exec_write("UPDATE users SET full_name=?, department=?, plants=?, role=?, status=?, updated_at=? WHERE username=?",
                (full_name.strip(), department.strip(), plants.strip(), role, status, now(), username))
     return {"ok": True}
@@ -436,15 +534,9 @@ def su01_delete_user(req: Request, username: str = Form(...)):
     caller = need_admin(req)
     username = username.lower().strip()
     target = fetch_one("SELECT * FROM users WHERE username=?", (username,))
-    if not target:
-        raise HTTPException(404, "User not found")
-    if is_master(target):
-        raise HTTPException(400, "Master Administrator account is protected from deletion.")
-    if target["role"] == "admin" and not is_master(caller):
-        raise HTTPException(403, "Only Master Admins can delete administrative accounts.")
-    if username == caller["username"]:
-        raise HTTPException(400, "You cannot delete your own session.")
-
+    if not target: raise HTTPException(404, "Not found")
+    if is_master(target): raise HTTPException(400, "Master account protected.")
+    if username == caller["username"]: raise HTTPException(400, "Cannot delete self.")
     exec_write("DELETE FROM users WHERE username=?", (username,))
     exec_write("DELETE FROM sessions WHERE username=?", (username,))
     exec_write("DELETE FROM access_grants WHERE username=?", (username,))
@@ -455,11 +547,8 @@ def su01_reset_password(req: Request, username: str = Form(...), new_password: s
     caller = need_admin(req)
     username = username.lower().strip()
     target = fetch_one("SELECT * FROM users WHERE username=?", (username,))
-    if not target:
-        raise HTTPException(404, "User not found")
-    if is_master(target) and not is_master(caller):
-        raise HTTPException(403, "Cannot reset password for Master Administrator.")
-
+    if not target: raise HTTPException(404, "Not found")
+    if is_master(target) and not is_master(caller): raise HTTPException(403, "Cannot reset Master.")
     ph = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     exec_write("UPDATE users SET password_hash=?, updated_at=? WHERE username=?", (ph, now(), username))
     exec_write("DELETE FROM sessions WHERE username=?", (username,))
@@ -512,11 +601,7 @@ async def se93_auto_create(
 ):
     u = need_admin(req)
     code = code.upper().strip()
-    if not code:
-        raise HTTPException(400, "T-Code identifier is required.")
-    if fetch_one("SELECT 1 FROM tcodes WHERE code=?", (code,)):
-        raise HTTPException(400, f"Module '{code}' already exists.")
-
+    if fetch_one("SELECT 1 FROM tcodes WHERE code=?", (code,)): raise HTTPException(400, "Code exists.")
     contents = await file.read()
     filename = file.filename.lower()
     headers, data_rows = [], []
@@ -530,24 +615,13 @@ async def se93_auto_create(
                 headers = [str(h).strip() for h in rows[0] if h is not None and str(h).strip()]
                 data_rows = rows[1:]
         elif filename.endswith(".csv"):
-            text = contents.decode("utf-8", errors="ignore")
-            rows = list(csv.reader(io.StringIO(text)))
+            rows = list(csv.reader(io.StringIO(contents.decode("utf-8", errors="ignore"))))
             if rows:
                 headers = [str(h).strip() for h in rows[0] if str(h).strip()]
                 data_rows = rows[1:]
-        elif filename.endswith(".json"):
-            parsed = json.loads(contents.decode("utf-8", errors="ignore"))
-            if isinstance(parsed, list) and len(parsed) > 0 and isinstance(parsed[0], dict):
-                headers = list(parsed[0].keys())
-                for item in parsed:
-                    data_rows.append([item.get(k, "") for k in headers])
-        else:
-            raise HTTPException(400, "Please upload an Excel (.xlsx/.xls), CSV, or JSON template.")
-    except Exception as e:
-        raise HTTPException(400, f"Template error: {str(e)}")
+    except Exception as e: raise HTTPException(400, f"Template parse error: {str(e)}")
 
-    if not headers:
-        raise HTTPException(400, "No valid column headers found.")
+    if not headers: raise HTTPException(400, "No headers detected.")
 
     col_samples = {idx: [] for idx in range(len(headers))}
     for r in data_rows[:25]:
@@ -557,8 +631,7 @@ async def se93_auto_create(
 
     fields = []
     for idx, h in enumerate(headers):
-        clean_key = re.sub(r'[^a-zA-Z0-9_]', '_', h.lower().strip())
-        clean_key = re.sub(r'_+', '_', clean_key).strip('_') or f"col_{idx+1}"
+        clean_key = re.sub(r'[^a-zA-Z0-9_]', '_', h.lower().strip()).strip('_') or f"col_{idx+1}"
         f_type = infer_field_type(col_samples[idx])
         fields.append({"key": clean_key, "label": h, "type": f_type, "required": False, "width": 2 if f_type == "textarea" else 1})
 
@@ -567,41 +640,34 @@ async def se93_auto_create(
                (code, title.strip() or f"{code} Module", description.strip(), module.strip(), allowed_depts.strip(), 1, cur_time, cur_time, u["username"]))
 
     fields_json = json.dumps(fields)
-    exec_write("INSERT INTO tcode_schemas (code, fields, layout, updated_at, updated_by) VALUES (?,?,?,?,?)",
-               (code, fields_json, json.dumps({"columns": 3}), cur_time, u["username"]))
-
+    exec_write("INSERT INTO tcode_schemas (code, fields, layout, updated_at, updated_by) VALUES (?,?,?,?,?)", (code, fields_json, json.dumps({"columns": 3}), cur_time, u["username"]))
     exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-               (code, f"GRID_{code}_01", "Default Grid", f"{title or code} Data View", 1, fields_json, json.dumps({"columns": 3}), "Auto-generated from file", u["username"], u["full_name"], cur_time, cur_time))
+               (code, f"GRID_{code}_01", "Default Grid", f"{title} Grid", 1, fields_json, json.dumps({"columns": 3}), "Auto-generated", u["username"], u["full_name"], cur_time, cur_time))
 
-    imported_count = 0
+    imported = 0
     if import_sample_data and data_rows:
         conn = get_conn()
         try:
             cur = conn.cursor()
             insert_sql = q("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)")
             def_plant = (u.get("plants") or "1000").split(",")[0].strip() or "1000"
-
             for r in data_rows:
-                if not any(r):
-                    continue
+                if not any(r): continue
                 rec = {}
                 row_plant = def_plant
                 for idx, h in enumerate(headers):
                     if idx < len(r):
                         val = r[idx]
-                        if val is None: val = ""
-                        elif isinstance(val, (datetime.datetime, datetime.date)): val = val.strftime("%Y-%m-%d %H:%M:%S") if isinstance(val, datetime.datetime) else val.strftime("%Y-%m-%d")
+                        if isinstance(val, (datetime.datetime, datetime.date)): val = val.strftime("%Y-%m-%d %H:%M:%S")
                         key = fields[idx]["key"]
                         if key in ["plant", "facility"]: row_plant = str(val or def_plant).strip()
-                        else: rec[key] = val
-
+                        else: rec[key] = val if val is not None else ""
                 cur.execute(insert_sql, (code, row_plant, json.dumps(rec, default=json_serial), "active", u["username"], u["full_name"], cur_time, cur_time))
-                imported_count += 1
+                imported += 1
             conn.commit()
-        finally:
-            conn.close()
+        finally: conn.close()
 
-    return {"ok": True, "code": code, "title": title, "columns_count": len(fields), "imported_count": imported_count}
+    return {"ok": True, "code": code, "title": title, "columns_count": len(fields), "imported_count": imported}
 
 @app.post("/api/se93/delete")
 def se93_delete(req: Request, code: str = Form(...)):
@@ -616,11 +682,11 @@ def se93_delete(req: Request, code: str = Form(...)):
 
 # --- TN01 ROUTES & PRESETS ---
 TN01_PRESET_ROUTES = {
-    "PROD_TO_QC": {"title": "Production to Final Testing", "route": "Production ➔ Final Testing", "from_dept": "Production", "to_dept": "Final Testing", "columns": ["Sr. No.", "Job No. #", "Customer Name", "Material Description", "Specified Length #", "Entry Length", "Drum Size", "PDrum Code", "Batch No. "]},
+    "PROD_TO_QC": {"title": "Production to Final Testing", "route": "Production ➔ Final Testing", "from_dept": "Production", "to_dept": "Final Testing", "columns": ["Sr. No.", "Job / Prod Order #", "Batch / Heat Lot", "Cable Description / Spec", "Drum / Coil #", "Length (Mtrs)", "Operator Name", "Production Remarks"]},
     "QC_TO_COMM": {"title": "Final Testing to Commercial", "route": "Final Testing ➔ Commercial", "from_dept": "Final Testing", "to_dept": "Commercial", "columns": ["Sr. No.", "Job / Prod Order #", "Batch / Heat Lot", "Cable Description / Spec", "Drum #", "Tested Length (Mtrs)", "HV Test Result", "Insulation Resistance", "QC Inspector", "Release Status"]},
     "PROD_TO_STORE": {"title": "Production to Store", "route": "Production ➔ Store", "from_dept": "Production", "to_dept": "Store", "columns": ["Sr. No.", "Work Order #", "Item Code / Material", "Batch / Heat Lot", "Quantity (Mtrs/Kgs)", "Weight (Kgs)", "Drum / Pack #", "Handover Person", "Remarks"]},
     "QC_TO_PROD": {"title": "Final Testing to Production (Rework/Reject)", "route": "Final Testing ➔ Production", "from_dept": "Final Testing", "to_dept": "Production", "columns": ["Sr. No.", "Job Order #", "Batch / Heat Lot", "Cable Size", "Defect Observed", "Length (Mtrs)", "QC Engineer", "Rework Instructions"]},
-    "COMM_TO_QC": {"title": "Commercial to Final Testing (Inspection Request)", "route": "Commercial ➔ Final Testing", "from_dept": "Commercial", "to_dept": "Final Testing", "columns": ["Sr. No.", "Customer Name", "Order / PO #", "Item Description", "Ordered Qty", "Inspection Agency", "Target Date", "Special Testing Notes"]},
+    "COMM_TO_QC": {"title": "Commercial to Final Testing (Inspection Request)", "route": "Commercial ➔ Final Testing", "from_dept": "Commercial", "to_dept": "Final Testing", "columns": ["Sr. No.", "Customer Name", "Order / PO #", "Item Description", "Ordered Qty", "Inspection Agency", "Target Dispatch Date", "Special Testing Notes"]},
     "STORE_TO_PROD": {"title": "Store to Production (Raw Material Issue)", "route": "Store ➔ Production", "from_dept": "Store", "to_dept": "Production", "columns": ["Sr. No.", "Material Code", "Material Description", "Lot / GRN #", "Issued Qty", "UOM", "Issued By", "Received For Work Order"]}
 }
 
@@ -657,7 +723,6 @@ def tn01_save_layout(req: Request, payload: dict):
     if not key:
         cnt = fetch_one("SELECT COUNT(*) as c FROM tcode_layouts WHERE tcode_code='TN01'")["c"]
         key = f"TN01_VAR_{cnt+1:02d}"
-
     cur_time = now()
     existing = fetch_one("SELECT id FROM tcode_layouts WHERE tcode_code='TN01' AND layout_code=?", (key,))
     if existing:
@@ -716,10 +781,17 @@ def tn01_receive(req: Request, nid: int):
                (cur_time, u["username"], u["full_name"], nid))
     return {"ok": True, "received_at": cur_time}
 
+# --- TN01 HISTORY: DEPARTMENTAL FILTERING & MASTER RESTRICTION ---
 @app.get("/api/tn01/history")
 def tn01_get_history(req: Request, plant: str = "", route: str = "", status: str = ""):
-    need(req)
+    u = need(req)
     sql, params = "SELECT * FROM transfer_notes WHERE 1=1", []
+
+    # Non-master users can ONLY view history sent by or received by their department
+    if not is_master(u):
+        sql += " AND (from_dept = ? OR to_dept = ?)"
+        params.extend([u["department"], u["department"]])
+
     if plant:
         sql += " AND (from_plant = ? OR to_plant = ?)"
         params.extend([plant, plant])
@@ -729,25 +801,110 @@ def tn01_get_history(req: Request, plant: str = "", route: str = "", status: str
     if status:
         sql += " AND status = ?"
         params.append(status)
-    sql += " ORDER BY id DESC LIMIT 150"
+
+    sql += " ORDER BY id DESC LIMIT 250"
     return fetch_all(sql, tuple(params))
+
+# MASTER ONLY: DELETE INDIVIDUAL HISTORY RECORD
+@app.delete("/api/tn01/history/{nid}")
+def tn01_delete_history_item(req: Request, nid: int):
+    need_master(req)
+    exec_write("DELETE FROM transfer_notes WHERE id=?", (nid,))
+    return {"ok": True}
+
+# MASTER ONLY: BULK DELETE OR WIPE ALL HISTORY
+@app.post("/api/tn01/history/bulk-delete")
+def tn01_bulk_delete_history(req: Request, payload: dict):
+    need_master(req)
+    delete_all = payload.get("all", False)
+    ids = payload.get("ids", [])
+
+    if delete_all:
+        exec_write("DELETE FROM transfer_notes")
+        return {"ok": True, "deleted": "all"}
+    elif ids:
+        placeholders = ",".join(["?" for _ in ids])
+        exec_write(f"DELETE FROM transfer_notes WHERE id IN ({placeholders})", tuple(ids))
+        return {"ok": True, "deleted": len(ids)}
+    return {"ok": False}
 
 @app.get("/api/tn01/note/{nid}")
 def tn01_get_note(req: Request, nid: int):
-    need(req)
+    u = need(req)
     note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
     if not note: raise HTTPException(404, "Note not found")
+    if not is_master(u) and (u["department"] not in [note["from_dept"], note["to_dept"]]):
+        raise HTTPException(403, "Access restricted to participating departments.")
     try: note["sheet_headers"] = json.loads(note["sheet_headers"])
     except: note["sheet_headers"] = []
     try: note["sheet_data"] = json.loads(note["sheet_data"])
     except: note["sheet_data"] = []
     return note
 
+# --- EXPORT TRANSFER NOTE AS FORMATTED EXCEL ---
+@app.get("/api/tn01/export-excel/{nid}")
+def tn01_export_note_excel(req: Request, nid: int):
+    u = need(req)
+    note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
+    if not note: raise HTTPException(404, "Transfer note not found")
+    if not is_master(u) and (u["department"] not in [note["from_dept"], note["to_dept"]]):
+        raise HTTPException(403, "Access restricted to participating departments.")
+
+    org = fetch_one("SELECT * FROM org WHERE id=1") or {}
+    company_name = org.get("name", "Thermocables Enterprise Group")
+
+    try: note["sheet_headers"] = json.loads(note["sheet_headers"])
+    except: note["sheet_headers"] = []
+    try: note["sheet_data"] = json.loads(note["sheet_data"])
+    except: note["sheet_data"] = []
+
+    bio = build_formatted_tn01_excel(note, company_name)
+    filename = f"{note['note_no']}_Transfer_Note.xlsx"
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+# DRAFT SHEET EXPORT AS FORMATTED EXCEL
+@app.post("/api/tn01/export-draft-excel")
+def tn01_export_draft_excel(req: Request, payload: dict):
+    u = need(req)
+    org = fetch_one("SELECT * FROM org WHERE id=1") or {}
+    company_name = org.get("name", "Thermocables Enterprise Group")
+
+    dummy_note = {
+        "note_no": "DRAFT-NOTE",
+        "route": payload.get("route", "Draft Material Transfer"),
+        "from_plant": (u.get("plants") or "1000").split(",")[0].strip(),
+        "from_dept": u["department"],
+        "from_user": u["username"],
+        "from_user_name": u["full_name"],
+        "to_plant": "PROPOSED",
+        "to_dept": "TARGET DEPT",
+        "to_user": "",
+        "to_user_name": "Assigned Receiver",
+        "entry_count": len(payload.get("rows", [])),
+        "sheet_headers": payload.get("headers", []),
+        "sheet_data": payload.get("rows", []),
+        "remarks": payload.get("remarks", "Draft handover export"),
+        "created_at": now()
+    }
+    bio = build_formatted_tn01_excel(dummy_note, company_name)
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=TN01_Draft_Transfer_Sheet.xlsx"}
+    )
+
+# PRINT PREVIEW HTML
 @app.get("/api/tn01/print/{nid}", response_class=HTMLResponse)
 def tn01_print_preview(req: Request, nid: int):
     u = need(req)
     note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
     if not note: return HTMLResponse("Note not found", 404)
+    if not is_master(u) and (u["department"] not in [note["from_dept"], note["to_dept"]]):
+        return HTMLResponse("Access restricted to participating departments.", 403)
     org = fetch_one("SELECT * FROM org WHERE id=1") or {}
     try: headers = json.loads(note["sheet_headers"])
     except: headers = []
@@ -771,7 +928,7 @@ def tn01_print_preview(req: Request, nid: int):
         <button onclick="window.print()" style="background:#4f46e5; color:white; border:none; padding:8px 16px; border-radius:6px; cursor:pointer; font-weight:bold;">Print / Save PDF</button>
       </div>
       <div class="header">
-        <h2 style="margin:0;">{org.get('name', 'Thermocables Limited')}</h2>
+        <h2 style="margin:0;">{org.get('name', 'Thermocables Group')}</h2>
         <h4 style="margin:4px 0 0; color:#4f46e5;">INTER-DEPARTMENT MATERIAL TRANSFER & HANDOVER NOTE (TN01)</h4>
         <div style="font-family:monospace; font-weight:bold; margin-top:4px;">{note['note_no']} | Date: {note['created_at']}</div>
       </div>
@@ -787,8 +944,8 @@ def tn01_print_preview(req: Request, nid: int):
       </div>
       <table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table>
       <div class="signs">
-        <div class="sign-box">Sent By ({note['from_user_name']})</div>
-        <div class="sign-box">Production Incharge | Quality Incharge</div>
+        <div class="sign-box">Dispatched By ({note['from_user_name']})</div>
+        <div class="sign-box">Inspection / Quality Check</div>
         <div class="sign-box">Received By ({note['received_by_name'] or note['to_user_name']})</div>
       </div>
     </body></html>""")
@@ -866,7 +1023,7 @@ def export_excel(code: str, req: Request):
     bio.seek(0)
     return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=Export_{code}_{datetime.date.today().strftime('%Y%m%d')}.xlsx"})
 
-# --- FRONTEND CLIENT (NORDIC SLATE UI) ---
+# --- FRONTEND CLIENT ---
 HTML_MODERN_UI = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -898,7 +1055,7 @@ HTML_MODERN_UI = """<!DOCTYPE html>
     <div class="flex items-center gap-4">
       <div class="flex items-center gap-2.5 cursor-pointer" onclick="goHome()">
         <div class="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white shadow-md shadow-indigo-600/30"><i class="ri-pulse-fill text-lg"></i></div>
-        <div class="font-bold text-sm tracking-tight text-white flex items-center gap-1.5">Nexus Core <span class="text-[10px] bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono px-1.5 py-0.5 rounded">v3.5</span></div>
+        <div class="font-bold text-sm tracking-tight text-white flex items-center gap-1.5">Nexus Core <span class="text-[10px] bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono px-1.5 py-0.5 rounded">v3.6</span></div>
       </div>
       <div class="relative ml-4">
         <i class="ri-search-line absolute left-3 top-2.5 text-slate-400 text-xs"></i>
@@ -957,7 +1114,7 @@ HTML_MODERN_UI = """<!DOCTYPE html>
         </div>
       </div>
       <div class="p-3 border-t border-slate-800 bg-slate-950/60 text-[11px]">
-        <div class="font-bold text-slate-300 truncate" id="side_company">Thermocables Limited</div>
+        <div class="font-bold text-slate-300 truncate" id="side_company">Thermocables Group</div>
         <div class="text-slate-500 truncate" id="side_plant">Facilities: Authorized</div>
       </div>
     </aside>
@@ -1019,7 +1176,7 @@ function renderLogon(errorMsg = "") {
     <div class="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-8 z-10">
       <div class="flex items-center gap-3 mb-6">
         <div class="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center font-bold text-white"><i class="ri-pulse-fill text-2xl"></i></div>
-        <div><h1 class="text-xl font-bold text-white">Nexus Core ERP</h1><p class="text-xs text-slate-400">Thermocables Limited</p></div>
+        <div><h1 class="text-xl font-bold text-white">Nexus Core ERP</h1><p class="text-xs text-slate-400">Thermocables Industrial Suite</p></div>
       </div>
       ${errorMsg ? `<div class="mb-4 p-3 bg-red-950/40 border border-red-800/60 rounded-xl text-red-300 text-xs">${esc(errorMsg)}</div>` : ''}
       <div class="space-y-4">
@@ -1079,7 +1236,7 @@ function goHome() {
   $('#main_screen').innerHTML = `
     <div class="flex-1 overflow-y-auto p-8 bg-slate-900 select-text">
       <div class="max-w-5xl mx-auto space-y-8">
-        <div><h1 class="text-2xl font-bold text-white">Operations Dashboard</h1><p class="text-sm text-slate-400 mt-1">Thermocables Ltd Management Platform</p></div>
+        <div><h1 class="text-2xl font-bold text-white">Operations Dashboard</h1><p class="text-sm text-slate-400 mt-1">Thermocables Industrial Management Platform</p></div>
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div class="bg-slate-800/60 border border-slate-700 rounded-2xl p-5">
             <div class="text-xs font-semibold text-slate-400 uppercase">Enterprise Org</div>
@@ -1147,7 +1304,7 @@ async function openTcode(code) {
 }
 
 // =========================================================================
-// --- SU01: USER DIRECTORY & IAM (COMPLETE WITH ALL ACTIONS) ---
+// --- SU01: USER DIRECTORY & IAM ---
 // =========================================================================
 async function renderSU01() {
   if (!ME.is_master && ME.role !== 'admin') return setMsg("Permission denied", true);
@@ -1362,7 +1519,7 @@ async function deleteUser(u) {
 }
 
 // =========================================================================
-// --- SPRO: COMPLETE PLANTS, DEPTS & ENTERPRISE MANAGEMENT ---
+// --- SPRO: COMPLETE PLANTS & DEPTS MANAGEMENT ---
 // =========================================================================
 async function renderSPRO() {
   if (!ME.is_master && ME.role !== 'admin') return setMsg("Permission denied", true);
@@ -1378,7 +1535,6 @@ async function renderSPRO() {
         <button onclick="renderSPRO()" class="btn-secondary text-xs px-3 py-1.5 rounded-xl"><i class="ri-refresh-line"></i> Refresh</button>
       </div>
 
-      <!-- ORG INFO STRIP -->
       <div class="mt-4 bg-slate-950 border border-slate-800 p-4 rounded-2xl flex items-center justify-between shrink-0">
         <div>
           <div class="text-[10px] text-slate-400 uppercase font-semibold">Corporate Enterprise Identity</div>
@@ -1387,16 +1543,13 @@ async function renderSPRO() {
         ${ME.is_master ? `<button onclick="showEditOrgModal('${esc(data.org.name)}','${esc(data.org.system_id)}','${esc(data.org.client)}')" class="btn-secondary text-xs px-3 py-1.5 rounded-xl">Edit Identity</button>` : ''}
       </div>
 
-      <!-- PLANTS & DEPARTMENTS SPLIT VIEW -->
       <div class="grid grid-cols-1 md:grid-cols-2 gap-6 flex-1 mt-4 overflow-auto">
-        <!-- PLANTS / FACILITIES -->
+        <!-- PLANTS -->
         <div class="bg-slate-950 border border-slate-800 rounded-2xl flex flex-col overflow-hidden">
           <div class="p-3.5 border-b border-slate-800 flex justify-between items-center bg-slate-900/60">
-            <div>
-              <span class="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
-                <i class="ri-building-line text-indigo-400"></i> Manufacturing Plants (${data.plants.length})
-              </span>
-            </div>
+            <span class="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
+              <i class="ri-building-line text-indigo-400"></i> Manufacturing Plants (${data.plants.length})
+            </span>
             ${ME.is_master ? `<button onclick="showCreatePlantModal()" class="btn-primary text-xs font-bold px-3 py-1.5 rounded-lg">+ Add Facility</button>` : ''}
           </div>
           <div class="flex-1 overflow-auto">
@@ -1423,11 +1576,9 @@ async function renderSPRO() {
         <!-- DEPARTMENTS -->
         <div class="bg-slate-950 border border-slate-800 rounded-2xl flex flex-col overflow-hidden">
           <div class="p-3.5 border-b border-slate-800 flex justify-between items-center bg-slate-900/60">
-            <div>
-              <span class="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
-                <i class="ri-team-line text-emerald-400"></i> Operational Departments (${data.departments.length})
-              </span>
-            </div>
+            <span class="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
+              <i class="ri-team-line text-emerald-400"></i> Operational Departments (${data.departments.length})
+            </span>
             ${ME.is_master ? `<button onclick="showCreateDeptModal()" class="btn-primary text-xs font-bold px-3 py-1.5 rounded-lg">+ Add Dept</button>` : ''}
           </div>
           <div class="flex-1 overflow-auto">
@@ -1575,61 +1726,8 @@ async function deleteDept(name) {
 }
 
 // =========================================================================
-// --- PFCG & TN01 FUNCTIONS ---
+// --- TN01: COMPLETE WORKSPACE WITH DEPARTMENT PRIVACY & EXCEL EXPORT ---
 // =========================================================================
-async function renderPFCG() {
-  if (!ME.is_master && ME.role !== 'admin') return setMsg("Permission denied", true);
-  const m = await api('/api/pfcg/matrix');
-  $('#main_screen').innerHTML = `
-    <div class="flex-1 flex flex-col bg-slate-900 p-6 overflow-hidden select-text">
-      <div class="flex items-center justify-between pb-5 border-b border-slate-800 shrink-0">
-        <div><h2 class="text-lg font-bold text-white tracking-tight">Access Control & Security Matrix (PFCG)</h2></div>
-        <div class="flex items-center gap-2">
-          <select id="pfcg_u" class="bg-slate-800 border border-slate-700 text-xs rounded-xl px-3 py-2 text-white">
-            ${m.users.map(u=>`<option value="${esc(u.username)}">${esc(u.username)} (${esc(u.full_name)})</option>`).join('')}
-          </select>
-          <select id="pfcg_t" class="bg-slate-800 border border-slate-700 text-xs rounded-xl px-3 py-2 text-white">
-            ${m.tcodes.map(t=>`<option value="${esc(t.code)}">${esc(t.code)} - ${esc(t.title)}</option>`).join('')}
-          </select>
-          <button onclick="grantAccess()" class="btn-primary text-xs font-semibold px-3 py-2 rounded-xl">+ Grant</button>
-        </div>
-      </div>
-      <div class="flex-1 mt-4 bg-slate-950 border border-slate-800 rounded-2xl overflow-auto">
-        <table class="w-full text-left custom-table">
-          <thead><tr><th>User</th><th>Permitted Module</th><th>Approved By</th><th>Granted At</th><th>Action</th></tr></thead>
-          <tbody class="text-slate-300">
-            ${m.grants.map(g => `
-              <tr class="border-b border-slate-800/60">
-                <td class="font-mono font-bold text-indigo-400">${esc(g.username)}</td>
-                <td class="font-mono font-bold text-white">${esc(g.tcode_code)}</td>
-                <td>${esc(g.granted_by)}</td>
-                <td class="text-slate-400 text-xs">${esc(g.granted_at)}</td>
-                <td><button onclick="revokeAccess('${esc(g.username)}','${esc(g.tcode_code)}')" class="text-xs text-red-400 hover:text-red-300">Revoke</button></td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
-      </div>
-    </div>`;
-}
-
-async function grantAccess() {
-  const u = $('#pfcg_u').value, t = $('#pfcg_t').value;
-  const fd = new FormData(); fd.append("username", u); fd.append("tcode", t);
-  await api('/api/pfcg/grant', {method: 'POST', body: fd});
-  renderPFCG();
-  setMsg("Permission granted");
-}
-
-async function revokeAccess(u, t) {
-  if (!confirm(`Revoke ${t} from ${u}?`)) return;
-  const fd = new FormData(); fd.append("username", u); fd.append("tcode", t);
-  await api('/api/pfcg/revoke', {method: 'POST', body: fd});
-  renderPFCG();
-  setMsg("Permission revoked");
-}
-
-// TN01 WORKSPACE
 let TN01_ROUTES = {}, TN01_ACTIVE_ROUTE = "PROD_TO_QC", TN01_HEADERS = [], TN01_ROWS = [], TN01_UNDO_STACK = [], TN01_REDO_STACK = [], TN01_ACTIVE_CELL = { r: 0, c: 1 };
 
 async function renderTN01() {
@@ -1644,14 +1742,14 @@ function renderTN01Main(activeTab = "sheet") {
         <div class="flex items-center gap-3">
           <div class="flex items-center gap-2">
             <span class="font-mono font-bold text-xs bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 px-2.5 py-1 rounded-lg">TN01</span>
-            <div><h2 class="text-sm font-bold text-white">Transfer Note & Handover System</h2><p class="text-[10px] text-slate-400">Inter-department transfer slips</p></div>
+            <div><h2 class="text-sm font-bold text-white">Transfer Note & Handover System</h2><p class="text-[10px] text-slate-400">Departmental material handover with strict privacy & audit controls</p></div>
           </div>
           <div class="h-6 w-[1px] bg-slate-800 mx-2"></div>
           <div class="flex items-center bg-slate-900 border border-slate-800 rounded-xl p-1 gap-1 text-xs font-semibold">
             <button onclick="switchTN01Tab('sheet')" class="px-3 py-1.5 rounded-lg flex items-center gap-1.5 ${activeTab==='sheet'?'bg-indigo-600 text-white shadow':'text-slate-400 hover:text-white'}"><i class="ri-table-line"></i> Excel Sheet</button>
             <button onclick="switchTN01Tab('receive')" class="px-3 py-1.5 rounded-lg flex items-center gap-1.5 ${activeTab==='receive'?'bg-indigo-600 text-white shadow':'text-slate-400 hover:text-white'}"><i class="ri-inbox-archive-line"></i> Receive Notes</button>
-            <button onclick="switchTN01Tab('history')" class="px-3 py-1.5 rounded-lg flex items-center gap-1.5 ${activeTab==='history'?'bg-indigo-600 text-white shadow':'text-slate-400 hover:text-white'}"><i class="ri-history-line"></i> History & Log</button>
-            ${ME.is_master || ME.role==='admin' ? `<button onclick="switchTN01Tab('format')" class="px-3 py-1.5 rounded-lg flex items-center gap-1.5 ${activeTab==='format'?'bg-indigo-600 text-white shadow':'text-slate-400 hover:text-white'}"><i class="ri-paint-brush-line"></i> Format Studio (Admin)</button>` : ''}
+            <button onclick="switchTN01Tab('history')" class="px-3 py-1.5 rounded-lg flex items-center gap-1.5 ${activeTab==='history'?'bg-indigo-600 text-white shadow':'text-slate-400 hover:text-white'}"><i class="ri-history-line"></i> History Log</button>
+            ${ME.is_master || ME.role==='admin' ? `<button onclick="switchTN01Tab('format')" class="px-3 py-1.5 rounded-lg flex items-center gap-1.5 ${activeTab==='format'?'bg-indigo-600 text-white shadow':'text-slate-400 hover:text-white'}"><i class="ri-paint-brush-line"></i> Format Studio</button>` : ''}
           </div>
         </div>
         <div>${activeTab === 'sheet' ? `<button onclick="openSendModal()" class="btn-primary text-xs font-bold px-4 py-2 rounded-xl flex items-center gap-1.5 shadow-lg shadow-indigo-600/40"><i class="ri-send-plane-fill"></i> Send Transfer Note</button>` : ''}</div>
@@ -1685,7 +1783,9 @@ function renderTN01SheetTab() {
         <button onclick="clearGrid()" class="bg-slate-800 text-slate-400 px-2 py-1 rounded border border-slate-700">Clear</button>
       </div>
       <div class="flex items-center gap-2 text-slate-400 text-xs">
-        <button onclick="copyGridForExcel()" class="bg-slate-800 text-emerald-400 border border-slate-700 px-3 py-1 rounded-lg flex items-center gap-1 font-semibold"><i class="ri-file-copy-line"></i> Copy for Excel</button>
+        <button onclick="exportDraftExcel()" class="bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-slate-700 px-3 py-1 rounded-lg flex items-center gap-1 font-semibold">
+          <i class="ri-file-excel-2-line text-sm"></i> Export as Excel
+        </button>
         <span class="text-[11px] bg-slate-800 border border-slate-700 px-2 py-0.5 rounded text-slate-400 font-mono">Press <b>Ctrl+V</b> to paste from Excel</span>
       </div>
     </div>
@@ -1803,14 +1903,38 @@ function setupPasteHandler() {
     });
     TN01_ROWS.forEach((r, idx) => { r[0] = idx + 1; });
     renderGridTable();
-    setMsg("Excel data pasted.");
+    setMsg("Excel data pasted into sheet.");
   });
 }
 
-function copyGridForExcel() {
-  let tsv = TN01_HEADERS.join('\\t') + '\\n';
-  TN01_ROWS.forEach(r => { tsv += r.join('\\t') + '\\n'; });
-  navigator.clipboard.writeText(tsv).then(() => { alert("Copied! Paste into Excel with Ctrl+V."); });
+// EXPORT DRAFT AS FORMATTED EXCEL
+async function exportDraftExcel() {
+  const filledRows = TN01_ROWS.filter(r => r.slice(1).some(c => String(c).trim() !== ''));
+  if (!filledRows.length) return alert("Sheet has no data to export.");
+
+  const payload = {
+    route: TN01_ROUTES[TN01_ACTIVE_ROUTE].route,
+    headers: TN01_HEADERS,
+    rows: filledRows
+  };
+
+  const res = await fetch('/api/tn01/export-draft-excel', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${localStorage.getItem('nexus_token')}`
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const blob = await res.blob();
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `TN01_${TN01_ACTIVE_ROUTE}_Export.xlsx`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 async function openSendModal() {
@@ -1822,7 +1946,7 @@ async function openSendModal() {
 
   openDialog(`
     <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50 rounded-t-2xl">
-      <div><h3 class="font-bold text-slate-800 text-sm">Transfer & Handover Note</h3><p class="text-xs text-slate-500">Route: ${activeRoute.route}</p></div>
+      <div><h3 class="font-bold text-slate-800 text-sm">Transfer Dispatch & Handover Note</h3><p class="text-xs text-slate-500">Route: ${activeRoute.route}</p></div>
       <button onclick="closeDialog()"><i class="ri-close-line text-lg"></i></button>
     </div>
     <div class="p-6 space-y-4">
@@ -1842,12 +1966,12 @@ async function openSendModal() {
         </div>
       </div>
       <div><label class="block text-xs font-semibold text-slate-700 mb-1">Remarks</label>
-        <textarea id="send_remarks" class="w-full border border-slate-300 rounded-xl p-2 text-xs" rows="2" placeholder="Any remarks..."></textarea>
+        <textarea id="send_remarks" class="w-full border border-slate-300 rounded-xl p-2 text-xs" rows="2" placeholder="Dispatch notes..."></textarea>
       </div>
     </div>
     <div class="px-6 py-4 bg-slate-50 border-t border-slate-200 flex justify-end gap-2 rounded-b-2xl">
       <button onclick="closeDialog()" class="btn-secondary px-4 py-2 rounded-xl text-xs font-semibold">Cancel</button>
-      <button onclick="submitSendNote()" class="btn-primary px-5 py-2 rounded-xl text-xs font-bold">Confirm & Send</button>
+      <button onclick="submitSendNote()" class="btn-primary px-5 py-2 rounded-xl text-xs font-bold">Confirm & Dispatch</button>
     </div>`);
   updateSuggestedUsers();
 }
@@ -1870,7 +1994,7 @@ async function submitSendNote() {
   try {
     const res = await api('/api/tn01/send', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
     closeDialog();
-    alert(`Transfer Sheet Sent! Note #: ${res.note_no}`);
+    alert(`Transfer Dispatched! Note #: ${res.note_no}`);
     switchTN01Tab('history');
   } catch(e) { alert(e); }
 }
@@ -1880,7 +2004,10 @@ async function renderTN01ReceiveTab() {
   $('#tn01_content').innerHTML = `
     <div class="p-6 flex-1 flex flex-col overflow-hidden">
       <div class="flex items-center justify-between pb-4 border-b border-slate-800 shrink-0">
-        <div><h2 class="text-base font-bold text-white">Incoming Transfer Notes (Receive Inbox)</h2></div>
+        <div>
+          <h2 class="text-base font-bold text-white">Incoming Transfer Notes (Receive Inbox)</h2>
+          <p class="text-xs text-slate-400">Restricted to transfer notes routed to your department: <b class="text-indigo-400">${esc(ME.department)}</b></p>
+        </div>
         <button onclick="renderTN01ReceiveTab()" class="btn-secondary text-xs px-3 py-1.5 rounded-lg"><i class="ri-refresh-line"></i> Refresh</button>
       </div>
       <div class="flex-1 mt-4 bg-slate-950 border border-slate-800 rounded-2xl overflow-auto">
@@ -1926,8 +2053,13 @@ async function viewTransferNote(nid) {
       <div class="flex justify-between items-center">
         <span class="text-xs font-bold text-slate-700">Batches (${note.entry_count} rows):</span>
         <div class="flex gap-2">
-          <button onclick="copyReceivedForExcel(${nid})" class="btn-secondary text-xs px-3 py-1.5 rounded-lg flex items-center gap-1 text-emerald-700 font-semibold border-emerald-300"><i class="ri-file-copy-line"></i> Copy for Excel</button>
-          <button onclick="loadNoteIntoWorkspace(${nid})" class="btn-primary text-xs px-3 py-1.5 rounded-lg flex items-center gap-1 font-semibold"><i class="ri-download-cloud-2-line"></i> Load into Workspace</button>
+          <!-- EXPORT AS FORMATTED EXCEL BUTTON (REPLACED RAW CLIPBOARD COPY) -->
+          <a href="/api/tn01/export-excel/${note.id}" class="btn-secondary text-xs px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-emerald-700 font-semibold border-emerald-300 hover:bg-emerald-50">
+            <i class="ri-file-excel-2-line text-sm"></i> Export as Excel
+          </a>
+          <button onclick="loadNoteIntoWorkspace(${nid})" class="btn-primary text-xs px-3 py-1.5 rounded-lg flex items-center gap-1 font-semibold">
+            <i class="ri-download-cloud-2-line"></i> Load into Workspace
+          </button>
         </div>
       </div>
       <div class="max-h-72 overflow-auto border border-slate-200 rounded-xl">
@@ -1943,13 +2075,6 @@ async function viewTransferNote(nid) {
     </div>`);
 }
 
-async function copyReceivedForExcel(nid) {
-  const note = await api(`/api/tn01/note/${nid}`);
-  let tsv = note.sheet_headers.join('\\t') + '\\n';
-  note.sheet_data.forEach(r => { tsv += r.join('\\t') + '\\n'; });
-  navigator.clipboard.writeText(tsv).then(() => { alert("Copied! Paste into Excel with Ctrl+V."); });
-}
-
 async function loadNoteIntoWorkspace(nid) {
   const note = await api(`/api/tn01/note/${nid}`);
   TN01_HEADERS = [...note.sheet_headers];
@@ -1959,18 +2084,53 @@ async function loadNoteIntoWorkspace(nid) {
   setMsg("Loaded note into active sheet.");
 }
 
+// --- TN01 HISTORY: DEPARTMENT PRIVACY & MASTER ACTIONS ---
 async function renderTN01HistoryTab() {
   const p = $('#hist_p') ? $('#hist_p').value : '';
   const history = await api(`/api/tn01/history?plant=${p}`);
+
   $('#tn01_content').innerHTML = `
     <div class="p-6 flex-1 flex flex-col overflow-hidden">
-      <div class="flex-1 mt-2 bg-slate-950 border border-slate-800 rounded-2xl overflow-auto">
+      <!-- HEADER & AUDIT INFO -->
+      <div class="flex items-center justify-between pb-3 border-b border-slate-800 shrink-0">
+        <div>
+          <h2 class="text-base font-bold text-white flex items-center gap-2">
+            Transfer History & Audit Trail
+            ${ME.is_master ? 
+              '<span class="text-[10px] bg-red-950 text-red-300 border border-red-800 font-mono px-2 py-0.5 rounded-full font-bold">MASTER VIEW: ALL DEPTS VISIBLE</span>' : 
+              `<span class="text-[10px] bg-indigo-950 text-indigo-300 border border-indigo-800 font-mono px-2 py-0.5 rounded-full">RESTRICTED TO: ${esc(ME.department)} (SENT/RECEIVED)</span>`
+            }
+          </h2>
+        </div>
+
+        <!-- MASTER ADMIN DELETE ACTIONS -->
+        <div class="flex items-center gap-2">
+          ${ME.is_master ? `
+            <button onclick="deleteSelectedHistory()" class="bg-red-950 hover:bg-red-900 text-red-300 border border-red-800 text-xs font-semibold px-3 py-1.5 rounded-xl flex items-center gap-1">
+              <i class="ri-delete-bin-line"></i> Delete Selected
+            </button>
+            <button onclick="wipeAllHistory()" class="bg-red-600 hover:bg-red-500 text-white text-xs font-bold px-3 py-1.5 rounded-xl flex items-center gap-1 shadow-md shadow-red-600/30">
+              <i class="ri-skull-line"></i> Wipe All History
+            </button>
+          ` : ''}
+          <button onclick="renderTN01HistoryTab()" class="btn-secondary text-xs px-3 py-1.5 rounded-xl"><i class="ri-refresh-line"></i> Refresh</button>
+        </div>
+      </div>
+
+      <!-- TABLE CONTAINER -->
+      <div class="flex-1 mt-4 bg-slate-950 border border-slate-800 rounded-2xl overflow-auto">
         <table class="w-full text-left custom-table">
-          <thead><tr><th>Note #</th><th>Route</th><th>From</th><th>To</th><th>Batches</th><th>Sender</th><th>Timestamp</th><th>Status</th><th>Actions</th></tr></thead>
+          <thead>
+            <tr>
+              ${ME.is_master ? '<th style="width:35px;"><input type="checkbox" onchange="toggleSelectAllHistory(this.checked)" class="rounded"></th>' : ''}
+              <th>Note #</th><th>Route</th><th>From</th><th>To</th><th>Batches</th><th>Sender</th><th>Timestamp</th><th>Status</th><th>Actions</th>
+            </tr>
+          </thead>
           <tbody class="text-slate-300">
-            ${!history.length ? `<tr><td colspan="9" class="text-center py-10 text-slate-500">No records found.</td></tr>` : ''}
+            ${!history.length ? `<tr><td colspan="${ME.is_master?10:9}" class="text-center py-12 text-slate-500">No transfer history records accessible.</td></tr>` : ''}
             ${history.map(h => `
-              <tr class="border-b border-slate-800/60">
+              <tr class="border-b border-slate-800/60 hover:bg-slate-900/60">
+                ${ME.is_master ? `<td><input type="checkbox" value="${h.id}" class="hist-chk rounded"></td>` : ''}
                 <td class="font-mono font-bold text-indigo-400">${esc(h.note_no)}</td>
                 <td class="font-semibold text-white">${esc(h.route)}</td>
                 <td>${esc(h.from_plant)} - ${esc(h.from_dept)}</td>
@@ -1979,9 +2139,11 @@ async function renderTN01HistoryTab() {
                 <td>${esc(h.from_user_name)}</td>
                 <td class="font-mono text-xs text-slate-400">${esc(h.created_at)}</td>
                 <td><span class="text-[10px] font-bold px-2 py-0.5 rounded-full ${h.status==='received'?'bg-emerald-950 text-emerald-300':'bg-amber-950 text-amber-300'}">${h.status.toUpperCase()}</span></td>
-                <td class="space-x-1">
-                  <button onclick="viewTransferNote(${h.id})" class="text-xs text-indigo-400 font-semibold">View</button>
-                  <a href="/api/tn01/print/${h.id}" target="_blank" class="text-xs text-emerald-400 font-semibold ml-2">PDF</a>
+                <td class="space-x-1.5">
+                  <button onclick="viewTransferNote(${h.id})" class="text-xs text-indigo-400 font-semibold hover:underline">View</button>
+                  <a href="/api/tn01/export-excel/${h.id}" class="text-xs text-emerald-400 font-semibold hover:underline" title="Download Formatted Excel">Excel</a>
+                  <a href="/api/tn01/print/${h.id}" target="_blank" class="text-xs text-slate-400 font-semibold hover:underline">PDF</a>
+                  ${ME.is_master ? `<button onclick="deleteSingleHistory(${h.id}, '${esc(h.note_no)}')" class="text-xs text-red-400 hover:text-red-300 font-semibold ml-2">Delete</button>` : ''}
                 </td>
               </tr>
             `).join('')}
@@ -1991,12 +2153,57 @@ async function renderTN01HistoryTab() {
     </div>`;
 }
 
+function toggleSelectAllHistory(checked) {
+  document.querySelectorAll('.hist-chk').forEach(cb => cb.checked = checked);
+}
+
+// MASTER: DELETE INDIVIDUAL HISTORY ITEM
+async function deleteSingleHistory(nid, noteNo) {
+  if (!confirm(`Master Action: Permanently delete transfer note ${noteNo}?`)) return;
+  try {
+    await api(`/api/tn01/history/${nid}`, {method: 'DELETE'});
+    setMsg(`Transfer note ${noteNo} deleted`);
+    renderTN01HistoryTab();
+  } catch(e) { alert(e); }
+}
+
+// MASTER: DELETE SELECTED HISTORY ITEMS
+async function deleteSelectedHistory() {
+  const chks = Array.from(document.querySelectorAll('.hist-chk:checked')).map(cb => parseInt(cb.value));
+  if (!chks.length) return alert("Select at least one transfer record to delete.");
+  if (!confirm(`Master Action: Permanently delete ${chks.length} selected transfer note(s)?`)) return;
+  try {
+    await api('/api/tn01/history/bulk-delete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ids: chks})
+    });
+    setMsg(`${chks.length} record(s) deleted`);
+    renderTN01HistoryTab();
+  } catch(e) { alert(e); }
+}
+
+// MASTER: WIPE ALL HISTORY
+async function wipeAllHistory() {
+  const p = prompt("WARNING: This will permanently purge ALL transfer notes across all facilities.\nType 'DELETE ALL' to proceed:");
+  if (p !== 'DELETE ALL') return alert("Action canceled.");
+  try {
+    await api('/api/tn01/history/bulk-delete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({all: true})
+    });
+    setMsg("All transfer history purged");
+    renderTN01HistoryTab();
+  } catch(e) { alert(e); }
+}
+
 async function renderTN01FormatTab() {
   const layouts = await api('/api/tn01/layouts');
   $('#tn01_content').innerHTML = `
     <div class="p-6 flex-1 flex flex-col overflow-hidden">
       <div class="flex items-center justify-between pb-4 border-b border-slate-800 shrink-0">
-        <div><h2 class="text-base font-bold text-white">Transfer Note Formats (Admin)</h2></div>
+        <div><h2 class="text-base font-bold text-white">Transfer Note Formats (Admin Studio)</h2></div>
         <button onclick="openCreateLayoutModal()" class="btn-primary text-xs font-semibold px-4 py-2 rounded-xl">+ Create Format</button>
       </div>
       <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4 overflow-auto">
@@ -2061,7 +2268,7 @@ async function deleteLayoutTN01(lid) {
   renderTN01FormatTab();
 }
 
-// STANDARD MODULE (PROD, GCH0, AUTO-CREATED MODULES)
+// STANDARD MODULE ALV VIEW (PROD, GCH0, AUTO-CREATED MODULES)
 async function renderStandardModule(code) {
   const layouts = await api(`/api/tcode/${code}/layouts`);
   const activeLayout = layouts.find(l => l.is_default) || layouts[0];
@@ -2180,7 +2387,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "3.5.0"}
+    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "3.6.0"}
 
 if __name__ == "__main__":
     import uvicorn
