@@ -191,7 +191,7 @@ def init_db():
     # Seed Master Org
     cur.execute(q("SELECT 1 FROM org WHERE id=1"))
     if not cur.fetchone():
-        cur.execute(q("INSERT INTO org (id, name, system_id, client) VALUES (?,?,?,?)"), (1, "Thermocables Enterprise Group", "NX-01", "GLOBAL"))
+        cur.execute(q("INSERT INTO org (id, name, system_id, client) VALUES (?,?,?,?)"), (1, "Thermocables Limited", "NX-01", "GLOBAL"))
 
     # Seed Departments
     for d in ["Production", "Final Testing", "Quality Control", "Commercial", "Store", "Planning", "Engineering"]:
@@ -336,7 +336,7 @@ def api_me(req: Request):
         "username": u["username"], "full_name": u["full_name"], "role": u["role"],
         "department": u["department"], "plants": [p for p in (u["plants"] or "").split(",") if p],
         "is_master": is_master(u), "system": org_info.get("system_id", "NX-01"),
-        "client": org_info.get("client", "GLOBAL"), "company": org_info.get("name", "Thermocables Group")
+        "client": org_info.get("client", "GLOBAL"), "company": org_info.get("name", "Thermocables Limited")
     }
 
 # --- SYSTEM UNITS, PLANTS & DEPTS (SPRO) ---
@@ -771,7 +771,7 @@ def tn01_print_preview(req: Request, nid: int):
         <button onclick="window.print()" style="background:#4f46e5; color:white; border:none; padding:8px 16px; border-radius:6px; cursor:pointer; font-weight:bold;">Print / Save PDF</button>
       </div>
       <div class="header">
-        <h2 style="margin:0;">{org.get('name', 'Thermocables Group')}</h2>
+        <h2 style="margin:0;">{org.get('name', 'Thermocables Limited')}</h2>
         <h4 style="margin:4px 0 0; color:#4f46e5;">INTER-DEPARTMENT MATERIAL TRANSFER & HANDOVER NOTE (TN01)</h4>
         <div style="font-family:monospace; font-weight:bold; margin-top:4px;">{note['note_no']} | Date: {note['created_at']}</div>
       </div>
@@ -787,8 +787,8 @@ def tn01_print_preview(req: Request, nid: int):
       </div>
       <table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table>
       <div class="signs">
-        <div class="sign-box">Dispatched By ({note['from_user_name']})</div>
-        <div class="sign-box">Inspection / Quality Check</div>
+        <div class="sign-box">Sent By ({note['from_user_name']})</div>
+        <div class="sign-box">Production Incharge | Quality Incharge</div>
         <div class="sign-box">Received By ({note['received_by_name'] or note['to_user_name']})</div>
       </div>
     </body></html>""")
@@ -957,7 +957,7 @@ HTML_MODERN_UI = """<!DOCTYPE html>
         </div>
       </div>
       <div class="p-3 border-t border-slate-800 bg-slate-950/60 text-[11px]">
-        <div class="font-bold text-slate-300 truncate" id="side_company">Thermocables Group</div>
+        <div class="font-bold text-slate-300 truncate" id="side_company">Thermocables Limited</div>
         <div class="text-slate-500 truncate" id="side_plant">Facilities: Authorized</div>
       </div>
     </aside>
@@ -1019,7 +1019,7 @@ function renderLogon(errorMsg = "") {
     <div class="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-8 z-10">
       <div class="flex items-center gap-3 mb-6">
         <div class="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center font-bold text-white"><i class="ri-pulse-fill text-2xl"></i></div>
-        <div><h1 class="text-xl font-bold text-white">Nexus Core ERP</h1><p class="text-xs text-slate-400">Thermocables Industrial Suite</p></div>
+        <div><h1 class="text-xl font-bold text-white">Nexus Core ERP</h1><p class="text-xs text-slate-400">Thermocables Limited</p></div>
       </div>
       ${errorMsg ? `<div class="mb-4 p-3 bg-red-950/40 border border-red-800/60 rounded-xl text-red-300 text-xs">${esc(errorMsg)}</div>` : ''}
       <div class="space-y-4">
@@ -1079,7 +1079,7 @@ function goHome() {
   $('#main_screen').innerHTML = `
     <div class="flex-1 overflow-y-auto p-8 bg-slate-900 select-text">
       <div class="max-w-5xl mx-auto space-y-8">
-        <div><h1 class="text-2xl font-bold text-white">Operations Dashboard</h1><p class="text-sm text-slate-400 mt-1">Thermocables Industrial Management Platform</p></div>
+        <div><h1 class="text-2xl font-bold text-white">Operations Dashboard</h1><p class="text-sm text-slate-400 mt-1">Thermocables Ltd Management Platform</p></div>
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div class="bg-slate-800/60 border border-slate-700 rounded-2xl p-5">
             <div class="text-xs font-semibold text-slate-400 uppercase">Enterprise Org</div>
@@ -1847,7 +1847,7 @@ async function openSendModal() {
     </div>
     <div class="px-6 py-4 bg-slate-50 border-t border-slate-200 flex justify-end gap-2 rounded-b-2xl">
       <button onclick="closeDialog()" class="btn-secondary px-4 py-2 rounded-xl text-xs font-semibold">Cancel</button>
-      <button onclick="submitSendNote()" class="btn-primary px-5 py-2 rounded-xl text-xs font-bold">Confirm & Dispatch</button>
+      <button onclick="submitSendNote()" class="btn-primary px-5 py-2 rounded-xl text-xs font-bold">Confirm & Send</button>
     </div>`);
   updateSuggestedUsers();
 }
