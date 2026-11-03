@@ -1,7 +1,8 @@
 # =========================================================================
-# NEXUS CORE ERP  —  app.py  —  v4.0.1
+# NEXUS CORE ERP  —  app.py  —  v4.0.2
 # =========================================================================
-# Fixes:
+# Adds:
+#  - "View Materials" button to see all loaded materials in MRQ1.
 #  - Bulletproof Material Master import (handles .xlsx zips, CSV newline
 #    issues, Mac/Windows line endings, and quoted commas).
 # =========================================================================
@@ -428,7 +429,7 @@ def check_tcode_access(user, code: str):
 # =========================================================================
 # FASTAPI APP
 # =========================================================================
-app = FastAPI(title="Nexus Core ERP", version="4.0.1")
+app = FastAPI(title="Nexus Core ERP", version="4.0.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -807,7 +808,7 @@ def se93_delete(req: Request, code: str = Form(...)):
 
 
 # =========================================================================
-# AI CODE STUDIO  —  SAFE MODE
+# AI CODE STUDIO
 # =========================================================================
 VALID_TYPES = {"text", "number", "date", "textarea", "select", "email", "tel"}
 RESERVED_CODES = {"TN01", "SU01", "SPRO", "SE93", "PFCG", "STUDIO", "CTST", "MRQ1"}
@@ -2627,7 +2628,8 @@ async function renderMRQ(category=null){
       <div class="flex items-center justify-between pb-4 border-b border-slate-200 shrink-0">
         <div class="flex items-center gap-3"><span class="font-mono font-bold text-xs bg-emerald-600 text-white px-2.5 py-1 rounded-lg shadow-sm">MRQ1</span><div><h2 class="text-lg font-bold text-slate-900">Material Requisition</h2><p class="text-xs text-slate-500">Department → Stores material request</p></div></div>
         <div class="flex items-center gap-2">
-          ${isAdmin?`<label class="btn-secondary text-xs font-semibold px-3 py-2 rounded-lg cursor-pointer flex items-center gap-1"><i class="ri-upload-2-line"></i> Import Material Master<input type="file" accept=".xlsx,.xls,.csv" onchange="mrqImportMaterials(this)" class="hidden"></label>`:''}
+          ${isAdmin?`<label class="btn-secondary text-xs font-semibold px-3 py-2 rounded-lg cursor-pointer flex items-center gap-1"><i class="ri-upload-2-line"></i> Import<input type="file" accept=".xlsx,.xls,.csv" onchange="mrqImportMaterials(this)" class="hidden"></label>`:''}
+          <button onclick="mrqViewMaterials()" class="btn-secondary text-xs font-semibold px-3 py-2 rounded-lg flex items-center gap-1"><i class="ri-eye-line text-indigo-500"></i> View Materials</button>
           <button onclick="renderMRQ()" class="btn-secondary text-xs font-semibold p-2 rounded-lg"><i class="ri-refresh-line"></i></button>
         </div>
       </div>
@@ -2677,6 +2679,37 @@ async function mrqImportMaterials(input){
   try{const r=await api('/api/mrq/materials/import',{method:'POST',body:fd});
     alert(`Imported ${r.imported}, updated ${r.updated}, skipped ${r.skipped} (${r.total_rows} rows)`);}
   catch(e){alert("Import failed: "+e);}
+}
+
+async function mrqViewMaterials(){
+  const materials=await api('/api/mrq/materials');
+  openDialog(`
+    <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50 rounded-t-2xl">
+      <div>
+        <h3 class="font-bold text-slate-900 text-sm">Material Master List</h3>
+        <p class="text-xs text-slate-500">${materials.length} items loaded</p>
+      </div>
+      <button onclick="closeDialog()"><i class="ri-close-line text-lg text-slate-500"></i></button>
+    </div>
+    <div class="p-0 overflow-auto max-h-[60vh]">
+      <table class="custom-table">
+        <thead class="sticky top-0 bg-slate-50 shadow-sm z-10"><tr>
+          <th>Code</th><th>Description</th><th>Category</th><th>UOM</th>
+        </tr></thead>
+        <tbody>
+          ${!materials.length?`<tr><td colspan="4" class="text-center py-10 text-slate-400">No materials loaded.</td></tr>`:materials.map(m=>`
+            <tr>
+              <td class="font-mono font-bold text-emerald-600">${esc(m.material_code)}</td>
+              <td class="font-medium text-slate-900">${esc(m.description)}</td>
+              <td class="text-xs uppercase">${esc(m.category)}</td>
+              <td class="text-xs">${esc(m.uom)}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    <div class="px-6 py-4 bg-slate-50 border-t border-slate-200 flex justify-end rounded-b-2xl">
+      <button onclick="closeDialog()" class="btn-secondary px-4 py-2 rounded-lg text-xs font-semibold">Close</button>
+    </div>`);
 }
 
 async function renderMRQForm(category){
@@ -2965,7 +2998,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "4.0.1"}
+    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "4.0.2"}
 
 
 if __name__ == "__main__":
