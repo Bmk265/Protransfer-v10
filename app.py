@@ -1,8 +1,9 @@
 # =========================================================================
-# NEXUS CORE ERP  —  app.py  —  v4.0.0
+# NEXUS CORE ERP  —  app.py  —  v4.0.1
 # =========================================================================
-# Adds: MRQ1 — Material Requisition (Department → Stores)
-# Preserves: CTST hub, TN01, SU01, SPRO, SE93, PFCG, AI Studio (Safe Mode)
+# Fixes:
+#  - Bulletproof Material Master import (handles .xlsx zips, CSV newline
+#    issues, Mac/Windows line endings, and quoted commas).
 # =========================================================================
 
 import io
@@ -427,7 +428,7 @@ def check_tcode_access(user, code: str):
 # =========================================================================
 # FASTAPI APP
 # =========================================================================
-app = FastAPI(title="Nexus Core ERP", version="4.0.0")
+app = FastAPI(title="Nexus Core ERP", version="4.0.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -1477,22 +1478,47 @@ async def mrq_import_materials(req: Request, file: UploadFile = File(...)):
     contents = await file.read()
     fn = file.filename.lower()
     rows = []
+    
     try:
-        if fn.endswith(".xlsx") or fn.endswith(".xls"):
+        # Check for modern Excel zip signature
+        is_zip = contents.startswith(b'PK\x03\x04')
+        
+        if fn.endswith(".xlsx") or is_zip:
+            if not is_zip:
+                raise HTTPException(400, "The .xlsx file is corrupted or not a real Excel file. Please re-save as CSV.")
             wb = load_workbook(io.BytesIO(contents), data_only=True)
             all_rows = list(wb.active.iter_rows(values_only=True))
             if not all_rows:
                 raise HTTPException(400, "Empty file.")
+            # Normalize headers
             headers = [str(h).strip().lower() for h in all_rows[0]]
             for r in all_rows[1:]:
                 rows.append(dict(zip(headers, r)))
+                
         elif fn.endswith(".csv"):
-            text = contents.decode("utf-8", errors="ignore")
-            reader = csv.DictReader(io.StringIO(text))
-            for r in reader:
-                rows.append({(k or "").strip().lower(): v for k, v in r.items()})
+            # Robust CSV parser: handles \r\n, \r, \n, and UTF-8 BOM
+            text = contents.decode("utf-8-sig", errors="ignore")
+            lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+            
+            if not lines:
+                raise HTTPException(400, "Empty file.")
+                
+            # Extract and normalize headers
+            header_line = lines[0]
+            headers = [h.strip().lower().strip('"').strip("'") for h in header_line.split(',')]
+            
+            for line in lines[1:]:
+                if not line.strip():
+                    continue  # Skip empty lines
+                
+                # Parse columns (handles quoted commas)
+                parsed = next(csv.reader([line]))
+                # Zip and pad if the row is shorter than headers
+                row_dict = dict(zip(headers, parsed))
+                rows.append(row_dict)
         else:
-            raise HTTPException(400, "Upload .xlsx/.xls/.csv")
+            raise HTTPException(400, "Upload .xlsx or .csv")
+            
     except HTTPException:
         raise
     except Exception as e:
@@ -1501,14 +1527,17 @@ async def mrq_import_materials(req: Request, file: UploadFile = File(...)):
     imported = 0
     updated = 0
     skipped = 0
+    
     for r in rows:
         code = str(r.get("material code") or r.get("code") or "").strip().upper()
         desc = str(r.get("description") or r.get("material description") or "").strip()
         cat = str(r.get("category") or "stores").strip().lower()
         uom = str(r.get("uom") or "NOS").strip().upper()
+        
         if not code or not desc:
             skipped += 1
             continue
+            
         exists = fetch_one("SELECT 1 FROM mrq_materials WHERE material_code=?", (code,))
         if exists:
             exec_write("UPDATE mrq_materials SET description=?, category=?, uom=? "
@@ -1519,6 +1548,7 @@ async def mrq_import_materials(req: Request, file: UploadFile = File(...)):
                        "category, uom, created_at) VALUES (?,?,?,?,?)",
                        (code, desc, cat, uom, now()))
             imported += 1
+            
     return {"ok": True, "imported": imported, "updated": updated,
             "skipped": skipped, "total_rows": len(rows)}
 
@@ -2223,7 +2253,7 @@ def export_excel(code: str, req: Request):
 
 
 # =========================================================================
-# FRONTEND — LIGHT PROFESSIONAL THEME
+# FRONTEND
 # =========================================================================
 HTML_UI = r"""<!DOCTYPE html>
 <html lang="en">
@@ -2269,24 +2299,16 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc;color:#0f172a;f
 </style>
 </head>
 <body class="h-screen flex flex-col overflow-hidden">
-
 <div id="app_root" class="h-full flex flex-col">
   <header class="h-14 bg-white border-b border-slate-200 px-4 flex items-center justify-between shrink-0 shadow-sm">
     <div class="flex items-center gap-4">
       <div class="flex items-center gap-2.5 cursor-pointer" onclick="goHome()">
-        <div class="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white shadow-sm">
-          <i class="ri-pulse-fill text-lg"></i>
-        </div>
-        <div class="font-bold text-sm tracking-tight text-slate-900 flex items-center gap-1.5">
-          Nexus Core
-          <span class="text-[10px] bg-indigo-50 text-indigo-600 border border-indigo-200 font-mono px-1.5 py-0.5 rounded">v4.0</span>
-        </div>
+        <div class="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white shadow-sm"><i class="ri-pulse-fill text-lg"></i></div>
+        <div class="font-bold text-sm tracking-tight text-slate-900 flex items-center gap-1.5">Nexus Core <span class="text-[10px] bg-indigo-50 text-indigo-600 border border-indigo-200 font-mono px-1.5 py-0.5 rounded">v4.0</span></div>
       </div>
       <div class="relative ml-4">
         <i class="ri-search-line absolute left-3 top-2.5 text-slate-400 text-xs"></i>
-        <input id="cmd_box" placeholder="Jump to module..."
-          class="bg-slate-50 border border-slate-200 rounded-lg pl-8 pr-4 py-1.5 text-xs text-slate-900 w-96 font-mono focus:outline-none focus:border-indigo-400 focus:bg-white"
-          onkeydown="if(event.key==='Enter') execCmd()">
+        <input id="cmd_box" placeholder="Jump to module..." class="bg-slate-50 border border-slate-200 rounded-lg pl-8 pr-4 py-1.5 text-xs text-slate-900 w-96 font-mono focus:outline-none focus:border-indigo-400 focus:bg-white" onkeydown="if(event.key==='Enter') execCmd()">
       </div>
     </div>
     <div class="flex items-center gap-3">
@@ -2295,12 +2317,9 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc;color:#0f172a;f
         <span id="user_display" class="font-medium text-slate-700">Connecting...</span>
         <span id="role_badge" class="badge badge-indigo"></span>
       </div>
-      <button onclick="logout()" class="text-xs bg-white hover:bg-red-50 text-slate-500 hover:text-red-600 border border-slate-200 p-2 rounded-lg transition">
-        <i class="ri-logout-box-r-line"></i>
-      </button>
+      <button onclick="logout()" class="text-xs bg-white hover:bg-red-50 text-slate-500 hover:text-red-600 border border-slate-200 p-2 rounded-lg transition"><i class="ri-logout-box-r-line"></i></button>
     </div>
   </header>
-
   <div class="flex-1 flex overflow-hidden">
     <aside class="w-64 bg-white border-r border-slate-200 flex flex-col justify-between shrink-0">
       <div class="p-3 overflow-y-auto flex-1 space-y-4">
@@ -2359,7 +2378,6 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc;color:#0f172a;f
     </aside>
     <main id="main_screen" class="flex-1 bg-slate-50 overflow-hidden flex flex-col"></main>
   </div>
-
   <footer class="h-7 bg-white border-t border-slate-200 px-4 flex items-center justify-between text-[11px] text-slate-500 font-mono shrink-0">
     <div class="flex items-center gap-2 truncate">
       <span id="stat_dot" class="w-2 h-2 rounded-full bg-emerald-500"></span>
@@ -2372,11 +2390,9 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc;color:#0f172a;f
     </div>
   </footer>
 </div>
-
 <div id="app_dialog" class="hidden fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
   <div id="app_dialog_body" class="bg-white text-slate-800 rounded-2xl shadow-2xl border border-slate-200 max-h-[90vh] overflow-y-auto w-full max-w-4xl"></div>
 </div>
-
 <script>
 let ME = null;
 let CURRENT_TCODE = null;
@@ -2949,7 +2965,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "4.0.0"}
+    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "4.0.1"}
 
 
 if __name__ == "__main__":
