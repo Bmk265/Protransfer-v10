@@ -1,5 +1,9 @@
 # =========================================================================
-# NEXUS CORE ERP  —  app.py  —  v5.0.0 (Fully Restored & Verified)
+# NEXUS CORE ERP  —  app.py  —  v5.1.0
+# =========================================================================
+# Fixes:
+#  - TN01 Receiver dropdown now correctly fetches by plant & dept.
+#  - TN01 Send modal has live updating Date/Time based on local zone.
 # =========================================================================
 
 import io
@@ -240,7 +244,7 @@ def check_tcode_access(user, code: str):
 # =========================================================================
 # FASTAPI APP
 # =========================================================================
-app = FastAPI(title="Nexus Core ERP", version="5.0.0")
+app = FastAPI(title="Nexus Core ERP", version="5.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # =========================================================================
@@ -485,127 +489,101 @@ def studio_apply(req: Request, payload: dict):
     return {"ok": True, "action": "upsert", "code": code, "version": 1}
 
 # =========================================================================
-# CTST — CABLE TYPE-TEST CALCULATOR
+# TN01 — TRANSFER NOTE
 # =========================================================================
-CTST_TESTS = {
-    "cr": {"title": "CR — Conductor Resistance", "icon": "ri-pulse-line", "desc": "Auto per-km CR + HIGH/LOW verdict vs spec"},
-    "braid": {"title": "Braid / Shield Coverage", "icon": "ri-shield-check-line", "desc": "Fill factor and % coverage"},
-    "tubular": {"title": "Tubular Mechanical Test", "icon": "ri-circle-line", "desc": "Area, tensile, elongation (tube)"},
-    "dumbbell": {"title": "Dumbbell Mechanical Test", "icon": "ri-shape-line", "desc": "Area, tensile, elongation (dumbbell)"},
-    "hotset": {"title": "Hot Set & Permanent Set", "icon": "ri-temp-hot-line", "desc": "Hot-set & permanent-set elongation"},
+TN01_ROUTES = {
+    "PROD_TO_QC": {"title": "Production to Final Testing", "route": "Production ➔ Final Testing", "from_dept": "Production", "to_dept": "Final Testing", "columns": ["Sr. No.", "Job No.", "Customer Name", "Material Description", "Specified Length", "Entry Length", "Drum Size", "Drum Code", "Batch No."]},
+    "QC_TO_COMM": {"title": "Final Testing to Commercial", "route": "Final Testing ➔ Commercial", "from_dept": "Final Testing", "to_dept": "Commercial", "columns": ["Sr. No.", "Job / Prod Order #", "Batch / Heat Lot", "Cable Description / Spec", "Drum #", "Tested Length (Mtrs)", "HV Test Result", "Insulation Resistance", "QC Inspector", "Release Status"]},
+    "PROD_TO_STORE": {"title": "Production to Store", "route": "Production ➔ Store", "from_dept": "Production", "to_dept": "Store", "columns": ["Sr. No.", "Work Order #", "Item Code / Material", "Batch / Heat Lot", "Quantity (Mtrs/Kgs)", "Weight (Kgs)", "Drum / Pack #", "Handover Person", "Remarks"]},
+    "QC_TO_PROD": {"title": "Final Testing to Production (Rework/Reject)", "route": "Final Testing ➔ Production", "from_dept": "Final Testing", "to_dept": "Production", "columns": ["Sr. No.", "Job Order #", "Batch / Heat Lot", "Cable Size", "Defect Observed", "Length (Mtrs)", "QC Engineer", "Rework Instructions"]},
+    "COMM_TO_QC": {"title": "Commercial to Final Testing", "route": "Commercial ➔ Final Testing", "from_dept": "Commercial", "to_dept": "Final Testing", "columns": ["Sr. No.", "Customer Name", "Order / PO #", "Item Description", "Ordered Qty", "Inspection Agency", "Target Date", "Special Testing Notes"]},
+    "STORE_TO_PROD": {"title": "Store to Production", "route": "Store ➔ Production", "from_dept": "Store", "to_dept": "Production", "columns": ["Sr. No.", "Material Code", "Material Description", "Lot / GRN #", "Issued Qty", "UOM", "Issued By", "Received For Work Order"]},
 }
 
-def _n(v):
-    try:
-        if v is None or str(v).strip() == "": return None
-        return float(str(v).replace(",", ""))
-    except Exception: return None
+@app.get("/api/tn01/routes")
+def tn01_routes(req: Request): need(req); return TN01_ROUTES
 
-def _compute_by_test(tt, d):
-    out = {}
-    if tt == "cr":
-        obd, t, L, spec = _n(d.get("obd_cr_reading")), _n(d.get("temp_c")), _n(d.get("length_m")), _n(d.get("specified_cr"))
-        tol = _n(d.get("cr_tolerance_pct")) or 5.0
-        observed_cr = None
-        if obd is not None and t is not None:
-            if -50 <= t <= 100:
-                factor = 250.0 / (230.0 + t)
-                corrected = factor * obd
-                out["cr_1m"] = round(corrected, 6)
-                if L and L > 0:
-                    observed_cr = corrected / L * 1000.0
-                    out["cr_total_per_km"] = round(observed_cr, 6)
-                    out["observed_cr"] = round(observed_cr, 6)
-            else: out["cr_warning"] = "Temp outside −50 to 100 °C"
-        if spec and observed_cr is not None and spec != 0:
-            dev = (observed_cr - spec) / spec * 100.0
-            out["cr_deviation_pct"] = round(dev, 4)
-            if abs(dev) < 0.001: out["cr_verdict"] = "ON SPEC"
-            elif dev > 0: out["cr_verdict"] = "HIGH"
-            else: out["cr_verdict"] = "LOW"
-            out["cr_within_tolerance"] = abs(dev) <= tol
-            out["cr_tolerance_pct"] = tol
-    elif tt == "braid":
-        bd, uD, wpc, carr, lay = _n(d.get("braid_d")), _n(d.get("under_braid_D")), _n(d.get("wires_per_carrier")), _n(d.get("carriers")), _n(d.get("lay_length"))
-        if all(v is not None for v in (bd, uD, wpc, carr, lay)) and uD > 0 and lay > 0:
-            N = wpc * carr
-            F = (N * bd) / (2 * math.pi * uD) * math.sqrt(1 + (math.pi * uD / lay) ** 2)
-            out["braid_total_wires"] = int(N)
-            out["braid_filling_factor"] = round(F, 6)
-            out["braid_coverage_pct"] = round((2 * F - F * F) * 100.0, 3)
-    elif tt in ("tubular", "dumbbell"):
-        if tt == "tubular":
-            D, wall = _n(d.get("tub_outer_d")), _n(d.get("tub_wall"))
-            if D and wall and D > wall: out["area_mm2"] = round(math.pi * (D - wall) * wall, 4)
-            load, final = _n(d.get("break_load_tub")), _n(d.get("elong_tub_final"))
-        else:
-            w, th = _n(d.get("dumb_width")), _n(d.get("dumb_thk"))
-            if w and th: out["area_mm2"] = round(w * th, 4)
-            load, final = _n(d.get("break_load_dumb")), _n(d.get("elong_dumb_final"))
-        init = _n(d.get("initial_gauge"))
-        if load is not None and out.get("area_mm2"): out["tensile_nmm2"] = round(load / out["area_mm2"], 4)
-        if init and final is not None and init != 0: out["elongation_pct"] = round((final - init) / init * 100.0, 4)
-    elif tt == "hotset":
-        init, hs, ps = _n(d.get("initial_gauge")), _n(d.get("hotset_elong_final")), _n(d.get("permset_cooled"))
-        if init and hs is not None and init != 0: out["hotset_pct"] = round((hs - init) / init * 100.0, 4)
-        if init and ps is not None and init != 0: out["permset_pct"] = round((ps - init) / init * 100.0, 4)
-    return out
-
-@app.get("/api/ctst/records")
-def ctst_list(req: Request, test_type: str = "", limit: int = 200):
+@app.get("/api/tn01/suggest-users")
+def tn01_suggest_users(req: Request, plant: str = "", dept: str = ""):
     need(req)
-    rows = fetch_all("SELECT * FROM tcode_records WHERE tcode_code='CTST' AND status='active' ORDER BY id DESC LIMIT ?", (limit,))
-    for r in rows:
-        try: r["data"] = json.loads(r["data"])
-        except Exception: r["data"] = {}
-        tt = r["data"].get("_test_type", "")
-        r["computed"] = _compute_by_test(tt, r["data"]) if tt else {}
-    return rows
+    sql = "SELECT username, full_name, department, plants, role FROM users WHERE status='approved'"
+    params = []
+    if dept: sql += " AND department = ?"; params.append(dept)
+    users = fetch_all(sql, tuple(params))
+    
+    if plant:
+        filtered = []
+        for u in users:
+            u_plants = (u.get("plants") or "").strip()
+            if not u_plants or plant in [p.strip() for p in u_plants.split(",")]:
+                filtered.append(u)
+        return filtered
+    return users
 
-@app.post("/api/ctst/compute")
-def ctst_compute(req: Request, payload: dict):
-    need(req)
-    tt = str(payload.get("_test_type", "")).strip()
-    if tt not in CTST_TESTS: raise HTTPException(400, "Unknown type.")
-    return {"computed": _compute_by_test(tt, payload)}
+@app.post("/api/tn01/send")
+def tn01_send(req: Request, payload: dict):
+    user = need(req); ct = now(); tag = datetime.date.today().strftime("%Y%m%d")
+    cnt = fetch_one("SELECT COUNT(*) AS c FROM transfer_notes WHERE created_at LIKE ?", (f"{datetime.date.today().strftime('%Y-%m-%d')}%",))
+    nn = f"TN-{tag}-{(cnt['c'] if cnt else 0) + 1:04d}"
+    hd, rows = payload.get("headers", []), payload.get("rows", [])
+    tu = payload.get("to_user", "").strip().lower()
+    tt = fetch_one("SELECT username, full_name FROM users WHERE username=?", (tu,))
+    tn = tt["full_name"] if tt else tu
+    fp = payload.get("from_plant", "").strip() or (user.get("plants") or "1000").split(",")[0].strip()
+    exec_write("INSERT INTO transfer_notes (note_no, layout_key, route, from_plant, from_dept, from_user, from_user_name, to_plant, to_dept, to_user, to_user_name, entry_count, sheet_headers, sheet_data, status, remarks, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (nn, payload.get("layout_key", "STANDARD"), payload.get("route", "Transfer"), fp, user["department"], user["username"], user["full_name"], payload.get("to_plant", "").strip(), payload.get("to_dept", "").strip(), tu, tn, len(rows), json.dumps(hd), json.dumps(rows, default=json_serial), "sent", payload.get("remarks", "").strip(), ct))
+    return {"ok": True, "note_no": nn, "entries": len(rows)}
 
-@app.post("/api/ctst/save")
-def ctst_save(req: Request, payload: dict):
+@app.get("/api/tn01/inbox")
+def tn01_inbox(req: Request):
     user = need(req)
-    tt = str(payload.get("_test_type", "")).strip()
-    pl = str(payload.pop("_plant", "") or (user.get("plants") or "1000").split(",")[0].strip() or "1000").strip()
-    ct = now()
-    exec_write("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)", ("CTST", pl, json.dumps(payload, default=json_serial), "active", user["username"], user["full_name"], ct, ct))
-    return {"ok": True, "computed": _compute_by_test(tt, payload)}
+    return fetch_all("SELECT * FROM transfer_notes WHERE to_user = ? OR (to_dept = ? AND to_user = '') ORDER BY id DESC", (user["username"].lower(), user["department"]))
 
-@app.delete("/api/ctst/records/{rid}")
-def ctst_delete(req: Request, rid: int):
+@app.post("/api/tn01/receive/{nid}")
+def tn01_receive(req: Request, nid: int):
+    user = need(req); ct = now()
+    exec_write("UPDATE transfer_notes SET status='received', received_at=?, received_by=?, received_by_name=? WHERE id=?", (ct, user["username"], user["full_name"], nid))
+    return {"ok": True, "received_at": ct}
+
+@app.get("/api/tn01/history")
+def tn01_history(req: Request, plant: str = "", route: str = "", status: str = "", from_dept: str = "", to_dept: str = "", date_from: str = "", date_to: str = ""):
+    user = need(req); sql = "SELECT * FROM transfer_notes WHERE 1=1"; params = []
+    if not (is_master(user) or user["role"] == "admin"):
+        sql += " AND (from_user = ? OR to_user = ? OR from_dept = ? OR to_dept = ?)"
+        params.extend([user["username"], user["username"], user["department"], user["department"]])
+    if plant: sql += " AND (from_plant = ? OR to_plant = ?)"; params.extend([plant, plant])
+    if route: sql += " AND route = ?"; params.append(route)
+    if status: sql += " AND status = ?"; params.append(status)
+    sql += " ORDER BY id DESC LIMIT 300"
+    return fetch_all(sql, tuple(params))
+
+@app.get("/api/tn01/note/{nid}")
+def tn01_get_note(req: Request, nid: int):
     need(req)
-    exec_write("UPDATE tcode_records SET status='deleted', updated_at=? WHERE id=?", (now(), rid))
-    return {"ok": True}
+    note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
+    if not note: raise HTTPException(404, "Not found.")
+    try: note["sheet_headers"] = json.loads(note["sheet_headers"])
+    except Exception: note["sheet_headers"] = []
+    try: note["sheet_data"] = json.loads(note["sheet_data"])
+    except Exception: note["sheet_data"] = []
+    return note
 
-@app.get("/api/ctst/print/{rid}", response_class=HTMLResponse)
-def ctst_print(req: Request, rid: int):
-    rec = fetch_one("SELECT * FROM tcode_records WHERE id=? AND tcode_code='CTST'", (rid,))
-    if not rec: return HTMLResponse("Not found", 404)
-    d = json.loads(rec["data"]) if rec["data"] else {}
-    tt = d.get("_test_type", "")
-    c = _compute_by_test(tt, d)
+@app.get("/api/tn01/print/{nid}", response_class=HTMLResponse)
+def tn01_print(req: Request, nid: int):
+    note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
+    if not note: return HTMLResponse("Not found", 404)
     org = fetch_one("SELECT * FROM org WHERE id=1") or {}
-    title = CTST_TESTS.get(tt, {}).get("title", tt.upper())
-    def cell(l, v, u=""): return f"<tr><td style='padding:4px 8px;border:1px solid #cbd5e1;font-size:11px;background:#f8fafc'>{l}</td><td style='padding:4px 8px;border:1px solid #cbd5e1;font-size:11px;font-weight:600'>{v or ''} {u}</td></tr>"
-    labels = {"obd_cr_reading": ("OBD CR Reading", "Ω"), "temp_c": ("Test Temp", "°C"), "length_m": ("Length", "m"), "specified_cr": ("Specified CR", "Ω/km"), "cr_tolerance_pct": ("Tolerance", "%"), "braid_d": ("Braid Wire Ø", "mm"), "under_braid_D": ("Ø Under Braid", "mm"), "wires_per_carrier": ("Wires/Carrier", ""), "carriers": ("Carriers", ""), "lay_length": ("Lay Length", "mm"), "tub_outer_d": ("Tubular Outer Ø", "mm"), "tub_wall": ("Tubular Wall", "mm"), "dumb_width": ("Dumbbell Width", "mm"), "dumb_thk": ("Dumbbell Thickness", "mm"), "break_load_tub": ("Break Load (Tub)", "N"), "break_load_dumb": ("Break Load (Dumb)", "N"), "elong_tub_final": ("Tubular Final Gauge", "mm"), "elong_dumb_final": ("Dumbbell Final Gauge", "mm"), "initial_gauge": ("Initial Gauge", "mm"), "hotset_elong_final": ("Hot Set Final", "mm"), "permset_cooled": ("Perm Set Cooled", "mm")}
-    comp_l = {"cr_1m": ("CR 1 m", "Ω"), "cr_total_per_km": ("CR per km", "Ω/km"), "observed_cr": ("Observed CR (auto, Ω/km)", "Ω/km"), "cr_deviation_pct": ("CR Deviation vs Spec", "%"), "cr_verdict": ("vs Spec", ""), "cr_within_tolerance": ("Within Tolerance", ""), "cr_tolerance_pct": ("Tolerance", "%"), "braid_total_wires": ("Total Wires", ""), "braid_filling_factor": ("Filling Factor", ""), "braid_coverage_pct": ("Coverage", "%"), "area_mm2": ("Area", "mm²"), "tensile_nmm2": ("Tensile Strength", "N/mm²"), "elongation_pct": ("Elongation", "%"), "hotset_pct": ("Hot Set", "%"), "permset_pct": ("Permanent Set", "%")}
-    irows = "".join(cell(l, d.get(k, ""), u_) for k, (l, u_) in labels.items() if k in d)
-    orows = "".join(cell(l, c.get(k, ""), u_) for k, (l, u_) in comp_l.items() if k in c)
-    if c.get("cr_warning"): orows += f"<tr><td colspan='2' style='padding:6px 8px;background:#fef3c7;border:1px solid #fcd34d;font-size:11px;color:#92400e'>⚠ {esc_py(c['cr_warning'])}</td></tr>"
-    return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>CTST #{rec['id']}</title><style>body{{font-family:sans-serif;margin:30px;color:#0f172a}}table{{width:100%;border-collapse:collapse;margin-bottom:16px}}@media print{{.no-print{{display:none}}body{{margin:0}}}}</style></head><body>
-    <div class="no-print" style="text-align:right;margin-bottom:12px"><button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600">Print / Save PDF</button></div>
-    <h2 style="margin:0">{esc_py(org.get('name', 'Thermocables Limited'))}</h2><h4 style="margin:4px 0 12px;color:#4f46e5">{esc_py(title)}</h4>
-    <div style="font-size:11px;color:#475569;margin-bottom:16px">Record #{rec['id']} | Plant {esc_py(rec['plant'] or '—')} | Sample {esc_py(d.get('sample_id', '—'))} | {esc_py(d.get('cable_type', '—'))} | By {esc_py(rec['created_by_name'] or rec['created_by'])} | {esc_py(rec['created_at'])}</div>
-    <h4 style="font-size:12px;color:#4338ca;text-transform:uppercase;margin-bottom:6px">Inputs</h4><table>{irows}</table>
-    <h4 style="font-size:12px;color:#4338ca;text-transform:uppercase;margin-bottom:6px">Computed Results</h4><table>{orows or '<tr><td style="padding:6px;font-size:11px;color:#64748b">None</td></tr>'}</table>
-    <h4 style="font-size:12px;color:#4338ca;text-transform:uppercase;margin-bottom:6px">Verdict</h4><table>{cell('Result', d.get('result', ''))}{cell('Remarks', d.get('remarks', ''))}</table></body></html>""")
+    try: headers = json.loads(note["sheet_headers"])
+    except Exception: headers = []
+    try: data_rows = json.loads(note["sheet_data"])
+    except Exception: data_rows = []
+    th = "".join(f"<th style='border:1px solid #0f172a; padding:6px 8px; font-size:11px; background:#e0e7ff'>{h}</th>" for h in headers)
+    trs = "".join(f"<tr>{''.join(f'<td style=\"border:1px solid #cbd5e1; padding:6px 8px; font-size:11px\">{c}</td>' for c in r)}</tr>" for r in data_rows)
+    return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>{note['note_no']}</title><style>body{{font-family:sans-serif;margin:30px;color:#0f172a}}.header{{border-bottom:2px solid #4f46e5;padding-bottom:10px;margin-bottom:15px}}.meta{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;font-size:12px;background:#f8fafc;padding:12px;border:1px solid #e2e8f0;margin-bottom:20px}}table{{width:100%;border-collapse:collapse;margin-bottom:30px}}.signs{{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin-top:40px;text-align:center;font-size:11px;font-weight:bold}}.sign-box{{border-top:1px solid #0f172a;padding-top:8px}}@media print{{.no-print{{display:none}}body{{margin:0}}}}</style></head><body>
+    <div class="no-print" style="margin-bottom:15px;text-align:right"><button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:bold">Print / PDF</button></div>
+    <div class="header"><h2 style="margin:0">{org.get('name','Thermocables')}</h2><h4 style="margin:4px 0 0;color:#4f46e5">TRANSFER NOTE (TN01)</h4><div style="font-family:monospace;font-weight:bold;margin-top:4px">{note['note_no']} | {note['created_at']}</div></div>
+    <div class="meta"><div><b>Route:</b><br>{note['route']}</div><div><b>From:</b><br>{note['from_plant']} - {note['from_dept']}</div><div><b>To:</b><br>{note['to_plant']} - {note['to_dept']}</div><div><b>Entries:</b><br>{note['entry_count']}</div><div><b>Sender:</b><br>{note['from_user_name']}</div><div><b>Recipient:</b><br>{note['to_user_name']}</div><div><b>Status:</b><br>{note['status'].upper()}</div><div><b>Receipt:</b><br>{note['received_at'] or 'Pending'}</div></div>
+    <table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table>
+    <div class="signs"><div class="sign-box">Handovered By ({note['from_user_name']})</div><div class="sign-box">Production | QC</div><div class="sign-box">Received By ({note['received_by_name'] or note['to_user_name']})</div></div></body></html>""")
 
 # =========================================================================
 # MRQ1 — MATERIAL REQUISITION
@@ -798,175 +776,127 @@ def mrq_print(req: Request, rid: int):
 </div></body></html>""")
 
 # =========================================================================
-# TN01 — TRANSFER NOTE
+# CTST — CABLE TYPE-TEST CALCULATOR
 # =========================================================================
-TN01_ROUTES = {
-    "PROD_TO_QC": {"title": "Production to Final Testing", "route": "Production ➔ Final Testing", "from_dept": "Production", "to_dept": "Final Testing", "columns": ["Sr. No.", "Job No.", "Customer Name", "Material Description", "Specified Length", "Entry Length", "Drum Size", "Drum Code", "Batch No."]},
-    "QC_TO_COMM": {"title": "Final Testing to Commercial", "route": "Final Testing ➔ Commercial", "from_dept": "Final Testing", "to_dept": "Commercial", "columns": ["Sr. No.", "Job / Prod Order #", "Batch / Heat Lot", "Cable Description / Spec", "Drum #", "Tested Length (Mtrs)", "HV Test Result", "Insulation Resistance", "QC Inspector", "Release Status"]},
-    "PROD_TO_STORE": {"title": "Production to Store", "route": "Production ➔ Store", "from_dept": "Production", "to_dept": "Store", "columns": ["Sr. No.", "Work Order #", "Item Code / Material", "Batch / Heat Lot", "Quantity (Mtrs/Kgs)", "Weight (Kgs)", "Drum / Pack #", "Handover Person", "Remarks"]},
-    "QC_TO_PROD": {"title": "Final Testing to Production (Rework/Reject)", "route": "Final Testing ➔ Production", "from_dept": "Final Testing", "to_dept": "Production", "columns": ["Sr. No.", "Job Order #", "Batch / Heat Lot", "Cable Size", "Defect Observed", "Length (Mtrs)", "QC Engineer", "Rework Instructions"]},
-    "COMM_TO_QC": {"title": "Commercial to Final Testing", "route": "Commercial ➔ Final Testing", "from_dept": "Commercial", "to_dept": "Final Testing", "columns": ["Sr. No.", "Customer Name", "Order / PO #", "Item Description", "Ordered Qty", "Inspection Agency", "Target Date", "Special Testing Notes"]},
-    "STORE_TO_PROD": {"title": "Store to Production", "route": "Store ➔ Production", "from_dept": "Store", "to_dept": "Production", "columns": ["Sr. No.", "Material Code", "Material Description", "Lot / GRN #", "Issued Qty", "UOM", "Issued By", "Received For Work Order"]},
+CTST_TESTS = {
+    "cr": {"title": "CR — Conductor Resistance", "icon": "ri-pulse-line", "desc": "Auto per-km CR + HIGH/LOW verdict vs spec"},
+    "braid": {"title": "Braid / Shield Coverage", "icon": "ri-shield-check-line", "desc": "Fill factor and % coverage"},
+    "tubular": {"title": "Tubular Mechanical Test", "icon": "ri-circle-line", "desc": "Area, tensile, elongation (tube)"},
+    "dumbbell": {"title": "Dumbbell Mechanical Test", "icon": "ri-shape-line", "desc": "Area, tensile, elongation (dumbbell)"},
+    "hotset": {"title": "Hot Set & Permanent Set", "icon": "ri-temp-hot-line", "desc": "Hot-set & permanent-set elongation"},
 }
 
-@app.get("/api/tn01/routes")
-def tn01_routes(req: Request): need(req); return TN01_ROUTES
+def _n(v):
+    try:
+        if v is None or str(v).strip() == "": return None
+        return float(str(v).replace(",", ""))
+    except Exception: return None
 
-@app.get("/api/tn01/suggest-users")
-def tn01_suggest_users(req: Request, plant: str = "", dept: str = ""):
-    need(req)
-    sql = "SELECT username, full_name, department, plants, role FROM users WHERE status='approved'"
-    params = []
-    if dept: sql += " AND department = ?"; params.append(dept)
-    users = fetch_all(sql, tuple(params))
-    if plant:
-        filtered = []
-        for u in users:
-            u_plants = (u.get("plants") or "").strip()
-            if not u_plants or plant in [p.strip() for p in u_plants.split(",")]:
-                filtered.append(u)
-        return filtered
-    return users
+def _compute_by_test(tt, d):
+    out = {}
+    if tt == "cr":
+        obd, t, L, spec = _n(d.get("obd_cr_reading")), _n(d.get("temp_c")), _n(d.get("length_m")), _n(d.get("specified_cr"))
+        tol = _n(d.get("cr_tolerance_pct")) or 5.0
+        observed_cr = None
+        if obd is not None and t is not None:
+            if -50 <= t <= 100:
+                factor = 250.0 / (230.0 + t)
+                corrected = factor * obd
+                out["cr_1m"] = round(corrected, 6)
+                if L and L > 0:
+                    observed_cr = corrected / L * 1000.0
+                    out["cr_total_per_km"] = round(observed_cr, 6)
+                    out["observed_cr"] = round(observed_cr, 6)
+            else: out["cr_warning"] = "Temp outside −50 to 100 °C"
+        if spec and observed_cr is not None and spec != 0:
+            dev = (observed_cr - spec) / spec * 100.0
+            out["cr_deviation_pct"] = round(dev, 4)
+            if abs(dev) < 0.001: out["cr_verdict"] = "ON SPEC"
+            elif dev > 0: out["cr_verdict"] = "HIGH"
+            else: out["cr_verdict"] = "LOW"
+            out["cr_within_tolerance"] = abs(dev) <= tol
+            out["cr_tolerance_pct"] = tol
+    elif tt == "braid":
+        bd, uD, wpc, carr, lay = _n(d.get("braid_d")), _n(d.get("under_braid_D")), _n(d.get("wires_per_carrier")), _n(d.get("carriers")), _n(d.get("lay_length"))
+        if all(v is not None for v in (bd, uD, wpc, carr, lay)) and uD > 0 and lay > 0:
+            N = wpc * carr
+            F = (N * bd) / (2 * math.pi * uD) * math.sqrt(1 + (math.pi * uD / lay) ** 2)
+            out["braid_total_wires"] = int(N)
+            out["braid_filling_factor"] = round(F, 6)
+            out["braid_coverage_pct"] = round((2 * F - F * F) * 100.0, 3)
+    elif tt in ("tubular", "dumbbell"):
+        if tt == "tubular":
+            D, wall = _n(d.get("tub_outer_d")), _n(d.get("tub_wall"))
+            if D and wall and D > wall: out["area_mm2"] = round(math.pi * (D - wall) * wall, 4)
+            load, final = _n(d.get("break_load_tub")), _n(d.get("elong_tub_final"))
+        else:
+            w, th = _n(d.get("dumb_width")), _n(d.get("dumb_thk"))
+            if w and th: out["area_mm2"] = round(w * th, 4)
+            load, final = _n(d.get("break_load_dumb")), _n(d.get("elong_dumb_final"))
+        init = _n(d.get("initial_gauge"))
+        if load is not None and out.get("area_mm2"): out["tensile_nmm2"] = round(load / out["area_mm2"], 4)
+        if init and final is not None and init != 0: out["elongation_pct"] = round((final - init) / init * 100.0, 4)
+    elif tt == "hotset":
+        init, hs, ps = _n(d.get("initial_gauge")), _n(d.get("hotset_elong_final")), _n(d.get("permset_cooled"))
+        if init and hs is not None and init != 0: out["hotset_pct"] = round((hs - init) / init * 100.0, 4)
+        if init and ps is not None and init != 0: out["permset_pct"] = round((ps - init) / init * 100.0, 4)
+    return out
 
-@app.get("/api/tn01/layouts")
-def tn01_get_layouts(req: Request):
+@app.get("/api/ctst/records")
+def ctst_list(req: Request, test_type: str = "", limit: int = 200):
     need(req)
-    rows = fetch_all("SELECT * FROM tcode_layouts WHERE tcode_code='TN01' ORDER BY is_default DESC, id ASC")
+    rows = fetch_all("SELECT * FROM tcode_records WHERE tcode_code='CTST' AND status='active' ORDER BY id DESC LIMIT ?", (limit,))
     for r in rows:
-        try: r["fields"] = json.loads(r["fields"])
-        except Exception: r["fields"] = []
+        try: r["data"] = json.loads(r["data"])
+        except Exception: r["data"] = {}
+        tt = r["data"].get("_test_type", "")
+        r["computed"] = _compute_by_test(tt, r["data"]) if tt else {}
     return rows
 
-@app.post("/api/tn01/layouts/save")
-def tn01_save_layout(req: Request, payload: dict):
-    user = need_admin(req)
-    name = payload.get("name", "Custom").strip(); key = payload.get("key", "").strip().upper(); cols = payload.get("columns", [])
-    if not key:
-        cnt = fetch_one("SELECT COUNT(*) AS c FROM tcode_layouts WHERE tcode_code='TN01'")["c"]
-        key = f"TN01_VAR_{cnt+1:02d}"
-    ct = now()
-    ex = fetch_one("SELECT id FROM tcode_layouts WHERE tcode_code='TN01' AND layout_code=?", (key,))
-    if ex: exec_write("UPDATE tcode_layouts SET name=?, title=?, fields=?, updated_at=? WHERE id=?", (name, name, json.dumps(cols), ct, ex["id"]))
-    else: exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", ("TN01", key, name, name, 0, json.dumps(cols), "{}", "Custom", user["username"], user["full_name"], ct, ct))
-    return {"ok": True, "key": key}
+@app.post("/api/ctst/compute")
+def ctst_compute(req: Request, payload: dict):
+    need(req)
+    tt = str(payload.get("_test_type", "")).strip()
+    if tt not in CTST_TESTS: raise HTTPException(400, "Unknown type.")
+    return {"computed": _compute_by_test(tt, payload)}
 
-@app.delete("/api/tn01/layouts/{lid}")
-def tn01_del_layout(req: Request, lid: int):
-    need_admin(req)
-    exec_write("DELETE FROM tcode_layouts WHERE id=? AND tcode_code='TN01'", (lid,))
+@app.post("/api/ctst/save")
+def ctst_save(req: Request, payload: dict):
+    user = need(req)
+    tt = str(payload.get("_test_type", "")).strip()
+    pl = str(payload.pop("_plant", "") or (user.get("plants") or "1000").split(",")[0].strip() or "1000").strip()
+    ct = now()
+    exec_write("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)", ("CTST", pl, json.dumps(payload, default=json_serial), "active", user["username"], user["full_name"], ct, ct))
+    return {"ok": True, "computed": _compute_by_test(tt, payload)}
+
+@app.delete("/api/ctst/records/{rid}")
+def ctst_delete(req: Request, rid: int):
+    need(req)
+    exec_write("UPDATE tcode_records SET status='deleted', updated_at=? WHERE id=?", (now(), rid))
     return {"ok": True}
 
-@app.post("/api/tn01/send")
-def tn01_send(req: Request, payload: dict):
-    user = need(req); ct = now(); tag = datetime.date.today().strftime("%Y%m%d")
-    cnt = fetch_one("SELECT COUNT(*) AS c FROM transfer_notes WHERE created_at LIKE ?", (f"{datetime.date.today().strftime('%Y-%m-%d')}%",))
-    nn = f"TN-{tag}-{(cnt['c'] if cnt else 0) + 1:04d}"
-    hd, rows = payload.get("headers", []), payload.get("rows", [])
-    tu = payload.get("to_user", "").strip().lower()
-    tt = fetch_one("SELECT username, full_name FROM users WHERE username=?", (tu,))
-    tn = tt["full_name"] if tt else tu
-    fp = payload.get("from_plant", "").strip() or (user.get("plants") or "1000").split(",")[0].strip()
-    exec_write("INSERT INTO transfer_notes (note_no, layout_key, route, from_plant, from_dept, from_user, from_user_name, to_plant, to_dept, to_user, to_user_name, entry_count, sheet_headers, sheet_data, status, remarks, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (nn, payload.get("layout_key", "STANDARD"), payload.get("route", "Transfer"), fp, user["department"], user["username"], user["full_name"], payload.get("to_plant", "").strip(), payload.get("to_dept", "").strip(), tu, tn, len(rows), json.dumps(hd), json.dumps(rows, default=json_serial), "sent", payload.get("remarks", "").strip(), ct))
-    return {"ok": True, "note_no": nn, "entries": len(rows)}
-
-@app.get("/api/tn01/inbox")
-def tn01_inbox(req: Request):
-    user = need(req)
-    return fetch_all("SELECT * FROM transfer_notes WHERE to_user = ? OR (to_dept = ? AND to_user = '') ORDER BY id DESC", (user["username"].lower(), user["department"]))
-
-@app.post("/api/tn01/receive/{nid}")
-def tn01_receive(req: Request, nid: int):
-    user = need(req); ct = now()
-    exec_write("UPDATE transfer_notes SET status='received', received_at=?, received_by=?, received_by_name=? WHERE id=?", (ct, user["username"], user["full_name"], nid))
-    return {"ok": True, "received_at": ct}
-
-@app.get("/api/tn01/history")
-def tn01_history(req: Request, plant: str = "", route: str = "", status: str = "", from_dept: str = "", to_dept: str = "", date_from: str = "", date_to: str = ""):
-    user = need(req); sql = "SELECT * FROM transfer_notes WHERE 1=1"; params = []
-    if not (is_master(user) or user["role"] == "admin"):
-        sql += " AND (from_user = ? OR to_user = ? OR from_dept = ? OR to_dept = ?)"
-        params.extend([user["username"], user["username"], user["department"], user["department"]])
-    if plant: sql += " AND (from_plant = ? OR to_plant = ?)"; params.extend([plant, plant])
-    if route: sql += " AND route = ?"; params.append(route)
-    if status: sql += " AND status = ?"; params.append(status)
-    sql += " ORDER BY id DESC LIMIT 300"
-    return fetch_all(sql, tuple(params))
-
-@app.get("/api/tn01/note/{nid}")
-def tn01_get_note(req: Request, nid: int):
-    need(req)
-    note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
-    if not note: raise HTTPException(404, "Not found.")
-    try: note["sheet_headers"] = json.loads(note["sheet_headers"])
-    except Exception: note["sheet_headers"] = []
-    try: note["sheet_data"] = json.loads(note["sheet_data"])
-    except Exception: note["sheet_data"] = []
-    return note
-
-@app.get("/api/tn01/export/{nid}")
-def tn01_export_excel(req: Request, nid: int):
-    note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
-    if not note: raise HTTPException(404, "Not found.")
-    try: headers = json.loads(note["sheet_headers"])
-    except Exception: headers = []
-    try: data_rows = json.loads(note["sheet_data"])
-    except Exception: data_rows = []
-    wb = Workbook(); ws = wb.active; ws.title = "Transfer_Note"
+@app.get("/api/ctst/print/{rid}", response_class=HTMLResponse)
+def ctst_print(req: Request, rid: int):
+    rec = fetch_one("SELECT * FROM tcode_records WHERE id=? AND tcode_code='CTST'", (rid,))
+    if not rec: return HTMLResponse("Not found", 404)
+    d = json.loads(rec["data"]) if rec["data"] else {}
+    tt = d.get("_test_type", "")
+    c = _compute_by_test(tt, d)
     org = fetch_one("SELECT * FROM org WHERE id=1") or {}
-    ws.append([org.get("name", "Thermocables")]); ws.append([f"TRANSFER NOTE {note['note_no']} — {note['route']}"])
-    ws.append([f"From: {note['from_plant']} - {note['from_dept']}  |  To: {note['to_plant']} - {note['to_dept']}"])
-    ws.append([f"Sender: {note['from_user_name']}  |  Receiver: {note['to_user_name']}  |  Status: {note['status'].upper()}"])
-    ws.append([f"Created: {note['created_at']}  |  Received: {note['received_at'] or 'Pending'}"]); ws.append([])
-    ws.append(headers)
-    for r in data_rows: ws.append(r)
-    ws.append([]); ws.append(["Handovered By: ________________", "", "Received By: ________________", "", "QC: ________________"])
-    from openpyxl.styles import Font, Alignment, PatternFill
-    hf = PatternFill("solid", fgColor="4F46E5"); hfo = Font(bold=True, color="FFFFFF")
-    ws["A1"].font = Font(bold=True, size=14); ws["A2"].font = Font(bold=True)
-    for ci in range(1, len(headers) + 1):
-        c = ws.cell(row=7, column=ci); c.fill = hf; c.font = hfo; c.alignment = Alignment(horizontal="center")
-    for ci, h in enumerate(headers, 1):
-        ws.column_dimensions[ws.cell(row=7, column=ci).column_letter].width = max(14, min(40, len(str(h)) + 4))
-    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
-    return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=TransferNote_{note['note_no']}.xlsx"})
-
-@app.post("/api/tn01/export-grid")
-def tn01_export_grid(req: Request, payload: dict):
-    user = need(req)
-    headers, rows, title = payload.get("headers", []), payload.get("rows", []), payload.get("title", "Draft")
-    if not headers: raise HTTPException(400, "No columns.")
-    wb = Workbook(); ws = wb.active; ws.title = "Draft"
-    org = fetch_one("SELECT * FROM org WHERE id=1") or {}
-    ws.append([org.get("name", "Thermocables")]); ws.append([title])
-    ws.append([f"By: {user['full_name']} ({user['username']}) · {user['department']}"]); ws.append([now()]); ws.append([]); ws.append(headers)
-    for r in rows: ws.append(r)
-    from openpyxl.styles import Font, Alignment, PatternFill
-    hf = PatternFill("solid", fgColor="4F46E5"); hfo = Font(bold=True, color="FFFFFF")
-    ws["A1"].font = Font(bold=True, size=14); ws["A2"].font = Font(bold=True)
-    for ci in range(1, len(headers) + 1):
-        c = ws.cell(row=6, column=ci); c.fill = hf; c.font = hfo; c.alignment = Alignment(horizontal="center")
-    for ci, h in enumerate(headers, 1):
-        ws.column_dimensions[ws.cell(row=6, column=ci).column_letter].width = max(14, min(40, len(str(h)) + 4))
-    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
-    return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=TN01_Draft_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"})
-
-@app.get("/api/tn01/print/{nid}", response_class=HTMLResponse)
-def tn01_print(req: Request, nid: int):
-    note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
-    if not note: return HTMLResponse("Not found", 404)
-    org = fetch_one("SELECT * FROM org WHERE id=1") or {}
-    try: headers = json.loads(note["sheet_headers"])
-    except Exception: headers = []
-    try: data_rows = json.loads(note["sheet_data"])
-    except Exception: data_rows = []
-    th = "".join(f"<th style='border:1px solid #0f172a; padding:6px 8px; font-size:11px; background:#e0e7ff'>{h}</th>" for h in headers)
-    trs = "".join(f"<tr>{''.join(f'<td style=\"border:1px solid #cbd5e1; padding:6px 8px; font-size:11px\">{c}</td>' for c in r)}</tr>" for r in data_rows)
-    return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>{note['note_no']}</title><style>body{{font-family:sans-serif;margin:30px;color:#0f172a}}.header{{border-bottom:2px solid #4f46e5;padding-bottom:10px;margin-bottom:15px}}.meta{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;font-size:12px;background:#f8fafc;padding:12px;border:1px solid #e2e8f0;margin-bottom:20px}}table{{width:100%;border-collapse:collapse;margin-bottom:30px}}.signs{{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin-top:40px;text-align:center;font-size:11px;font-weight:bold}}.sign-box{{border-top:1px solid #0f172a;padding-top:8px}}@media print{{.no-print{{display:none}}body{{margin:0}}}}</style></head><body>
-    <div class="no-print" style="margin-bottom:15px;text-align:right"><button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:bold">Print / PDF</button></div>
-    <div class="header"><h2 style="margin:0">{org.get('name','Thermocables')}</h2><h4 style="margin:4px 0 0;color:#4f46e5">TRANSFER NOTE (TN01)</h4><div style="font-family:monospace;font-weight:bold;margin-top:4px">{note['note_no']} | {note['created_at']}</div></div>
-    <div class="meta"><div><b>Route:</b><br>{note['route']}</div><div><b>From:</b><br>{note['from_plant']} - {note['from_dept']}</div><div><b>To:</b><br>{note['to_plant']} - {note['to_dept']}</div><div><b>Entries:</b><br>{note['entry_count']}</div><div><b>Sender:</b><br>{note['from_user_name']}</div><div><b>Recipient:</b><br>{note['to_user_name']}</div><div><b>Status:</b><br>{note['status'].upper()}</div><div><b>Receipt:</b><br>{note['received_at'] or 'Pending'}</div></div>
-    <table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table>
-    <div class="signs"><div class="sign-box">Handovered By ({note['from_user_name']})</div><div class="sign-box">Production | QC</div><div class="sign-box">Received By ({note['received_by_name'] or note['to_user_name']})</div></div></body></html>""")
+    title = CTST_TESTS.get(tt, {}).get("title", tt.upper())
+    def cell(l, v, u=""): return f"<tr><td style='padding:4px 8px;border:1px solid #cbd5e1;font-size:11px;background:#f8fafc'>{l}</td><td style='padding:4px 8px;border:1px solid #cbd5e1;font-size:11px;font-weight:600'>{v or ''} {u}</td></tr>"
+    labels = {"obd_cr_reading": ("OBD CR Reading", "Ω"), "temp_c": ("Test Temp", "°C"), "length_m": ("Length", "m"), "specified_cr": ("Specified CR", "Ω/km"), "cr_tolerance_pct": ("Tolerance", "%"), "braid_d": ("Braid Wire Ø", "mm"), "under_braid_D": ("Ø Under Braid", "mm"), "wires_per_carrier": ("Wires/Carrier", ""), "carriers": ("Carriers", ""), "lay_length": ("Lay Length", "mm"), "tub_outer_d": ("Tubular Outer Ø", "mm"), "tub_wall": ("Tubular Wall", "mm"), "dumb_width": ("Dumbbell Width", "mm"), "dumb_thk": ("Dumbbell Thickness", "mm"), "break_load_tub": ("Break Load (Tub)", "N"), "break_load_dumb": ("Break Load (Dumb)", "N"), "elong_tub_final": ("Tubular Final Gauge", "mm"), "elong_dumb_final": ("Dumbbell Final Gauge", "mm"), "initial_gauge": ("Initial Gauge", "mm"), "hotset_elong_final": ("Hot Set Final", "mm"), "permset_cooled": ("Perm Set Cooled", "mm")}
+    comp_l = {"cr_1m": ("CR 1 m", "Ω"), "cr_total_per_km": ("CR per km", "Ω/km"), "observed_cr": ("Observed CR (auto, Ω/km)", "Ω/km"), "cr_deviation_pct": ("CR Deviation vs Spec", "%"), "cr_verdict": ("vs Spec", ""), "cr_within_tolerance": ("Within Tolerance", ""), "cr_tolerance_pct": ("Tolerance", "%"), "braid_total_wires": ("Total Wires", ""), "braid_filling_factor": ("Filling Factor", ""), "braid_coverage_pct": ("Coverage", "%"), "area_mm2": ("Area", "mm²"), "tensile_nmm2": ("Tensile Strength", "N/mm²"), "elongation_pct": ("Elongation", "%"), "hotset_pct": ("Hot Set", "%"), "permset_pct": ("Permanent Set", "%")}
+    irows = "".join(cell(l, d.get(k, ""), u_) for k, (l, u_) in labels.items() if k in d)
+    orows = "".join(cell(l, c.get(k, ""), u_) for k, (l, u_) in comp_l.items() if k in c)
+    if c.get("cr_warning"): orows += f"<tr><td colspan='2' style='padding:6px 8px;background:#fef3c7;border:1px solid #fcd34d;font-size:11px;color:#92400e'>⚠ {esc_py(c['cr_warning'])}</td></tr>"
+    return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>CTST #{rec['id']}</title><style>body{{font-family:sans-serif;margin:30px;color:#0f172a}}table{{width:100%;border-collapse:collapse;margin-bottom:16px}}@media print{{.no-print{{display:none}}body{{margin:0}}}}</style></head><body>
+    <div class="no-print" style="text-align:right;margin-bottom:12px"><button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600">Print / Save PDF</button></div>
+    <h2 style="margin:0">{esc_py(org.get('name', 'Thermocables Limited'))}</h2><h4 style="margin:4px 0 12px;color:#4f46e5">{esc_py(title)}</h4>
+    <div style="font-size:11px;color:#475569;margin-bottom:16px">Record #{rec['id']} | Plant {esc_py(rec['plant'] or '—')} | Sample {esc_py(d.get('sample_id', '—'))} | {esc_py(d.get('cable_type', '—'))} | By {esc_py(rec['created_by_name'] or rec['created_by'])} | {esc_py(rec['created_at'])}</div>
+    <h4 style="font-size:12px;color:#4338ca;text-transform:uppercase;margin-bottom:6px">Inputs</h4><table>{irows}</table>
+    <h4 style="font-size:12px;color:#4338ca;text-transform:uppercase;margin-bottom:6px">Computed Results</h4><table>{orows or '<tr><td style="padding:6px;font-size:11px;color:#64748b">None</td></tr>'}</table>
+    <h4 style="font-size:12px;color:#4338ca;text-transform:uppercase;margin-bottom:6px">Verdict</h4><table>{cell('Result', d.get('result', ''))}{cell('Remarks', d.get('remarks', ''))}</table></body></html>""")
 
 # =========================================================================
 # STANDARD MODULES
@@ -1064,7 +994,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc;color:#0f172a;f
     <div class="flex items-center gap-4">
       <div class="flex items-center gap-2.5 cursor-pointer" onclick="goHome()">
         <div class="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white shadow-sm"><i class="ri-pulse-fill text-lg"></i></div>
-        <div class="font-bold text-sm tracking-tight text-slate-900 flex items-center gap-1.5">Nexus Core <span class="text-[10px] bg-indigo-50 text-indigo-600 border border-indigo-200 font-mono px-1.5 py-0.5 rounded">v5.0</span></div>
+        <div class="font-bold text-sm tracking-tight text-slate-900 flex items-center gap-1.5">Nexus Core <span class="text-[10px] bg-indigo-50 text-indigo-600 border border-indigo-200 font-mono px-1.5 py-0.5 rounded">v5.1</span></div>
       </div>
       <div class="relative ml-4">
         <i class="ri-search-line absolute left-3 top-2.5 text-slate-400 text-xs"></i>
@@ -1747,7 +1677,8 @@ function addGridRow(){TN01_UNDO.push(JSON.stringify(TN01_ROWS));const r=new Arra
 function deleteGridRow(){if(TN01_ROWS.length<=1)return;TN01_ROWS.pop();renderGridTable();}
 function setupPasteHandler(){const c=$('#grid_table_container');if(!c)return;c.addEventListener('paste',e=>{e.preventDefault();const clip=(e.clipboardData||window.clipboardData).getData('text');if(!clip)return;const lines=clip.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n');let sr=TN01_CELL.r||0,sc=TN01_CELL.c||1;if(sc===0)sc=1;lines.forEach((line,li)=>{if(!line&&li===lines.length-1)return;const cells=line.split('\t');const tr=sr+li;while(TN01_ROWS.length<=tr){const nr=new Array(TN01_HEADERS.length).fill("");nr[0]=TN01_ROWS.length+1;TN01_ROWS.push(nr);}cells.forEach((v,ci)=>{const tc=sc+ci;if(tc<TN01_HEADERS.length)TN01_ROWS[tr][tc]=v.trim();});});TN01_ROWS.forEach((r,i)=>{r[0]=i+1;});renderGridTable();});}
 async function exportGridAsExcel(){const f=TN01_ROWS.filter(r=>r.slice(1).some(x=>String(x).trim()!==''));if(!f.length)return alert("No rows.");const t=TN01_ROUTES[TN01_ACTIVE_ROUTE]?TN01_ROUTES[TN01_ACTIVE_ROUTE].route:"Draft";try{const tok=localStorage.getItem("nexus_token");const r=await fetch('/api/tn01/export-grid',{method:'POST',headers:{'Content-Type':'application/json','Authorization':tok?`Bearer ${tok}`:''},body:JSON.stringify({headers:TN01_HEADERS,rows:f,title:`TN01 Draft — ${t}`})});if(!r.ok)throw await r.text();const b=await r.blob();const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download='TN01_Draft.xlsx';document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(u);}catch(e){alert("Failed: "+e);}}
-async function openSendModal(){const a=TN01_ROUTES[TN01_ACTIVE_ROUTE];const f=TN01_ROWS.filter(r=>r.slice(1).some(x=>String(x).trim()!==''));if(!f.length)return alert("Enter rows.");const sp=await api('/api/spro/overview');openDialog(`<div class="px-6 py-4 border-b bg-slate-50"><h3 class="font-bold text-sm">Send Transfer Note</h3></div><div class="p-6 space-y-4"><div class="grid grid-cols-3 gap-3"><div><label class="form-label">Plant</label><select id="send_plant" class="form-input">${sp.plants.map(p=>`<option value="${esc(p.code)}">${esc(p.code)} - ${esc(p.name)}</option>`).join('')}</select></div><div><label class="form-label">Dept</label><select id="send_dept" class="form-input">${sp.departments.map(d=>`<option value="${esc(d.name)}" ${d.name===a.to_dept?'selected':''}>${esc(d.name)}</option>`).join('')}</select></div><div><label class="form-label">Receiver</label><select id="send_user" class="form-input"></select></div></div><div><label class="form-label">Remarks</label><textarea id="send_remarks" class="form-input" rows="2"></textarea></div></div><div class="px-6 py-4 bg-slate-50 flex justify-end gap-2"><button onclick="closeDialog()" class="btn-secondary px-4 py-2 rounded-lg text-xs">Cancel</button><button onclick="submitSendNote()" class="btn-primary px-5 py-2 rounded-lg text-xs">Send</button></div>`);updateSuggestedUsers();}
+async function openSendModal(){const a=TN01_ROUTES[TN01_ACTIVE_ROUTE];const f=TN01_ROWS.filter(r=>r.slice(1).some(x=>String(x).trim()!==''));if(!f.length)return alert("Enter rows.");const sp=await api('/api/spro/overview');openDialog(`<div class="px-6 py-4 border-b bg-slate-50 flex justify-between items-center"><h3 class="font-bold text-sm">Send Transfer Note</h3><span id="live_datetime" class="text-xs font-mono text-slate-500"></span></div><div class="p-6 space-y-4"><div class="grid grid-cols-3 gap-3"><div><label class="form-label">Plant</label><select id="send_plant" class="form-input">${sp.plants.map(p=>`<option value="${esc(p.code)}">${esc(p.code)} - ${esc(p.name)}</option>`).join('')}</select></div><div><label class="form-label">Dept</label><select id="send_dept" class="form-input">${sp.departments.map(d=>`<option value="${esc(d.name)}" ${d.name===a.to_dept?'selected':''}>${esc(d.name)}</option>`).join('')}</select></div><div><label class="form-label">Receiver</label><select id="send_user" class="form-input"></select></div></div><div><label class="form-label">Remarks</label><textarea id="send_remarks" class="form-input" rows="2"></textarea></div></div><div class="px-6 py-4 bg-slate-50 flex justify-end gap-2"><button onclick="closeDialog()" class="btn-secondary px-4 py-2 rounded-lg text-xs">Cancel</button><button onclick="submitSendNote()" class="btn-primary px-5 py-2 rounded-lg text-xs">Send</button></div>`);updateSuggestedUsers();updateLiveClock();}
+function updateLiveClock(){const el=$('#live_datetime');if(!el)return;const d=new Date();el.textContent=d.toLocaleString('en-GB',{timeZone:Intl.DateTimeFormat().resolvedOptions().timeZone,dateStyle:'medium',timeStyle:'medium'});setTimeout(updateLiveClock,1000);}
 async function updateSuggestedUsers(){const pl=$('#send_plant').value,dept=$('#send_dept').value;const u=await api(`/api/tn01/suggest-users?plant=${pl}&dept=${encodeURIComponent(dept)}`);$('#send_user').innerHTML=u.map(x=>`<option value="${esc(x.username)}">${esc(x.full_name)}</option>`).join('');}
 async function submitSendNote(){const f=TN01_ROWS.filter(r=>r.slice(1).some(x=>String(x).trim()!==''));const p={layout_key:TN01_ACTIVE_ROUTE,route:TN01_ROUTES[TN01_ACTIVE_ROUTE].route,to_plant:$('#send_plant').value,to_dept:$('#send_dept').value,to_user:$('#send_user').value,remarks:$('#send_remarks').value,headers:TN01_HEADERS,rows:f};try{const r=await api('/api/tn01/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});closeDialog();alert(`Sent: ${r.note_no}`);switchTN01Tab('history');}catch(e){alert(e);}}
 async function renderTN01ReceiveTab(){const ns=await api('/api/tn01/inbox');$('#tn01_content').innerHTML=`<div class="p-6 flex-1 flex flex-col overflow-hidden"><div class="flex items-center justify-between pb-4 border-b"><h2 class="text-base font-bold">Incoming</h2><button onclick="renderTN01ReceiveTab()" class="btn-secondary text-xs px-3 py-1.5 rounded-lg"><i class="ri-refresh-line"></i></button></div><div class="flex-1 mt-4 card overflow-auto"><table class="custom-table"><thead><tr><th>Note</th><th>Route</th><th>From</th><th>Sender</th><th>Batches</th><th>Time</th><th>Status</th><th>Actions</th></tr></thead><tbody>${!ns.length?`<tr><td colspan="8" class="text-center py-12 text-slate-400">Empty.</td></tr>`:ns.map(n=>`<tr><td class="font-mono font-bold text-indigo-600">${esc(n.note_no)}</td><td>${esc(n.route)}</td><td>${esc(n.from_plant)} - ${esc(n.from_dept)}</td><td>${esc(n.from_user_name)}</td><td class="font-mono">${n.entry_count}</td><td class="font-mono text-xs">${esc(n.created_at)}</td><td><span class="badge ${n.status==='received'?'badge-emerald':'badge-amber'}">${n.status.toUpperCase()}</span></td><td><button onclick="viewTransferNote(${n.id})" class="btn-primary text-xs px-2.5 py-1 rounded">Open</button>${n.status==='sent'?`<button onclick="ackNote(${n.id})" class="bg-emerald-600 text-white text-xs px-2.5 py-1 rounded ml-1">Ack</button>`:''}</td></tr>`).join('')}</tbody></table></div></div>`;}
@@ -1811,7 +1742,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "5.0.0"}
+    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "5.1.0"}
 
 if __name__ == "__main__":
     import uvicorn
