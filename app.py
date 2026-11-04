@@ -8,8 +8,9 @@
 #     Cancel, per-category req_no prefixes, single-material lookup,
 #     print access checks, issued_to_name fallback in PDF).
 #   - SU01: Edit user modal with plant picker restored.
-#   - PFCG: user-centric access matrix (AUTO / GRANTED / NO ACCESS / ADMIN)
-#     with inline grant/revoke.
+#   - PFCG: user-centric access matrix with inline grant/revoke.
+#   - MRQ1: Added Reports & Analytics tab with advanced filtering 
+#     (Date, Status, Category, Material, Plant, Dept) and Excel export.
 # =========================================================================
 
 import io
@@ -202,6 +203,15 @@ def init_db():
                 cur.execute(
                     "ALTER TABLE transfer_notes ADD COLUMN IF NOT EXISTS cc_users TEXT DEFAULT '';"
                 )
+            
+            # MRQ1 issued_at migration
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='mrq_requisitions' AND column_name='issued_at';"
+            )
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE mrq_requisitions ADD COLUMN issued_at TEXT;")
+
             conn.commit()
         except Exception as e:
             print("PG auto-migration notice:", e)
@@ -286,7 +296,7 @@ def init_db():
         f"from_dept TEXT NOT NULL, from_plant TEXT DEFAULT '', "
         f"to_dept TEXT DEFAULT 'Store', status TEXT DEFAULT 'pending', "
         f"remarks TEXT DEFAULT '', requested_by TEXT, requested_by_name TEXT, "
-        f"issued_by TEXT, issued_by_name TEXT, issued_to_name TEXT, "
+        f"issued_by TEXT, issued_by_name TEXT, issued_to_name TEXT, issued_at TEXT, "
         f"received_by TEXT, received_by_name TEXT, "
         f"created_at TEXT, updated_at TEXT, cancelled_at TEXT, "
         f"cancelled_by TEXT, cancel_reason TEXT DEFAULT '');"
@@ -766,18 +776,27 @@ def pfcg_matrix(req: Request):
 @app.api_route("/api/pfcg/grant", methods=["POST"])
 def pfcg_grant(req: Request, username: str = Form(...), tcode: str = Form(...)):
     caller = need_admin(req)
-    u, tc = username.strip(), tcode.upper().strip()
-    if USE_PG:
-        exec_write(
-            "INSERT INTO access_grants (username, tcode_code, granted_by, granted_at) "
-            "VALUES (?,?,?,?) ON CONFLICT (username, tcode_code) DO NOTHING",
-            (u, tc, caller["username"], now()),
-        )
-    else:
-        exec_write(
-            "INSERT OR IGNORE INTO access_grants (username, tcode_code, granted_by, granted_at) "
-            "VALUES (?,?,?,?)", (u, tc, caller["username"], now()),
-        )
+    u = str(username or "").strip()
+    tc = str(tcode or "").upper().strip()
+    if not u or not tc:
+        raise HTTPException(400, "Username and module code are required.")
+    try:
+        if USE_PG:
+            exec_write(
+                "INSERT INTO access_grants (username, tcode_code, granted_by, granted_at) "
+                "VALUES (?,?,?,?) ON CONFLICT (username, tcode_code) DO NOTHING",
+                (u, tc, caller["username"], now()),
+            )
+        else:
+            exec_write(
+                "INSERT OR IGNORE INTO access_grants "
+                "(username, tcode_code, granted_by, granted_at) "
+                "VALUES (?,?,?,?)",
+                (u, tc, caller["username"], now()),
+            )
+    except Exception as e:
+        print("pfcg_grant error:", e)
+        raise HTTPException(500, f"Grant failed: {str(e)}")
     return {"ok": True}
 
 
@@ -1882,8 +1901,8 @@ def mrq_issue(req: Request, rid: int, payload: dict = None):
     ct = now()
     exec_write(
         "UPDATE mrq_requisitions SET status='issued', issued_by=?, "
-        "issued_by_name=?, issued_to_name=?, updated_at=? WHERE id=?",
-        (user["username"], user["full_name"], issued_to_name, ct, rid),
+        "issued_by_name=?, issued_to_name=?, issued_at=?, updated_at=? WHERE id=?",
+        (user["username"], user["full_name"], issued_to_name, ct, ct, rid),
     )
     return {"ok": True}
 
@@ -1919,6 +1938,91 @@ def mrq_delete(req: Request, rid: int):
     exec_write("DELETE FROM mrq_lines WHERE req_id=?", (rid,))
     exec_write("DELETE FROM mrq_requisitions WHERE id=?", (rid,))
     return {"ok": True}
+
+
+@app.api_route("/api/mrq/reports", methods=["GET"])
+def mrq_reports(req: Request, date_from: str = "", date_to: str = "", 
+                category: str = "", material_code: str = "", plant: str = "", 
+                department: str = "", user: str = "", status: str = ""):
+    user_obj = need(req)
+    sql = """
+        SELECT r.*, l.material_code, l.description as material_desc, l.qty_required, 
+               l.qty_issued, l.batch_no, l.uom
+        FROM mrq_requisitions r
+        JOIN mrq_lines l ON r.id = l.req_id
+        WHERE 1=1
+    """
+    params = []
+    
+    is_admin = is_master(user_obj) or user_obj["role"] == "admin"
+    if not is_admin:
+        sql += " AND (r.from_dept = ? OR r.to_dept = ?)"
+        params.extend([user_obj["department"], user_obj["department"]])
+
+    if date_from:
+        sql += " AND r.created_at >= ?"
+        params.append(date_from + " 00:00:00")
+    if date_to:
+        sql += " AND r.created_at <= ?"
+        params.append(date_to + " 23:59:59")
+    if category:
+        sql += " AND r.category = ?"
+        params.append(category)
+    if material_code:
+        sql += " AND l.material_code = ?"
+        params.append(material_code.upper().strip())
+    if plant:
+        sql += " AND r.from_plant = ?"
+        params.append(plant)
+    if department:
+        sql += " AND (r.from_dept = ? OR r.to_dept = ?)"
+        params.extend([department, department])
+    if user:
+        sql += " AND (LOWER(r.requested_by) = ? OR LOWER(r.issued_by) = ? OR LOWER(r.issued_to_name) LIKE ?)"
+        params.extend([user.lower(), user.lower(), f"%{user.lower()}%"])
+    if status:
+        sql += " AND r.status = ?"
+        params.append(status)
+        
+    sql += " ORDER BY r.created_at DESC LIMIT 5000"
+    return fetch_all(sql, tuple(params))
+
+@app.api_route("/api/mrq/reports/export", methods=["GET"])
+def mrq_reports_export(req: Request, date_from: str = "", date_to: str = "", 
+                       category: str = "", material_code: str = "", plant: str = "", 
+                       department: str = "", user: str = "", status: str = ""):
+    rows = mrq_reports(req, date_from, date_to, category, material_code, plant, department, user, status)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "MRQ_Report"
+    headers = ["Req No", "Date", "Category", "Status", "From Dept", "To Dept", 
+               "Requested By", "Issued By", "Received/To", "Material Code", 
+               "Description", "Qty Req", "Qty Issued", "UOM", "Batch No"]
+    ws.append(headers)
+    for r in rows:
+        ws.append([
+            r["req_no"], r["created_at"], r["category"], r["status"].upper(),
+            r["from_dept"], r["to_dept"], r["requested_by_name"],
+            r["issued_by_name"] or "", r["received_by_name"] or r["issued_to_name"] or "",
+            r["material_code"], r["material_desc"], r["qty_required"],
+            r["qty_issued"], r["uom"], r["batch_no"]
+        ])
+    header_fill = PatternFill("solid", fgColor="4F46E5")
+    header_font = Font(bold=True, color="FFFFFF")
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+    for ci, h in enumerate(headers, 1):
+        ws.column_dimensions[ws.cell(row=1, column=ci).column_letter].width = max(12, len(h) + 4)
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=MRQ_Report_{datetime.date.today()}.xlsx"},
+    )
 
 
 @app.api_route("/api/mrq/print/{rid}", methods=["GET"], response_class=HTMLResponse)
@@ -3010,21 +3114,29 @@ let MRQ_CATEGORIES = {};
 let MRQ_ACTIVE_CATEGORY = null;
 let MRQ_CART = [];
 
-async function renderMRQ(category = null) {
+async function renderMRQ(category = null, tab = 'list') {
   if (category) {
     MRQ_ACTIVE_CATEGORY = category;
     return renderMRQForm(category);
   }
+  
   MRQ_CATEGORIES = await api('/api/mrq/categories');
-  const history = await api('/api/mrq/requisitions');
   const isAdmin = ME.is_master || ME.role === 'admin';
+
+  if (tab === 'reports') {
+    return renderMRQReports(MRQ_CATEGORIES);
+  }
+
+  const history = await api('/api/mrq/requisitions');
   $('#main_screen').innerHTML = `
     <div class="flex-1 flex flex-col p-6 overflow-hidden select-text">
       <div class="flex items-center justify-between pb-4 border-b border-slate-200 shrink-0">
         <div class="flex items-center gap-3">
           <span class="font-mono font-bold text-xs bg-emerald-600 text-white px-2.5 py-1 rounded-lg shadow-sm">MRQ1</span>
-          <div><h2 class="text-lg font-bold text-slate-900">Material Requisition</h2>
-          <p class="text-xs text-slate-500">Department → Stores material request</p></div>
+          <div class="flex items-center bg-slate-100 border border-slate-200 rounded-lg p-1 gap-1 text-xs font-semibold">
+            <button onclick="renderMRQ(null, 'list')" class="px-3 py-1.5 rounded-md transition bg-white text-emerald-600 shadow-sm">My Requisitions</button>
+            <button onclick="renderMRQ(null, 'reports')" class="px-3 py-1.5 rounded-md transition text-slate-500 hover:text-slate-800">Reports & Analytics</button>
+          </div>
         </div>
         <div class="flex items-center gap-2">
           ${isAdmin ? `<label class="btn-secondary text-xs font-semibold px-3 py-2 rounded-lg cursor-pointer flex items-center gap-1">
@@ -3034,7 +3146,7 @@ async function renderMRQ(category = null) {
           <button onclick="mrqViewMaterials()" class="btn-secondary text-xs font-semibold px-3 py-2 rounded-lg flex items-center gap-1">
             <i class="ri-eye-line text-indigo-500"></i> View Materials
           </button>
-          <button onclick="renderMRQ()" class="btn-secondary text-xs font-semibold p-2 rounded-lg">
+          <button onclick="renderMRQ(null, 'list')" class="btn-secondary text-xs font-semibold p-2 rounded-lg">
             <i class="ri-refresh-line"></i>
           </button>
         </div>
@@ -3058,7 +3170,7 @@ async function renderMRQ(category = null) {
       <div class="flex-1 mt-6 card overflow-hidden flex flex-col">
         <div class="p-3 border-b border-slate-200 bg-slate-50">
           <span class="text-xs font-bold text-slate-700 uppercase">
-            <i class="ri-history-line text-indigo-500"></i> History (${history.length})
+            <i class="ri-history-line text-indigo-500"></i> Recent Requisitions (${history.length})
           </span>
         </div>
         <div class="flex-1 overflow-auto">
@@ -3101,6 +3213,165 @@ async function renderMRQ(category = null) {
         </div>
       </div>
     </div>`;
+}
+
+async function renderMRQReports(CATS) {
+  const sp = await api('/api/spro/overview');
+  
+  $('#main_screen').innerHTML = `
+    <div class="flex-1 flex flex-col p-6 overflow-hidden select-text">
+      <div class="flex items-center justify-between pb-4 border-b border-slate-200 shrink-0">
+        <div class="flex items-center gap-3">
+          <span class="font-mono font-bold text-xs bg-indigo-600 text-white px-2.5 py-1 rounded-lg shadow-sm">MRQ1</span>
+          <div class="flex items-center bg-slate-100 border border-slate-200 rounded-lg p-1 gap-1 text-xs font-semibold">
+            <button onclick="renderMRQ(null, 'list')" class="px-3 py-1.5 rounded-md transition text-slate-500 hover:text-slate-800">My Requisitions</button>
+            <button onclick="renderMRQ(null, 'reports')" class="px-3 py-1.5 rounded-md transition bg-white text-emerald-600 shadow-sm">Reports & Analytics</button>
+          </div>
+        </div>
+        <button onclick="mrqExportReport()" class="btn-primary text-xs font-bold px-4 py-2 rounded-lg flex items-center gap-1.5 shadow-sm">
+          <i class="ri-file-excel-2-line"></i> Export to Excel
+        </button>
+      </div>
+
+      <div class="mt-4 card p-4 shrink-0">
+        <div class="grid grid-cols-1 md:grid-cols-4 lg:grid-cols-8 gap-3">
+          <div><label class="form-label">From Date</label><input type="date" id="rp_date_from" class="form-input"></div>
+          <div><label class="form-label">To Date</label><input type="date" id="rp_date_to" class="form-input"></div>
+          <div><label class="form-label">Status</label>
+            <select id="rp_status" class="form-input">
+              <option value="">All</option><option value="pending">Pending</option>
+              <option value="issued">Issued</option><option value="received">Received</option>
+              <option value="cancelled">Cancelled</option>
+            </select>
+          </div>
+          <div><label class="form-label">Category</label>
+            <select id="rp_category" class="form-input">
+              <option value="">All</option>
+              ${Object.entries(CATS).map(([k,t])=>`<option value="${k}">${t.title}</option>`).join('')}
+            </select>
+          </div>
+          <div><label class="form-label">Material Code</label><input id="rp_material" class="form-input font-mono uppercase" placeholder="e.g. CU-001"></div>
+          <div><label class="form-label">Plant</label>
+            <select id="rp_plant" class="form-input">
+              <option value="">All</option>
+              ${sp.plants.map(p=>`<option value="${esc(p.code)}">${esc(p.code)} - ${esc(p.name)}</option>`).join('')}
+            </select>
+          </div>
+          <div><label class="form-label">Department</label>
+            <select id="rp_dept" class="form-input">
+              <option value="">All</option>
+              ${sp.departments.map(d=>`<option value="${esc(d.name)}">${esc(d.name)}</option>`).join('')}
+            </select>
+          </div>
+          <div class="flex items-end">
+            <button onclick="runMRQReport()" class="btn-primary w-full text-xs font-bold py-2 rounded-md flex items-center justify-center gap-1 shadow-sm">
+              <i class="ri-filter-3-line"></i> Filter
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="flex-1 mt-4 card overflow-hidden flex flex-col">
+        <div class="flex-1 overflow-auto">
+          <table class="custom-table">
+            <thead class="sticky top-0 bg-slate-50 shadow-sm z-10"><tr>
+              <th>Req #</th><th>Date</th><th>Category</th><th>Status</th>
+              <th>Dept</th><th>Material</th><th>Qty Req</th><th>Qty Issued</th><th>Batch</th>
+            </tr></thead>
+            <tbody id="rp_tbody">
+              <tr><td colspan="9" class="text-center py-10 text-slate-400">Click "Filter" to generate report.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function runMRQReport() {
+  const df = $('#rp_date_from').value;
+  const dt = $('#rp_date_to').value;
+  const st = $('#rp_status').value;
+  const cat = $('#rp_category').value;
+  const mat = $('#rp_material').value;
+  const pl = $('#rp_plant').value;
+  const dept = $('#rp_dept').value;
+
+  const q = new URLSearchParams();
+  if(df) q.append('date_from', df);
+  if(dt) q.append('date_to', dt);
+  if(st) q.append('status', st);
+  if(cat) q.append('category', cat);
+  if(mat) q.append('material_code', mat);
+  if(pl) q.append('plant', pl);
+  if(dept) q.append('department', dept);
+
+  const tbody = $('#rp_tbody');
+  tbody.innerHTML = `<tr><td colspan="9" class="text-center py-10 text-slate-500">Loading...</td></tr>`;
+  
+  try {
+    const rows = await api('/api/mrq/reports?' + q.toString());
+    
+    if(!rows.length) {
+      tbody.innerHTML = `<tr><td colspan="9" class="text-center py-10 text-slate-400">No records found matching filters.</td></tr>`;
+      return;
+    }
+    
+    tbody.innerHTML = rows.map(r => {
+      const stBadge = r.status === 'cancelled' ? 'badge-red'
+        : r.status === 'received' ? 'badge-emerald'
+        : r.status === 'issued' ? 'badge-indigo'
+        : 'badge-amber';
+        
+      return `<tr>
+        <td class="font-mono font-bold text-emerald-600">${esc(r.req_no)}</td>
+        <td class="text-xs text-slate-500">${esc(r.created_at.split(' ')[0])}</td>
+        <td class="text-xs uppercase">${esc(r.category)}</td>
+        <td><span class="badge ${stBadge}">${r.status.toUpperCase()}</span></td>
+        <td class="text-xs">${esc(r.from_dept)}</td>
+        <td class="font-mono text-xs">${esc(r.material_code)}</td>
+        <td class="font-mono text-right">${r.qty_required}</td>
+        <td class="font-mono font-bold text-right">${r.qty_issued || 0}</td>
+        <td class="font-mono text-xs">${esc(r.batch_no || '—')}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) {
+    tbody.innerHTML = `<tr><td colspan="9" class="text-center py-10 text-red-500">Error: ${esc(e)}</td></tr>`;
+  }
+}
+
+async function mrqExportReport() {
+  const df = $('#rp_date_from').value;
+  const dt = $('#rp_date_to').value;
+  const st = $('#rp_status').value;
+  const cat = $('#rp_category').value;
+  const mat = $('#rp_material').value;
+  const pl = $('#rp_plant').value;
+  const dept = $('#rp_dept').value;
+
+  const q = new URLSearchParams();
+  if(df) q.append('date_from', df);
+  if(dt) q.append('date_to', dt);
+  if(st) q.append('status', st);
+  if(cat) q.append('category', cat);
+  if(mat) q.append('material_code', mat);
+  if(pl) q.append('plant', pl);
+  if(dept) q.append('department', dept);
+
+  try {
+    const tok = localStorage.getItem("nexus_token");
+    const r = await fetch('/api/mrq/reports/export?' + q.toString(), {
+      headers: { 'Authorization': tok ? `Bearer ${tok}` : '' }
+    });
+    if(!r.ok) throw await r.text();
+    const b = await r.blob();
+    const u = URL.createObjectURL(b);
+    const a = document.createElement('a');
+    a.href = u;
+    a.download = `MRQ_Report_${new Date().toISOString().slice(0,10)}.xlsx`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(u);
+    setMsg("Report exported successfully.");
+  } catch(e) { alert("Failed to export: " + e); }
 }
 
 async function mrqIssueModal(id) {
