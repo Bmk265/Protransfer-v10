@@ -9,8 +9,10 @@
 #     print access checks, issued_to_name fallback in PDF).
 #   - SU01: Edit user modal with plant picker restored.
 #   - PFCG: user-centric access matrix with inline grant/revoke.
-#   - MRQ1: Added Reports & Analytics tab with advanced filtering 
-#     (Date, Status, Category, Material, Plant, Dept) and Excel export.
+#   - MRQ1: Added Reports & Analytics tab with advanced filtering.
+#   - MRQ1: Added Maintenance category. Backend issue logic relaxed (Admin 
+#     and selected `to_dept` can issue).
+#   - SPRO: Plant & Department management fully restored.
 # =========================================================================
 
 import io
@@ -336,7 +338,7 @@ def init_db():
 
     # --- Departments ---
     for dept in ["Production", "Final Testing", "Quality Control", "Commercial",
-                 "Store", "Planning", "Engineering"]:
+                 "Store", "Planning", "Engineering", "Maintenance"]:
         cur.execute(q("SELECT 1 FROM departments WHERE name=?"), (dept,))
         if not cur.fetchone():
             cur.execute(
@@ -390,8 +392,8 @@ def init_db():
          "CR, Braid Coverage, Tubular & Dumbbell mechanical tests", "QC",
          "Production,Final Testing,Quality Control,Commercial,Store,Planning,Engineering", []),
         ("MRQ1", "Material Requisition",
-         "Department-to-Stores material request (Stores / Inhouse / Conductor)", "MM",
-         "Production,Final Testing,Quality Control,Commercial,Store,Planning,Engineering", []),
+         "Department-to-Stores material request (Stores / Inhouse / Conductor / Maintenance)", "MM",
+         "Production,Final Testing,Quality Control,Commercial,Store,Planning,Engineering,Maintenance", []),
         ("PROD", "Production Handover Report",
          "Manufacturing batch & lot transfer logs", "PROD",
          "Production,Quality Control", [
@@ -1644,13 +1646,15 @@ MRQ_CATEGORIES = {
                 "desc": "In-house fabricated / semi-finished material"},
     "conductor": {"title": "Conductor Issue", "icon": "ri-plug-line",
                   "desc": "Copper / aluminium conductor stock"},
+    "maintenance": {"title": "Maintenance Issue", "icon": "ri-tools-line",
+                    "desc": "Spares & consumables for Maintenance"},
 }
 
 
 def _mrq_next_no(category):
     tag = datetime.date.today().strftime("%Y%m%d")
     prefix = {"stores": "MRQ-S", "inhouse": "MRQ-I",
-              "conductor": "MRQ-C"}.get(category, "MRQ")
+              "conductor": "MRQ-C", "maintenance": "MRQ-M"}.get(category, "MRQ")
     cnt = fetch_one(
         "SELECT COUNT(*) AS c FROM mrq_requisitions WHERE req_no LIKE ?",
         (f"{prefix}-{tag}-%",),
@@ -1881,8 +1885,9 @@ def mrq_issue(req: Request, rid: int, payload: dict = None):
     if r["status"] == "cancelled":
         raise HTTPException(400, "Cancelled cannot be issued.")
     is_admin = is_master(user) or user["role"] == "admin"
+    # Relaxed logic: Any admin OR the specific department this was routed to can issue.
     if not is_admin and user["department"] != r["to_dept"]:
-        raise HTTPException(403, "Only receiver can issue.")
+        raise HTTPException(403, "Only the assigned department or admin can issue.")
     payload = payload or {}
     issued_to_name = str(payload.get("issued_to_name") or "").strip()
     if not issued_to_name:
@@ -3187,7 +3192,8 @@ async function renderMRQ(category = null, tab = 'list') {
                   : r.status === 'issued' ? 'badge-indigo'
                   : 'badge-amber';
                 const canCancel = (r.status === 'pending') && (isAdmin || ME.department === r.from_dept);
-                const canIssue = (r.status === 'pending') && (isAdmin || ME.department === 'Store');
+                // Update: Admin OR Anyone in the target department (e.g. Store, RM, Maintenance) can issue
+                const canIssue = (r.status === 'pending') && (isAdmin || ME.department === r.to_dept);
                 const canAccept = (r.status === 'issued') && (isAdmin || ME.department === r.from_dept);
                 return `<tr>
                   <td class="font-mono font-bold text-emerald-600">${esc(r.req_no)}</td>
@@ -3379,7 +3385,7 @@ async function mrqIssueModal(id) {
   openDialog(`
     <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50 rounded-t-2xl">
       <div>
-        <h3 class="font-bold text-slate-900 text-sm">Issue Material (Stores)</h3>
+        <h3 class="font-bold text-slate-900 text-sm">Issue Material (${esc(r.to_dept)})</h3>
         <p class="text-xs text-slate-500">${esc(r.req_no)}</p>
       </div>
       <button onclick="closeDialog()"><i class="ri-close-line text-lg text-slate-500"></i></button>
@@ -4267,7 +4273,7 @@ async function deleteUser(u){
   catch(e) { alert(e); }
 }
 
-// ===== SPRO / SE93 / STUDIO / STANDARD =====
+// ===== SPRO (Plant & Dept Management) =====
 async function renderSPRO(){
   if(!ME.is_master && ME.role !== 'admin') return setMsg("Denied", true);
   const d = await api('/api/spro/overview');
