@@ -1,5 +1,5 @@
 # =========================================================================
-# NEXUS CORE ERP  —  app.py  —  v4.0.0
+# NEXUS CORE ERP  —  app.py  —  v4.0.1
 # =========================================================================
 
 import io
@@ -213,7 +213,7 @@ def init_db():
     else:
         cur.execute(q("INSERT INTO users (username, password_hash, full_name, role, department, plants, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"), ("Admin_Erp", hashed, "Master System Administrator", "master", "IT & Systems", "1000,1400,2000,CORP", "approved", cur_time, cur_time))
 
-    # Clean up previous default users except admin
+    # Clean up default sample accounts
     cur.execute(q("DELETE FROM users WHERE username IN ('prod_user', 'testing_lead', 'comm_lead', 'store_head', 'qc_lead')"))
 
     for code, title, desc, mod, depts in [
@@ -234,8 +234,9 @@ def init_db():
             if code == "CTST":
                 cur.execute(q("UPDATE tcodes SET allowed_depts=? WHERE code='CTST'"), (depts,))
 
+    # Fix: delete with correct column names (code for tcode_schemas, tcode_code for tcode_layouts)
     cur.execute(q("DELETE FROM tcode_schemas WHERE code='CTST'"))
-    cur.execute(q("DELETE FROM tcode_layouts WHERE code='CTST'"))
+    cur.execute(q("DELETE FROM tcode_layouts WHERE tcode_code='CTST'"))
     conn.commit()
     conn.close()
 
@@ -282,7 +283,7 @@ def check_tcode_access(user, code: str) -> bool:
     granted = fetch_one("SELECT 1 FROM access_grants WHERE username=? AND tcode_code=?", (user["username"], code))
     return bool(granted)
 
-app = FastAPI(title="Nexus Core ERP", version="4.0.0")
+app = FastAPI(title="Nexus Core ERP", version="4.0.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 @app.post("/api/login")
@@ -519,577 +520,243 @@ def se93_delete(req: Request, code: str = Form(...)):
     if code in STUDIO_PROTECTED: raise HTTPException(403, f"'{code}' is a protected system module and cannot be deleted.")
     exec_write("DELETE FROM tcodes WHERE code=?", (code,))
     exec_write("DELETE FROM tcode_schemas WHERE code=?", (code,))
-    exec_write("DELETE FROM tcode_layouts WHERE code=?", (code,))
+    exec_write("DELETE FROM tcode_layouts WHERE tcode_code=?", (code,))
     exec_write("DELETE FROM tcode_records WHERE code=?", (code,))
-    exec_write("DELETE FROM access_grants WHERE code=?", (code,))
+    exec_write("DELETE FROM access_grants WHERE tcode_code=?", (code,))
     return {"ok": True}
 
-VALID_TYPES = {"text", "number", "date", "textarea", "select", "email", "tel"}
-RESERVED_CODES = {"TN01", "SU01", "SPRO", "SE93", "PFCG", "STUDIO", "CTST", "MRQ1"}
-
-def _snapshot_module(code: str) -> dict:
-    tc = fetch_one("SELECT * FROM tcodes WHERE code=?", (code,))
-    schema = fetch_one("SELECT * FROM tcode_schemas WHERE code=?", (code,))
-    layouts = fetch_all("SELECT * FROM tcode_layouts WHERE tcode_code=?", (code,))
-    records = fetch_all("SELECT id, plant, data, status, created_by, created_by_name, created_at, updated_at FROM tcode_records WHERE tcode_code=?", (code,))
-    grants = fetch_all("SELECT * FROM access_grants WHERE tcode_code=?", (code,))
-    if schema:
-        try: schema["fields"] = json.loads(schema["fields"])
-        except Exception: pass
-    for lay in layouts:
-        try: lay["fields"] = json.loads(lay["fields"])
-        except Exception: pass
-    for rec in records:
-        try: rec["data"] = json.loads(rec["data"])
-        except Exception: pass
-    return {"tcode": tc, "schema": schema, "layouts": layouts, "records": records, "grants": grants, "snapshot_at": now()}
-
-def _restore_module(code: str, snapshot: dict):
-    exec_write("DELETE FROM tcodes WHERE code=?", (code,))
-    exec_write("DELETE FROM tcode_schemas WHERE code=?", (code,))
-    exec_write("DELETE FROM tcode_layouts WHERE code=?", (code,))
-    exec_write("DELETE FROM tcode_records WHERE code=?", (code,))
-    exec_write("DELETE FROM access_grants WHERE code=?", (code,))
-    tc = snapshot.get("tcode")
-    if tc:
-        exec_write("INSERT INTO tcodes (code, title, description, module, allowed_depts, active, created_at, updated_at, created_by) VALUES (?,?,?,?,?,?,?,?,?)", (tc["code"], tc["title"], tc.get("description") or "", tc.get("module") or "", tc.get("allowed_depts") or "", tc.get("active", 1), tc.get("created_at") or now(), tc.get("updated_at") or now(), tc.get("created_by") or ""))
-    sch = snapshot.get("schema")
-    if sch:
-        exec_write("INSERT INTO tcode_schemas (code, fields, layout, updated_at, updated_by) VALUES (?,?,?,?,?)", (sch["code"], json.dumps(sch.get("fields", [])), json.dumps(sch.get("layout") or {}), sch.get("updated_at") or now(), sch.get("updated_by") or ""))
-    for lay in snapshot.get("layouts", []):
-        exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (lay["tcode_code"], lay["layout_code"], lay.get("name") or "", lay.get("title") or "", lay.get("is_default", 0), json.dumps(lay.get("fields", [])), lay.get("layout_config") or "{}", lay.get("description") or "", lay.get("created_by") or "", lay.get("created_by_name") or "", lay.get("created_at") or now(), lay.get("updated_at") or now()))
-    for rec in snapshot.get("records", []):
-        exec_write("INSERT INTO tcode_records (id, tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)", (rec["id"], code, rec.get("plant") or "", json.dumps(rec.get("data") or {}, default=json_serial), rec.get("status") or "active", rec.get("created_by") or "", rec.get("created_by_name") or "", rec.get("created_at") or now(), rec.get("updated_at") or now()))
-    for g in snapshot.get("grants", []):
-        exec_write("INSERT INTO access_grants (username, tcode_code, granted_by, granted_at) VALUES (?,?,?,?)", (g["username"], g["tcode_code"], g.get("granted_by") or "", g.get("granted_at") or now()))
-
-def _validate_spec(spec: dict):
-    errors = []
-    if not isinstance(spec, dict): return None, ["Spec must be a JSON object."]
-    action = (spec.get("action") or "upsert").lower()
-    if action not in ("upsert", "delete"): errors.append("action must be 'upsert' or 'delete'.")
-    code = str(spec.get("code") or "").upper().strip()
-    if not re.match(r"^[A-Z][A-Z0-9_]{1,10}$", code): errors.append("code must be 2-11 chars, start with a letter, A-Z/0-9/_ only.")
-    if code in STUDIO_PROTECTED:
-        errors.append(f"'{code}' is a protected system module. Remove it from STUDIO_PROTECTED in app.py to allow Studio edits.")
-        return {"action": action, "code": code}, errors
-    if code in RESERVED_CODES: errors.append(f"'{code}' is reserved.")
-    clean = {"action": action, "code": code}
-    if action == "delete": return clean, errors
-    clean["title"] = str(spec.get("title") or code).strip()[:120]
-    clean["description"] = str(spec.get("description") or "").strip()[:500]
-    clean["module"] = str(spec.get("module") or "CUSTOM").strip()[:16].upper()
-    depts = spec.get("allowed_depts") or ""
-    if isinstance(depts, list): depts = ",".join(str(d).strip() for d in depts)
-    clean["allowed_depts"] = str(depts).strip()
-    fields = spec.get("fields") or []
-    if not isinstance(fields, list) or not fields:
-        errors.append("fields must be a non-empty array.")
-        return clean, errors
-    clean_fields = []
-    seen_keys = set()
-    for i, f in enumerate(fields):
-        if not isinstance(f, dict):
-            errors.append(f"fields[{i}] must be an object.")
-            continue
-        key = re.sub(r"[^a-z0-9_]", "_", str(f.get("key") or f.get("label") or f"col_{i+1}").lower().strip())
-        key = re.sub(r"_+", "_", key).strip("_") or f"col_{i+1}"
-        if key in seen_keys:
-            errors.append(f"duplicate field key '{key}'.")
-            continue
-        seen_keys.add(key)
-        ftype = str(f.get("type") or "text").lower()
-        if ftype not in VALID_TYPES:
-            errors.append(f"field '{key}' has invalid type '{ftype}'.")
-            ftype = "text"
-        clean_fields.append({"key": key, "label": str(f.get("label") or key).strip()[:120], "type": ftype, "required": bool(f.get("required", False)), "width": 2 if ftype == "textarea" else int(f.get("width", 1) or 1), "options": f.get("options") if ftype == "select" else None})
-    clean["fields"] = clean_fields
-    seeds = spec.get("seed_rows") or []
-    if not isinstance(seeds, list):
-        errors.append("seed_rows must be an array.")
-        seeds = []
-    clean["seed_rows"] = [r for r in seeds if isinstance(r, dict)][:500]
-    return clean, errors
-
-def _diff_preview(code: str, clean: dict) -> dict:
-    existing = fetch_one("SELECT * FROM tcodes WHERE code=?", (code,))
-    if not existing:
-        return {"kind": "create", "before_rows": 0, "before_fields": [], "after_fields": [f["key"] for f in clean["fields"]], "added_fields": [f["key"] for f in clean["fields"]], "removed_fields": [], "rows_preserved": True}
-    schema = fetch_one("SELECT fields FROM tcode_schemas WHERE code=?", (code,))
-    try: prev_fields = json.loads(schema["fields"]) if schema else []
-    except Exception: prev_fields = []
-    prev_keys = [f.get("key", "") for f in prev_fields]
-    new_keys = [f["key"] for f in clean["fields"]]
-    added = [k for k in new_keys if k not in prev_keys]
-    removed = [k for k in prev_keys if k not in new_keys]
-    before_rows = fetch_one("SELECT COUNT(*) AS c FROM tcode_records WHERE tcode_code=?", (code,))["c"]
-    return {"kind": "update", "before_rows": before_rows, "before_fields": prev_keys, "after_fields": new_keys, "added_fields": added, "removed_fields": removed, "rows_preserved": True}
-
-def _apply_spec(clean: dict, user: dict, note: str = ""):
-    code = clean["code"]
-    action = clean["action"]
-    if code in STUDIO_PROTECTED: raise HTTPException(403, f"'{code}' is protected. Edit STUDIO_PROTECTED in app.py to unlock.")
-    cur_time = now()
-    existing = fetch_one("SELECT code FROM tcodes WHERE code=?", (code,))
-    before_snapshot = _snapshot_module(code) if existing else None
-    if action == "delete":
-        if not existing: raise HTTPException(404, f"Module '{code}' does not exist.")
-        exec_write("DELETE FROM tcodes WHERE code=?", (code,))
-        exec_write("DELETE FROM tcode_schemas WHERE code=?", (code,))
-        exec_write("DELETE FROM tcode_layouts WHERE code=?", (code,))
-        exec_write("DELETE FROM tcode_records WHERE code=?", (code,))
-        exec_write("DELETE FROM access_grants WHERE code=?", (code,))
-        summary = {"action": "delete", "code": code}
-    else:
-        fields_json = json.dumps(clean["fields"])
-        layout_cfg = json.dumps({"columns": 3})
-        if existing:
-            exec_write("UPDATE tcodes SET title=?, description=?, module=?, allowed_depts=?, updated_at=?, created_by=? WHERE code=?", (clean["title"], clean["description"], clean["module"], clean["allowed_depts"], cur_time, user["username"], code))
-            exec_write("UPDATE tcode_schemas SET fields=?, layout=?, updated_at=?, updated_by=? WHERE code=?", (fields_json, layout_cfg, cur_time, user["username"], code))
-            default_layout = fetch_one("SELECT id FROM tcode_layouts WHERE tcode_code=? AND is_default=1", (code,))
-            if default_layout:
-                exec_write("UPDATE tcode_layouts SET fields=?, layout_config=?, updated_at=? WHERE id=?", (fields_json, layout_cfg, cur_time, default_layout["id"]))
-            else:
-                exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (code, f"GRID_{code}_01", "Default Grid", clean["title"], 1, fields_json, layout_cfg, "Managed by AI Studio", user["username"], user["full_name"], cur_time, cur_time))
-            summary = {"action": "updated", "code": code}
-        else:
-            exec_write("INSERT INTO tcodes (code, title, description, module, allowed_depts, active, created_at, updated_at, created_by) VALUES (?,?,?,?,?,?,?,?,?)", (code, clean["title"], clean["description"], clean["module"], clean["allowed_depts"], 1, cur_time, cur_time, user["username"]))
-            exec_write("INSERT INTO tcode_schemas (code, fields, layout, updated_at, updated_by) VALUES (?,?,?,?,?)", (code, fields_json, layout_cfg, cur_time, user["username"]))
-            exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (code, f"GRID_{code}_01", "Default Grid", clean["title"], 1, fields_json, layout_cfg, "Created via AI Studio", user["username"], user["full_name"], cur_time, cur_time))
-            summary = {"action": "created", "code": code}
-        seeded = 0
-        field_keys = {f["key"] for f in clean["fields"]}
-        for row in clean["seed_rows"]:
-            rec = {k: row[k] for k in row if k in field_keys}
-            if not rec: continue
-            plant = str(row.get("plant") or (user.get("plants") or "1000").split(",")[0].strip() or "1000")
-            exec_write("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)", (code, plant, json.dumps(rec, default=json_serial), "active", user["username"], user["full_name"], cur_time, cur_time))
-            seeded += 1
-        summary["seeded_rows"] = seeded
-    prev = fetch_one("SELECT COALESCE(MAX(version), 0) AS v FROM module_specs WHERE tcode_code=?", (code,))
-    version = (prev["v"] if prev else 0) + 1
-    history_payload = {"clean_spec": clean, "before_snapshot": before_snapshot}
-    exec_write("INSERT INTO module_specs (tcode_code, version, action, spec, applied_by, applied_at, note) VALUES (?,?,?,?,?,?,?)", (code, version, action, json.dumps(history_payload, default=json_serial), user["username"], cur_time, note or ""))
-    summary["version"] = version
-    return summary
-
-@app.post("/api/studio/validate")
-def studio_validate(req: Request, payload: dict):
-    need_master(req)
-    clean, errors = _validate_spec(payload.get("spec", payload))
-    result = {"ok": not errors, "errors": errors, "clean": clean, "diff": None, "protected": clean and clean.get("code") in STUDIO_PROTECTED}
-    if clean and not errors and clean.get("code"): result["diff"] = _diff_preview(clean["code"], clean)
-    return result
-
-@app.post("/api/studio/apply")
-def studio_apply(req: Request, payload: dict):
-    user = need_master(req)
-    clean, errors = _validate_spec(payload.get("spec", payload))
-    if errors: raise HTTPException(400, "Spec invalid: " + "; ".join(errors))
-    if clean["action"] == "delete" and not payload.get("confirmed", False):
-        raise HTTPException(400, "Delete requires confirmed=true. Review the diff, then re-apply.")
-    summary = _apply_spec(clean, user, note=str(payload.get("note", "") or ""))
-    return {"ok": True, **summary}
-
-@app.get("/api/studio/history")
-def studio_history(req: Request, code: str = ""):
-    need_master(req)
-    sql = "SELECT id, tcode_code, version, action, applied_by, applied_at, note FROM module_specs"
-    params = []
-    if code:
-        sql += " WHERE tcode_code=?"
-        params.append(code.upper().strip())
-    sql += " ORDER BY id DESC LIMIT 200"
-    return fetch_all(sql, tuple(params))
-
-@app.get("/api/studio/spec/{code}")
-def studio_get_spec(req: Request, code: str):
-    need_master(req)
-    code = code.upper().strip()
-    tc = fetch_one("SELECT * FROM tcodes WHERE code=?", (code,))
-    if not tc: raise HTTPException(404, "Module not found.")
-    schema = fetch_one("SELECT fields FROM tcode_schemas WHERE code=?", (code,))
-    try: fields = json.loads(schema["fields"]) if schema else []
-    except Exception: fields = []
-    return {"action": "upsert", "code": code, "title": tc["title"], "description": tc["description"] or "", "module": tc["module"] or "CUSTOM", "allowed_depts": tc["allowed_depts"] or "", "fields": [{"key": f.get("key"), "label": f.get("label"), "type": f.get("type", "text"), "required": f.get("required", False), "width": f.get("width", 1)} for f in fields], "seed_rows": [], "protected": code in STUDIO_PROTECTED}
-
-@app.post("/api/studio/rollback/{msid}")
-def studio_rollback(req: Request, msid: int):
-    user = need_master(req)
-    row = fetch_one("SELECT * FROM module_specs WHERE id=?", (msid,))
-    if not row: raise HTTPException(404, "History entry not found.")
-    try: payload = json.loads(row["spec"])
-    except Exception: raise HTTPException(400, "Stored spec is corrupt.")
-    before_snapshot = payload.get("before_snapshot")
-    clean_spec = payload.get("clean_spec") or payload
-    code = clean_spec.get("code")
-    if not code: raise HTTPException(400, "History entry is missing a module code.")
-    if code in STUDIO_PROTECTED: raise HTTPException(403, f"'{code}' is protected. Rollback blocked.")
-    if before_snapshot: _restore_module(code, before_snapshot)
-    else:
-        clean, errors = _validate_spec(clean_spec)
-        if errors: raise HTTPException(400, "Cannot rollback: " + "; ".join(errors))
-        _apply_spec(clean, user, note=f"Rollback v{row['version']}")
-    cur_time = now()
-    prev = fetch_one("SELECT COALESCE(MAX(version), 0) AS v FROM module_specs WHERE tcode_code=?", (code,))
-    new_version = (prev["v"] if prev else 0) + 1
-    exec_write("INSERT INTO module_specs (tcode_code, version, action, spec, applied_by, applied_at, note) VALUES (?,?,?,?,?,?,?)", (code, new_version, "rollback", json.dumps({"clean_spec": clean_spec, "before_snapshot": None}), user["username"], cur_time, f"Restored from v{row['version']}"))
-    return {"ok": True, "code": code, "version": new_version, "restored_from": row["version"]}
-
-CTST_TESTS = {
-    "cr": {"title": "CR — Conductor Resistance", "icon": "ri-pulse-line", "desc": "Temperature-corrected resistance with auto per-km value and HIGH / LOW verdict vs spec"},
-    "braid": {"title": "Braid / Shield Coverage", "icon": "ri-shield-check-line", "desc": "Fill factor and % coverage for wire braid screens"},
-    "tubular": {"title": "Tubular Mechanical Test", "icon": "ri-circle-line", "desc": "Area, tensile strength, elongation for tube specimen"},
-    "dumbbell": {"title": "Dumbbell Mechanical Test", "icon": "ri-shape-line", "desc": "Area, tensile strength, elongation for dumbbell specimen"},
-    "hotset": {"title": "Hot Set & Permanent Set", "icon": "ri-temp-hot-line", "desc": "Hot-set and permanent-set elongation percentages"},
+# =========================================================================
+# TN01 — TRANSFER NOTE
+# =========================================================================
+TN01_ROUTES = {
+    "PROD_TO_QC": {"title": "Production to Final Testing", "route": "Production ➔ Final Testing", "from_dept": "Production", "to_dept": "Final Testing", "columns": ["Sr. No.", "Job No.", "Customer Name", "Material Description", "Specified Length", "Entry Length", "Drum Size", "Drum Code", "Batch No."]},
+    "QC_TO_COMM": {"title": "Final Testing to Commercial", "route": "Final Testing ➔ Commercial", "from_dept": "Final Testing", "to_dept": "Commercial", "columns": ["Sr. No.", "Job / Prod Order #", "Batch / Heat Lot", "Cable Description / Spec", "Drum #", "Tested Length (Mtrs)", "HV Test Result", "Insulation Resistance", "QC Inspector", "Release Status"]},
+    "PROD_TO_STORE": {"title": "Production to Store", "route": "Production ➔ Store", "from_dept": "Production", "to_dept": "Store", "columns": ["Sr. No.", "Work Order #", "Item Code / Material", "Batch / Heat Lot", "Quantity (Mtrs/Kgs)", "Weight (Kgs)", "Drum / Pack #", "Handover Person", "Remarks"]},
+    "QC_TO_PROD": {"title": "Final Testing to Production (Rework/Reject)", "route": "Final Testing ➔ Production", "from_dept": "Final Testing", "to_dept": "Production", "columns": ["Sr. No.", "Job Order #", "Batch / Heat Lot", "Cable Size", "Defect Observed", "Length (Mtrs)", "QC Engineer", "Rework Instructions"]},
+    "COMM_TO_QC": {"title": "Commercial to Final Testing", "route": "Commercial ➔ Final Testing", "from_dept": "Commercial", "to_dept": "Final Testing", "columns": ["Sr. No.", "Customer Name", "Order / PO #", "Item Description", "Ordered Qty", "Inspection Agency", "Target Date", "Special Testing Notes"]},
+    "STORE_TO_PROD": {"title": "Store to Production", "route": "Store ➔ Production", "from_dept": "Store", "to_dept": "Production", "columns": ["Sr. No.", "Material Code", "Material Description", "Lot / GRN #", "Issued Qty", "UOM", "Issued By", "Received For Work Order"]},
 }
 
-def _n(v):
-    try:
-        if v is None or str(v).strip() == "": return None
-        return float(str(v).replace(",", ""))
-    except Exception: return None
-
-def _compute_by_test(tt: str, d: dict) -> dict:
-    out = {}
-    if tt == "cr":
-        obd, t, L, spec = _n(d.get("obd_cr_reading")), _n(d.get("temp_c")), _n(d.get("length_m")), _n(d.get("specified_cr"))
-        tol = _n(d.get("cr_tolerance_pct")) or 5.0
-        observed_cr = None
-        if obd is not None and t is not None:
-            if -50 <= t <= 100:
-                factor = 250.0 / (230.0 + t)
-                corrected = factor * obd
-                out["cr_1m"] = round(corrected, 6)
-                if L and L > 0:
-                    observed_cr = corrected / L * 1000.0
-                    out["cr_total_per_km"] = round(observed_cr, 6)
-                    out["observed_cr"] = round(observed_cr, 6)
-            else: out["cr_warning"] = "Temp outside −50 to 100 °C — check entry"
-        if spec and observed_cr is not None and spec != 0:
-            dev = (observed_cr - spec) / spec * 100.0
-            out["cr_deviation_pct"] = round(dev, 4)
-            if abs(dev) < 0.001: out["cr_verdict"] = "ON SPEC"
-            elif dev > 0: out["cr_verdict"] = "HIGH"
-            else: out["cr_verdict"] = "LOW"
-            out["cr_within_tolerance"] = abs(dev) <= tol
-            out["cr_tolerance_pct"] = tol
-    elif tt == "braid":
-        bd, uD, wpc, carr, lay = _n(d.get("braid_d")), _n(d.get("under_braid_D")), _n(d.get("wires_per_carrier")), _n(d.get("carriers")), _n(d.get("lay_length"))
-        if (all(v is not None for v in (bd, uD, wpc, carr, lay)) and uD > 0 and lay > 0):
-            N = wpc * carr
-            F = (N * bd) / (2 * math.pi * uD) * math.sqrt(1 + (math.pi * uD / lay) ** 2)
-            out["braid_total_wires"] = int(N)
-            out["braid_filling_factor"] = round(F, 6)
-            out["braid_coverage_pct"] = round((2 * F - F * F) * 100.0, 3)
-    elif tt in ("tubular", "dumbbell"):
-        if tt == "tubular":
-            D, wall = _n(d.get("tub_outer_d")), _n(d.get("tub_wall"))
-            if D and wall and D > wall: out["area_mm2"] = round(math.pi * (D - wall) * wall, 4)
-            load, final = _n(d.get("break_load_tub")), _n(d.get("elong_tub_final"))
-        else:
-            w, th = _n(d.get("dumb_width")), _n(d.get("dumb_thk"))
-            if w and th: out["area_mm2"] = round(w * th, 4)
-            load, final = _n(d.get("break_load_dumb")), _n(d.get("elong_dumb_final"))
-        init = _n(d.get("initial_gauge"))
-        if load is not None and out.get("area_mm2"): out["tensile_nmm2"] = round(load / out["area_mm2"], 4)
-        if init and final is not None and init != 0: out["elongation_pct"] = round((final - init) / init * 100.0, 4)
-    elif tt == "hotset":
-        init, hs, ps = _n(d.get("initial_gauge")), _n(d.get("hotset_elong_final")), _n(d.get("permset_cooled"))
-        if init and hs is not None and init != 0: out["hotset_pct"] = round((hs - init) / init * 100.0, 4)
-        if init and ps is not None and init != 0: out["permset_pct"] = round((ps - init) / init * 100.0, 4)
-    return out
-
-def _filter_by_test(base_sql: str, test_type: str):
-    if not test_type: return base_sql, []
-    if USE_PG: return base_sql + " AND data::json->>'_test_type' = %s", [test_type]
-    return base_sql + " AND json_extract(data, '$._test_type') = ?", [test_type]
-
-@app.get("/api/ctst/tests")
-def ctst_tests(req: Request):
+@app.get("/api/tn01/routes")
+def tn01_get_routes(req: Request):
     need(req)
-    return CTST_TESTS
+    return TN01_ROUTES
 
-@app.get("/api/ctst/records")
-def ctst_list(req: Request, test_type: str = "", limit: int = 200):
-    user = need(req)
-    if not check_tcode_access(user, "CTST"): raise HTTPException(403, "Access denied.")
-    base = "SELECT * FROM tcode_records WHERE tcode_code='CTST' AND status='active'"
-    sql, params = _filter_by_test(base, test_type)
-    sql += " ORDER BY id DESC LIMIT ?" if not USE_PG else " ORDER BY id DESC LIMIT %s"
-    params.append(limit)
-    rows = fetch_all(sql, tuple(params))
+@app.get("/api/tn01/suggest-users")
+def tn01_suggest_users(req: Request, plant: str = "", dept: str = "", q: str = ""):
+    need(req)
+    sql = "SELECT username, full_name, department, plants, role FROM users WHERE status='approved'"
+    params = []
+    if dept:
+        sql += " AND department = ?"
+        params.append(dept)
+    if q:
+        sql += " AND (LOWER(username) LIKE ? OR LOWER(full_name) LIKE ?)"
+        term = f"%{q.strip().lower()}%"
+        params.extend([term, term])
+    users = fetch_all(sql, tuple(params))
+    if plant:
+        return [u for u in users if not (u.get("plants") or "").strip() or plant in [p.strip() for p in (u.get("plants") or "").split(",")]]
+    return users
+
+@app.get("/api/tn01/layouts")
+def tn01_get_layouts(req: Request):
+    need(req)
+    rows = fetch_all("SELECT * FROM tcode_layouts WHERE tcode_code='TN01' ORDER BY is_default DESC, id ASC")
     for r in rows:
-        try: r["data"] = json.loads(r["data"])
-        except Exception: r["data"] = {}
-        tt = r["data"].get("_test_type", "")
-        r["computed"] = _compute_by_test(tt, r["data"]) if tt else {}
+        try: r["fields"] = json.loads(r["fields"])
+        except Exception: r["fields"] = []
     return rows
 
-@app.post("/api/ctst/compute")
-def ctst_compute(req: Request, payload: dict):
-    need(req)
-    tt = str(payload.get("_test_type", "")).strip()
-    if tt not in CTST_TESTS: raise HTTPException(400, "Unknown test type.")
-    return {"computed": _compute_by_test(tt, payload)}
-
-@app.post("/api/ctst/save")
-def ctst_save(req: Request, payload: dict):
+@app.post("/api/tn01/send")
+def tn01_send(req: Request, payload: dict):
     user = need(req)
-    if not check_tcode_access(user, "CTST"): raise HTTPException(403, "Access denied.")
-    tt = str(payload.get("_test_type", "")).strip()
-    if tt not in CTST_TESTS: raise HTTPException(400, "Unknown test type.")
-    plant = str(payload.pop("_plant", "") or (user.get("plants") or "1000").split(",")[0].strip() or "1000").strip()
     cur_time = now()
-    exec_write("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)", ("CTST", plant, json.dumps(payload, default=json_serial), "active", user["username"], user["full_name"], cur_time, cur_time))
-    return {"ok": True, "computed": _compute_by_test(tt, payload)}
+    today_tag = datetime.date.today().strftime("%Y%m%d")
+    cnt = fetch_one("SELECT COUNT(*) AS c FROM transfer_notes WHERE created_at LIKE ?", (f"{datetime.date.today().strftime('%Y-%m-%d')}%",))
+    note_no = f"TN-{today_tag}-{(cnt['c'] if cnt else 0) + 1:04d}"
+    headers = payload.get("headers", [])
+    rows = payload.get("rows", [])
+    header_count = len(headers) if headers else 0
+    normalized_rows = []
+    for i, raw in enumerate(rows, 1):
+        if not isinstance(raw, (list, tuple)): continue
+        row = ["" if c is None else str(c) for c in raw]
+        while len(row) < header_count: row.append("")
+        if header_count: row = row[:header_count]
+        row[0] = str(i)
+        normalized_rows.append(row)
+    normalized_rows = [r for r in normalized_rows if any(str(x).strip() for x in r[1:])]
+    to_user = payload.get("to_user", "").strip()
+    target = fetch_one("SELECT username, full_name FROM users WHERE username=?", (to_user,))
+    to_user_name = target["full_name"] if target else to_user
+    cc_users_raw = payload.get("cc_users") or []
+    if isinstance(cc_users_raw, str): cc_users_raw = [cc_users_raw]
+    cc_users = ",".join(str(x).strip() for x in cc_users_raw if str(x).strip())
+    from_plant = (payload.get("from_plant", "").strip() or (user.get("plants") or "1000").split(",")[0].strip())
+    exec_write("INSERT INTO transfer_notes (note_no, layout_key, route, from_plant, from_dept, from_user, from_user_name, to_plant, to_dept, to_user, to_user_name, entry_count, sheet_headers, sheet_data, status, remarks, created_at, cc_users) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (note_no, payload.get("layout_key", "STANDARD"), payload.get("route", "Transfer"), from_plant, user["department"], user["username"], user["full_name"], payload.get("to_plant", "").strip(), payload.get("to_dept", "").strip(), to_user, to_user_name, len(normalized_rows), json.dumps(headers), json.dumps(normalized_rows, default=json_serial), "sent", payload.get("remarks", "").strip(), cur_time, cc_users))
+    return {"ok": True, "note_no": note_no, "entries": len(normalized_rows)}
 
-@app.delete("/api/ctst/records/{rid}")
-def ctst_delete(req: Request, rid: int):
+@app.get("/api/tn01/inbox")
+def tn01_inbox(req: Request):
     user = need(req)
-    if not check_tcode_access(user, "CTST"): raise HTTPException(403, "Access denied.")
-    rec = fetch_one("SELECT * FROM tcode_records WHERE id=? AND tcode_code='CTST'", (rid,))
-    if not rec: raise HTTPException(404, "Record not found.")
-    if (rec["created_by"] != user["username"] and not is_master(user) and user["role"] != "admin"): raise HTTPException(403, "You can only delete your own records.")
-    exec_write("UPDATE tcode_records SET status='deleted', updated_at=? WHERE id=?", (now(), rid))
+    uname = user["username"]
+    return fetch_all("SELECT * FROM transfer_notes WHERE to_user = ? OR (to_dept = ? AND to_user = '') OR (',' || cc_users || ',') LIKE ? ORDER BY id DESC", (uname, user["department"], f"%,{uname},%"))
+
+@app.post("/api/tn01/receive/{nid}")
+def tn01_receive(req: Request, nid: int):
+    user = need(req)
+    cur_time = now()
+    exec_write("UPDATE transfer_notes SET status='received', received_at=?, received_by=?, received_by_name=? WHERE id=?", (cur_time, user["username"], user["full_name"], nid))
+    return {"ok": True, "received_at": cur_time}
+
+@app.delete("/api/tn01/delete/{nid}")
+def tn01_delete(req: Request, nid: int):
+    user = need(req)
+    if not (is_master(user) or user["role"] == "admin"): raise HTTPException(403, "Only Admin can delete history.")
+    exec_write("DELETE FROM transfer_notes WHERE id=?", (nid,))
     return {"ok": True}
 
-@app.get("/api/ctst/export")
-def ctst_export(req: Request, test_type: str = ""):
+@app.get("/api/tn01/history")
+def tn01_history(req: Request, plant: str = "", route: str = "", status: str = "", from_dept: str = "", to_dept: str = "", date_from: str = "", date_to: str = ""):
     user = need(req)
-    if not check_tcode_access(user, "CTST"): raise HTTPException(403, "Access denied.")
-    base = "SELECT * FROM tcode_records WHERE tcode_code='CTST' AND status='active'"
-    sql, params = _filter_by_test(base, test_type)
-    sql += " ORDER BY id ASC"
-    rows = fetch_all(sql, tuple(params))
-    wb = Workbook()
-    ws = wb.active
-    ws.title = (test_type.upper() if test_type else "CTST") + "_DATA"
-    ws.append(["ID", "Plant", "Test Type", "Sample ID", "Cable Type", "Date", "Result", "Computed", "Remarks", "Created By", "Created At"])
-    for r in rows:
-        try: d = json.loads(r["data"])
-        except Exception: d = {}
-        tt = d.get("_test_type", "")
-        c = _compute_by_test(tt, d)
-        computed_str = "; ".join(f"{k}={v}" for k, v in c.items())
-        ws.append([r["id"], r["plant"], tt, d.get("sample_id", ""), d.get("cable_type", ""), d.get("test_date", ""), d.get("result", ""), computed_str, d.get("remarks", ""), r["created_by_name"] or r["created_by"], r["created_at"]])
-    bio = io.BytesIO()
-    wb.save(bio)
-    bio.seek(0)
-    tag = test_type.upper() if test_type else "ALL"
-    return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=CTST_{tag}_{datetime.date.today().strftime('%Y%m%d')}.xlsx"})
-
-@app.get("/api/ctst/print/{rid}", response_class=HTMLResponse)
-def ctst_print(req: Request, rid: int):
-    user = need(req)
-    if not check_tcode_access(user, "CTST"): return HTMLResponse("Access denied", 403)
-    rec = fetch_one("SELECT * FROM tcode_records WHERE id=? AND tcode_code='CTST'", (rid,))
-    if not rec: return HTMLResponse("Record not found", 404)
-    try: d = json.loads(rec["data"])
-    except Exception: d = {}
-    tt = d.get("_test_type", "")
-    c = _compute_by_test(tt, d)
-    org = fetch_one("SELECT * FROM org WHERE id=1") or {}
-    title = CTST_TESTS.get(tt, {}).get("title", tt.upper())
-    def cell(l, v, u=""): return f"<tr><td style='padding:4px 8px;border:1px solid #cbd5e1;font-size:11px;background:#f8fafc'>{l}</td><td style='padding:4px 8px;border:1px solid #cbd5e1;font-size:11px;font-weight:600'>{v or ''} {u}</td></tr>"
-    labels = {"obd_cr_reading": ("OBD CR Reading", "Ω"), "temp_c": ("Test Temp", "°C"), "length_m": ("Length", "m"), "specified_cr": ("Specified CR", "Ω/km"), "cr_tolerance_pct": ("Tolerance", "%"), "braid_d": ("Braid Wire Ø", "mm"), "under_braid_D": ("Ø Under Braid", "mm"), "wires_per_carrier": ("Wires/Carrier", ""), "carriers": ("Carriers", ""), "lay_length": ("Lay Length", "mm"), "tub_outer_d": ("Tubular Outer Ø", "mm"), "tub_wall": ("Tubular Wall", "mm"), "dumb_width": ("Dumbbell Width", "mm"), "dumb_thk": ("Dumbbell Thickness", "mm"), "break_load_tub": ("Break Load (Tub)", "N"), "break_load_dumb": ("Break Load (Dumb)", "N"), "elong_tub_final": ("Tubular Final Gauge", "mm"), "elong_dumb_final": ("Dumbbell Final Gauge", "mm"), "initial_gauge": ("Initial Gauge", "mm"), "hotset_elong_final": ("Hot Set Final", "mm"), "permset_cooled": ("Perm Set Cooled", "mm")}
-    comp_labels = {"cr_1m": ("CR 1 m", "Ω"), "cr_total_per_km": ("CR per km", "Ω/km"), "observed_cr": ("Observed CR (auto, Ω/km)", "Ω/km"), "cr_deviation_pct": ("CR Deviation vs Spec", "%"), "cr_verdict": ("vs Spec", ""), "cr_within_tolerance": ("Within Tolerance", ""), "cr_tolerance_pct": ("Tolerance", "%"), "braid_total_wires": ("Total Wires", ""), "braid_filling_factor": ("Filling Factor", ""), "braid_coverage_pct": ("Coverage", "%"), "area_mm2": ("Area", "mm²"), "tensile_nmm2": ("Tensile Strength", "N/mm²"), "elongation_pct": ("Elongation", "%"), "hotset_pct": ("Hot Set", "%"), "permset_pct": ("Permanent Set", "%")}
-    irows = "".join(cell(l, d.get(k, ""), u_) for k, (l, u_) in labels.items() if k in d)
-    orows = "".join(cell(l, c.get(k, ""), u_) for k, (l, u_) in comp_labels.items() if k in c)
-    if c.get("cr_warning"): orows += f"<tr><td colspan='2' style='padding:6px 8px;background:#fef3c7;border:1px solid #fcd34d;font-size:11px;color:#92400e'>⚠ {esc_py(c['cr_warning'])}</td></tr>"
-    return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>CTST #{rec['id']}</title><style>body {{ font-family: sans-serif; margin: 30px; color: #0f172a; }} table {{ width: 100%; border-collapse: collapse; margin-bottom: 16px; }} @media print {{ .no-print {{ display: none; }} body {{ margin: 0; }} }}</style></head><body><div class="no-print" style="text-align:right;margin-bottom:12px"><button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600">Print / Save PDF</button></div><h2 style="margin:0">{esc_py(org.get('name', 'Thermocables Limited'))}</h2><h4 style="margin:4px 0 12px;color:#4f46e5">{esc_py(title)}</h4><div style="font-size:11px;color:#475569;margin-bottom:16px">Record #{rec['id']} | Plant {esc_py(rec['plant'] or '—')} | Sample {esc_py(d.get('sample_id', '—'))} | {esc_py(d.get('cable_type', '—'))} | By {esc_py(rec['created_by_name'] or rec['created_by'])} | {esc_py(rec['created_at'])}</div><h4 style="font-size:12px;color:#4338ca;text-transform:uppercase;margin-bottom:6px">Inputs</h4><table>{irows}</table><h4 style="font-size:12px;color:#4338ca;text-transform:uppercase;margin-bottom:6px">Computed Results</h4><table>{orows or '<tr><td style="padding:6px;font-size:11px;color:#64748b">None</td></tr>'}</table><h4 style="font-size:12px;color:#4338ca;text-transform:uppercase;margin-bottom:6px">Verdict</h4><table>{cell('Result', d.get('result', ''))}{cell('Remarks', d.get('remarks', ''))}</table></body></html>""")
-
-MRQ_CATEGORIES = {
-    "stores": {"title": "Stores Issue", "icon": "ri-store-2-line", "desc": "General consumables & spares from Stores"},
-    "inhouse": {"title": "Inhouse Material Issue", "icon": "ri-home-gear-line", "desc": "In-house fabricated / semi-finished material"},
-    "conductor": {"title": "Conductor Issue", "icon": "ri-plug-line", "desc": "Copper / aluminium conductor stock"},
-}
-
-@app.get("/api/mrq/categories")
-def mrq_categories(req: Request):
-    need(req)
-    return MRQ_CATEGORIES
-
-@app.get("/api/mrq/materials")
-def mrq_list_materials(req: Request, category: str = ""):
-    need(req)
-    sql = "SELECT * FROM mrq_materials"
+    uname = user["username"]
+    sql = "SELECT * FROM transfer_notes WHERE 1=1"
     params = []
-    if category:
-        sql += " WHERE category=?"
-        params.append(category)
-    sql += " ORDER BY material_code"
-    return fetch_all(sql, tuple(params))
-
-@app.post("/api/mrq/materials/import")
-async def mrq_import_materials(req: Request, file: UploadFile = File(...)):
-    need_admin(req)
-    contents = await file.read()
-    fn = file.filename.lower()
-    rows = []
-    try:
-        is_zip = contents.startswith(b'PK\x03\x04')
-        if fn.endswith(".xlsx") or is_zip:
-            if not is_zip: raise HTTPException(400, "The .xlsx file is corrupted. Save as CSV.")
-            wb = load_workbook(io.BytesIO(contents), data_only=True)
-            all_rows = list(wb.active.iter_rows(values_only=True))
-            if not all_rows: raise HTTPException(400, "Empty file.")
-            headers = [str(h).strip().lower() for h in all_rows[0]]
-            for r in all_rows[1:]: rows.append(dict(zip(headers, r)))
-        elif fn.endswith(".csv"):
-            text = contents.decode("utf-8-sig", errors="ignore")
-            lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
-            if not lines: raise HTTPException(400, "Empty file.")
-            header_line = lines[0]
-            headers = [h.strip().lower().strip('"').strip("'") for h in header_line.split(',')]
-            for line in lines[1:]:
-                if not line.strip(): continue
-                parsed = next(csv.reader([line]))
-                rows.append(dict(zip(headers, parsed)))
-        else: raise HTTPException(400, "Upload .xlsx or .csv")
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(400, f"Parse error: {e}")
-    imported, updated, skipped = 0, 0, 0
-    for r in rows:
-        code = str(r.get("material code") or r.get("code") or "").strip().upper()
-        desc = str(r.get("description") or r.get("material description") or "").strip()
-        cat = str(r.get("category") or "stores").strip().lower()
-        uom = str(r.get("uom") or "NOS").strip().upper()
-        if not code or not desc:
-            skipped += 1
-            continue
-        exists = fetch_one("SELECT 1 FROM mrq_materials WHERE material_code=?", (code,))
-        if exists:
-            exec_write("UPDATE mrq_materials SET description=?, category=?, uom=? WHERE material_code=?", (desc, cat, uom, code))
-            updated += 1
-        else:
-            exec_write("INSERT INTO mrq_materials (material_code, description, category, uom, created_at) VALUES (?,?,?,?,?)", (code, desc, cat, uom, now()))
-            imported += 1
-    return {"ok": True, "imported": imported, "updated": updated, "skipped": skipped, "total_rows": len(rows)}
-
-@app.get("/api/mrq/requisitions")
-def mrq_list(req: Request, category: str = "", status: str = ""):
-    user = need(req)
-    sql = "SELECT * FROM mrq_requisitions WHERE 1=1"
-    params = []
-    is_admin = is_master(user) or user["role"] == "admin"
-    if not is_admin:
-        sql += " AND (from_dept = ? OR to_dept = ?)"
-        params.extend([user["department"], user["department"]])
-    if category:
-        sql += " AND category = ?"
-        params.append(category)
+    if not (is_master(user) or user["role"] == "admin"):
+        sql += " AND (from_user = ? OR to_user = ? OR from_dept = ? OR to_dept = ? OR (',' || cc_users || ',') LIKE ?)"
+        params.extend([user["username"], user["username"], user["department"], user["department"], f"%,{uname},%"])
+    if plant:
+        sql += " AND (from_plant = ? OR to_plant = ?)"
+        params.extend([plant, plant])
+    if route:
+        sql += " AND route = ?"
+        params.append(route)
     if status:
         sql += " AND status = ?"
         params.append(status)
+    if is_master(user) or user["role"] == "admin":
+        if from_dept:
+            sql += " AND from_dept = ?"
+            params.append(from_dept)
+        if to_dept:
+            sql += " AND to_dept = ?"
+            params.append(to_dept)
+        if date_from:
+            sql += " AND created_at >= ?"
+            params.append(date_from + " 00:00:00")
+        if date_to:
+            sql += " AND created_at <= ?"
+            params.append(date_to + " 23:59:59")
     sql += " ORDER BY id DESC LIMIT 300"
-    rows = fetch_all(sql, tuple(params))
-    for r in rows:
-        agg = fetch_one("SELECT COUNT(*) AS c, COALESCE(SUM(qty_required),0) AS q FROM mrq_lines WHERE req_id=?", (r["id"],))
-        r["line_count"] = agg["c"]
-        r["total_qty"] = agg["q"]
-    return rows
+    return fetch_all(sql, tuple(params))
 
-@app.get("/api/mrq/requisition/{rid}")
-def mrq_get(req: Request, rid: int):
+@app.get("/api/tn01/note/{nid}")
+def tn01_get_note(req: Request, nid: int):
+    need(req)
+    note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
+    if not note: raise HTTPException(404, "Note not found.")
+    try: note["sheet_headers"] = json.loads(note["sheet_headers"])
+    except Exception: note["sheet_headers"] = []
+    try: note["sheet_data"] = json.loads(note["sheet_data"])
+    except Exception: note["sheet_data"] = []
+    return note
+
+@app.get("/api/tn01/export/{nid}")
+def tn01_export_excel(req: Request, nid: int):
     user = need(req)
-    r = fetch_one("SELECT * FROM mrq_requisitions WHERE id=?", (rid,))
-    if not r: raise HTTPException(404, "Not found.")
-    is_admin = is_master(user) or user["role"] == "admin"
-    if not is_admin and user["department"] not in (r["from_dept"], r["to_dept"]): raise HTTPException(403, "Access denied.")
-    r["lines"] = fetch_all("SELECT * FROM mrq_lines WHERE req_id=? ORDER BY sort_order, id", (rid,))
-    return r
-
-@app.post("/api/mrq/requisition")
-def mrq_create(req: Request, payload: dict):
-    user = need(req)
-    category = str(payload.get("category") or "").strip().lower()
-    if category not in MRQ_CATEGORIES: raise HTTPException(400, "Invalid category.")
-    lines = payload.get("lines") or []
-    clean_lines = []
-    for i, ln in enumerate(lines):
-        code = str(ln.get("material_code") or "").strip().upper()
-        qty = float(ln.get("qty_required") or 0)
-        if not code or qty <= 0: continue
-        mat = fetch_one("SELECT * FROM mrq_materials WHERE material_code=?", (code,))
-        if not mat: continue
-        clean_lines.append({"material_code": code, "description": mat["description"], "uom": mat["uom"], "qty_required": qty, "batch_no": "", "qty_issued": 0, "sort_order": i})
-    req_no = f"MRQ-{datetime.date.today().strftime('%Y%m%d')}-{secrets.token_hex(2).upper()}"
-    ct = now()
-    exec_write("INSERT INTO mrq_requisitions (req_no, category, from_dept, from_plant, to_dept, status, remarks, requested_by, requested_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (req_no, category, user["department"], "1000", "Store", "pending", "", user["username"], user["full_name"], ct, ct))
-    header = fetch_one("SELECT id FROM mrq_requisitions WHERE req_no=?", (req_no,))
-    req_id = header["id"]
-    for ln in clean_lines:
-        exec_write("INSERT INTO mrq_lines (req_id, material_code, description, qty_required, batch_no, qty_issued, uom, sort_order) VALUES (?,?,?,?,?,?,?,?)", (req_id, ln["material_code"], ln["description"], ln["qty_required"], ln["batch_no"], ln["qty_issued"], ln["uom"], ln["sort_order"]))
-    return {"ok": True, "id": req_id, "req_no": req_no}
-
-@app.post("/api/mrq/requisition/{rid}/issue")
-def mrq_issue(req: Request, rid: int, payload: dict = None):
-    user = need(req)
-    r = fetch_one("SELECT * FROM mrq_requisitions WHERE id=?", (rid,))
-    if not r: raise HTTPException(404, "Not found.")
-    is_admin = is_master(user) or user["role"] == "admin"
-    if not is_admin and user["department"] != r["to_dept"]: raise HTTPException(403, "Only receiver can issue.")
-    payload = payload or {}
-    issued_to_name = str(payload.get("issued_to_name") or "").strip()
-    lines_in = payload.get("lines") or []
-    line_map = {int(x["id"]): x for x in lines_in if "id" in x}
-    for ln in fetch_all("SELECT * FROM mrq_lines WHERE req_id=?", (rid,)):
-        patch = line_map.get(ln["id"])
-        if not patch: continue
-        exec_write("UPDATE mrq_lines SET batch_no=?, qty_issued=? WHERE id=?", (str(patch.get("batch_no") or "").strip(), float(patch.get("qty_issued") or 0), ln["id"]))
-    ct = now()
-    exec_write("UPDATE mrq_requisitions SET status='issued', issued_by=?, issued_by_name=?, issued_to_name=?, updated_at=? WHERE id=?", (user["username"], user["full_name"], issued_to_name, ct, rid))
-    return {"ok": True}
-
-@app.post("/api/mrq/requisition/{rid}/receive")
-def mrq_receive(req: Request, rid: int):
-    user = need(req)
-    r = fetch_one("SELECT * FROM mrq_requisitions WHERE id=?", (rid,))
-    if not r: raise HTTPException(404, "Not found.")
-    is_admin = is_master(user) or user["role"] == "admin"
-    if not is_admin and user["department"] != r["from_dept"]: raise HTTPException(403, "Only requester can receive.")
-    ct = now()
-    exec_write("UPDATE mrq_requisitions SET status='received', received_by=?, received_by_name=?, updated_at=? WHERE id=?", (user["username"], user["full_name"], ct, rid))
-    return {"ok": True}
-
-@app.post("/api/mrq/requisition/{rid}/cancel")
-def mrq_cancel(req: Request, rid: int, payload: dict):
-    user = need(req)
-    r = fetch_one("SELECT * FROM mrq_requisitions WHERE id=?", (rid,))
-    if not r: raise HTTPException(404, "Not found.")
-    is_admin = is_master(user) or user["role"] == "admin"
-    if not is_admin and user["department"] != r["from_dept"]: raise HTTPException(403, "Only requester or admin can cancel.")
-    reason = str(payload.get("reason") or "").strip()
-    if not reason: raise HTTPException(400, "Reason required.")
-    ct = now()
-    exec_write("UPDATE mrq_requisitions SET status='cancelled', cancelled_at=?, cancelled_by=?, cancel_reason=?, updated_at=? WHERE id=?", (ct, user["username"], reason, ct, rid))
-    return {"ok": True}
-
-@app.delete("/api/mrq/requisition/{rid}")
-def mrq_delete(req: Request, rid: int):
-    user = need(req)
-    if not (is_master(user) or user["role"] == "admin"): raise HTTPException(403, "Admin only.")
-    exec_write("DELETE FROM mrq_lines WHERE req_id=?", (rid,))
-    exec_write("DELETE FROM mrq_requisitions WHERE id=?", (rid,))
-    return {"ok": True}
-
-@app.get("/api/mrq/print/{rid}", response_class=HTMLResponse)
-def mrq_print(req: Request, rid: int):
-    r = fetch_one("SELECT * FROM mrq_requisitions WHERE id=?", (rid,))
-    if not r: return HTMLResponse("Not found", 404)
-    lines = fetch_all("SELECT * FROM mrq_lines WHERE req_id=? ORDER BY sort_order, id", (rid,))
+    note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
+    if not note: raise HTTPException(404, "Note not found.")
+    is_sender = (user["username"] == note["from_user"]) or (user["department"] == note["from_dept"])
+    is_receiver = (user["username"] == note["to_user"]) or (user["department"] == note["to_dept"])
+    cc_hit = f",{user['username']}," in f",{note.get('cc_users') or ''},"
+    if not (is_sender or is_receiver or cc_hit or is_master(user) or user["role"] == "admin"): raise HTTPException(403, "Access denied.")
+    try: headers = json.loads(note["sheet_headers"])
+    except Exception: headers = []
+    try: data_rows = json.loads(note["sheet_data"])
+    except Exception: data_rows = []
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Transfer_Note"
     org = fetch_one("SELECT * FROM org WHERE id=1") or {}
-    cat_title = MRQ_CATEGORIES.get(r["category"], {}).get("title", r["category"].upper())
-    th = ("<th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; background:#e0e7ff; text-align:left'>S.No</th><th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; background:#e0e7ff; text-align:left'>Material Code</th><th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; background:#e0e7ff; text-align:left'>Description</th><th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; background:#e0e7ff; text-align:right'>Qty Required</th><th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; background:#e0e7ff; text-align:left'>Batch No.</th><th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; background:#e0e7ff; text-align:right'>Qty Issued</th>")
-    trs = ""
-    for i, ln in enumerate(lines, 1):
-        trs += (f"<tr><td style='border:1px solid #cbd5e1; padding:6px 8px; font-size:11px'>{i}</td><td style='border:1px solid #cbd5e1; padding:6px 8px; font-size:11px; font-family:monospace'>{esc_py(ln['material_code'])}</td><td style='border:1px solid #cbd5e1; padding:6px 8px; font-size:11px'>{esc_py(ln['description'])}</td><td style='border:1px solid #cbd5e1; padding:6px 8px; font-size:11px; text-align:right'>{ln['qty_required']} {esc_py(ln['uom'])}</td><td style='border:1px solid #cbd5e1; padding:6px 8px; font-size:11px; font-family:monospace'>{esc_py(ln['batch_no'])}</td><td style='border:1px solid #cbd5e1; padding:6px 8px; font-size:11px; text-align:right'>{(ln['qty_issued'] or 0)} {esc_py(ln['uom'])}</td></tr>")
-    status_color = {"pending": "#b45309", "issued": "#0369a1", "received": "#047857", "cancelled": "#b91c1c"}.get(r["status"], "#475569")
-    cancel_html = f"<div style='margin-top:12px; padding:8px 12px; background:#fef2f2; border:1px solid #fecaca; border-radius:8px; color:#b91c1c; font-size:11px'><b>CANCELLED</b> on {esc_py(r['cancelled_at'])} by {esc_py(r['cancelled_by'])} — Reason: {esc_py(r['cancel_reason'])}</div>" if r["status"] == "cancelled" else ""
-    return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>Material Requisition {r['req_no']}</title><style>body {{ font-family: sans-serif; margin: 30px; color: #0f172a; }} table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }} .signs {{ display: grid; grid-template-columns: repeat(3,1fr); gap: 30px; margin-top: 40px; text-align: center; font-size: 11px; font-weight: bold; }} .sign-box {{ border-top: 1px solid #0f172a; padding-top: 8px; }} @media print {{ .no-print {{ display: none; }} body {{ margin: 0; }} }}</style></head><body><div class="no-print" style="text-align:right;margin-bottom:12px"><button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:bold">Print / Save PDF</button></div><div style="display:flex; justify-content:space-between; border-bottom:2px solid #4f46e5; padding-bottom:12px; margin-bottom:14px;"><div><h2 style="margin:0; font-size:18px">{esc_py(org.get('name', 'Thermocables Limited'))}</h2><div style="font-size:11px; color:#475569; margin-top:2px">System: {esc_py(org.get('system_id', 'NX-01'))} · Client: {esc_py(org.get('client', 'GLOBAL'))}</div></div><div style="text-align:right"><div style="font-size:16px; font-weight:700; color:#4f46e5">MATERIAL REQUISITION</div><div style="font-family:monospace; font-weight:700; font-size:13px; margin-top:4px">{r['req_no']}</div><div style="font-size:11px; color:#475569">{esc_py(r['created_at'])}</div></div></div><div style="display:grid; grid-template-columns:repeat(4,1fr); gap:10px; font-size:11px; background:#f8fafc; padding:12px; border:1px solid #e2e8f0; margin-bottom:14px"><div><b>Category:</b><br>{esc_py(cat_title)}</div><div><b>From Dept:</b><br>{esc_py(r['from_dept'])}</div><div><b>From Plant:</b><br>{esc_py(r['from_plant'])}</div><div><b>To Dept:</b><br>{esc_py(r['to_dept'])}</div><div><b>Status:</b><br><span style="color:{status_color}; font-weight:700">{r['status'].upper()}</span></div><div><b>Requested By:</b><br>{esc_py(r['requested_by_name'] or r['requested_by'])}</div><div><b>Issued By:</b><br>{esc_py(r['issued_by_name'] or r['issued_by'] or '—')}</div><div><b>Received By:</b><br>{esc_py(r['received_by_name'] or r['received_by'] or '—')}</div></div><table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table><div style="margin-top:14px; font-size:11px"><b>Remarks:</b> {esc_py(r['remarks'] or '—')}</div>{cancel_html}<div class="signs"><div class="sign-box">Requested By<br><span style="font-weight:400;color:#475569">{esc_py(r['requested_by_name'] or r['requested_by'])}</span></div><div class="sign-box">Issued By (Stores)<br><span style="font-weight:400;color:#475569">{esc_py(r['issued_by_name'] or r['issued_by'] or '____________')}</span></div><div class="sign-box">Received By<br><span style="font-weight:400;color:#475569">{esc_py(r['received_by_name'] or r['received_by'] or r['issued_to_name'] or '____________')}</span></div></div></body></html>""")
+    ws.append([org.get("name", "Thermocables Limited")])
+    ws.append([f"TRANSFER NOTE {note['note_no']} — {note['route']}"])
+    ws.append([f"From: {note['from_plant']} - {note['from_dept']}  |  To: {note['to_plant']} - {note['to_dept']}"])
+    ws.append([f"Sender: {note['from_user_name']}  |  Receiver: {note['to_user_name']}  |  Status: {note['status'].upper()}"])
+    cc_line = f"  |  CC: {note.get('cc_users')}" if note.get("cc_users") else ""
+    ws.append([f"Created: {note['created_at']}  |  Received: {note['received_at'] or 'Pending'}{cc_line}"])
+    ws.append([])
+    ws.append(headers)
+    for row in data_rows: ws.append(row)
+    ws.append([])
+    ws.append(["Handovered By: ________________", "", "Received By: ________________", "", "QC: ________________"])
+    from openpyxl.styles import Font, Alignment, PatternFill
+    header_fill = PatternFill("solid", fgColor="4F46E5")
+    header_font = Font(bold=True, color="FFFFFF")
+    ws["A1"].font = Font(bold=True, size=14)
+    ws["A2"].font = Font(bold=True)
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=7, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+    for col_idx, h in enumerate(headers, 1):
+        ws.column_dimensions[ws.cell(row=7, column=col_idx).column_letter].width = max(14, min(40, len(str(h)) + 4))
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=TransferNote_{note['note_no']}.xlsx"})
 
-# (Standard Modules & Frontend Layouts)
+@app.post("/api/tn01/export-grid")
+def tn01_export_grid(req: Request, payload: dict):
+    user = need(req)
+    headers = payload.get("headers", [])
+    rows = payload.get("rows", [])
+    title = payload.get("title", "Transfer Note (Draft)")
+    if not headers: raise HTTPException(400, "No columns to export.")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Draft_Note"
+    org = fetch_one("SELECT * FROM org WHERE id=1") or {}
+    ws.append([org.get("name", "Thermocables Limited")])
+    ws.append([title])
+    ws.append([f"Prepared by: {user['full_name']} ({user['username']}) · {user['department']}"])
+    ws.append([f"Generated: {now()}"])
+    ws.append([])
+    ws.append(headers)
+    for r in rows: ws.append(r)
+    from openpyxl.styles import Font, Alignment, PatternFill
+    header_fill = PatternFill("solid", fgColor="4F46E5")
+    header_font = Font(bold=True, color="FFFFFF")
+    ws["A1"].font = Font(bold=True, size=14)
+    ws["A2"].font = Font(bold=True)
+    header_row = 6
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=header_row, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+    for col_idx, h in enumerate(headers, 1):
+        ws.column_dimensions[ws.cell(row=header_row, column=col_idx).column_letter].width = max(14, min(40, len(str(h)) + 4))
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=TN01_Draft_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"})
+
+@app.get("/api/tn01/print/{nid}", response_class=HTMLResponse)
+def tn01_print_preview(req: Request, nid: int):
+    need(req)
+    note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
+    if not note: return HTMLResponse("Note not found", 404)
+    org = fetch_one("SELECT * FROM org WHERE id=1") or {}
+    try: headers = json.loads(note["sheet_headers"])
+    except Exception: headers = []
+    try: data_rows = json.loads(note["sheet_data"])
+    except Exception: data_rows = []
+    th = "".join(f"<th style='border:1px solid #0f172a; padding:6px 8px; font-size:11px; background:#e0e7ff'>{h}</th>" for h in headers)
+    trs = "".join(f"<tr>{''.join(f'<td style=\"border:1px solid #cbd5e1; padding:6px 8px; font-size:11px\">{c}</td>' for c in r)}</tr>" for r in data_rows)
+    return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>{note['note_no']}</title><style>body {{ font-family: sans-serif; margin: 30px; color: #0f172a; }} .header {{ border-bottom: 2px solid #4f46e5; padding-bottom: 10px; margin-bottom: 15px; }} .meta {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; font-size: 12px; background: #f8fafc; padding: 12px; border: 1px solid #e2e8f0; margin-bottom: 20px; }} table {{ width: 100%; border-collapse: collapse; margin-bottom: 30px; }} .signs {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-top: 40px; text-align: center; font-size: 11px; font-weight: bold; }} .sign-box {{ border-top: 1px solid #0f172a; padding-top: 8px; }} @media print {{ .no-print {{ display: none; }} body {{ margin: 0; }} }}</style></head><body><div class="no-print" style="margin-bottom:15px;text-align:right"><button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:bold">Print / PDF</button></div><div class="header"><h2 style="margin:0">{org.get('name', 'Thermocables')}</h2><h4 style="margin:4px 0 0;color:#4f46e5">TRANSFER NOTE (TN01)</h4><div style="font-family:monospace;font-weight:bold;margin-top:4px">{note['note_no']} | {note['created_at']}</div></div><div class="meta"><div><b>Route:</b><br>{note['route']}</div><div><b>From:</b><br>{note['from_plant']} - {note['from_dept']}</div><div><b>To:</b><br>{note['to_plant']} - {note['to_dept']}</div><div><b>Entries:</b><br>{note['entry_count']}</div><div><b>Sender:</b><br>{note['from_user_name']}</div><div><b>Recipient:</b><br>{note['to_user_name']}</div><div><b>Status:</b><br>{note['status'].upper()}</div><div><b>Receipt:</b><br>{note['received_at'] or 'Pending'}</div></div><div style="font-size:11px;margin-bottom:10px"><b>CC:</b> {note.get('cc_users') or '—'}</div><table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table><div class="signs"><div class="sign-box">Handovered By ({note['from_user_name']})</div><div class="sign-box">Production | QC</div><div class="sign-box">Received By ({note['received_by_name'] or note['to_user_name']})</div></div></body></html>""")
+
 @app.get("/api/tcode/{code}/layouts")
 def get_layouts(code: str, req: Request):
     user = need(req)
@@ -1148,7 +815,7 @@ def export_excel(code: str, req: Request):
     dynamic_keys = set()
     parsed_rows = []
     for r in rows:
-        try: d = json.loads(r["data"])
+        try: d = json.loads(r["data"]) if isinstance(r["data"], str) else r["data"]
         except Exception: d = {}
         dynamic_keys.update(d.keys())
         parsed_rows.append((r, d))
@@ -1207,7 +874,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc;color:#0f172a;f
     <div class="flex items-center gap-4">
       <div class="flex items-center gap-2.5 cursor-pointer" onclick="goHome()">
         <div class="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white shadow-sm"><i class="ri-pulse-fill text-lg"></i></div>
-        <div class="font-bold text-sm tracking-tight text-slate-900 flex items-center gap-1.5">Nexus Core <span class="text-[10px] bg-indigo-50 text-indigo-600 border border-indigo-200 font-mono px-1.5 py-0.5 rounded">v4.0</span></div>
+        <div class="font-bold text-sm tracking-tight text-slate-900 flex items-center gap-1.5">Nexus Core <span class="text-[10px] bg-indigo-50 text-indigo-600 border border-indigo-200 font-mono px-1.5 py-0.5 rounded">v4.0.1</span></div>
       </div>
       <div class="relative ml-4">
         <i class="ri-search-line absolute left-3 top-2.5 text-slate-400 text-xs"></i>
@@ -1401,7 +1068,6 @@ async function openTcode(code){
   if(code==='SPRO')return renderSPRO();
   if(code==='SE93')return renderSE93();
   if(code==='PFCG')return renderPFCG();
-  if(code==='STUDIO')return renderStudio();
   renderStandardModule(code);
 }
 
@@ -1768,7 +1434,8 @@ async function showEditUserModal(u){
 }
 
 async function submitEditUser(u){
-  const fd=new FormData();fd.append("username",u);fd.append("full_name",$('#eu_fn').value);fd.append("department",$('#eu_d').value);fd.append("role",$('#eu_r').value);fd.append("plants",$('#eu_pl').value);fd.append("status",$('#eu_st').value);
+  const fd=new FormData();
+  fd.append("username",u);fd.append("full_name",$('#eu_fn').value);fd.append("department",$('#eu_d').value);fd.append("role",$('#eu_r').value);fd.append("plants",$('#eu_pl').value);fd.append("status",$('#eu_st').value);
   try{await api('/api/su01/update',{method:'POST',body:fd});closeDialog();renderSU01();}catch(e){alert(e);}
 }
 
@@ -1828,7 +1495,7 @@ async function renderPFCG(){
       <div class="flex justify-between pb-4 border-b">
         <h2 class="text-lg font-bold">Access Control (PFCG)</h2>
         <div class="flex gap-2">
-          <select id="pfcg_u" class="form-input w-56">${m.users.map(u=>`<option value="${esc(u.username)}">${esc(u.username)} (${esc(u.full_name)})</option>`).join('')}</select>
+          <select id="pfcg_u" class="form-input w-56">${m.users.map(u=>`<option value="${esc(u.username)}">${esc(u.full_name||u.username)}</option>`).join('')}</select>
           <select id="pfcg_t" class="form-input w-56">${m.tcodes.map(t=>`<option value="${esc(t.code)}">${esc(t.code)} - ${esc(t.title)}</option>`).join('')}</select>
           <button onclick="grantAccess()" class="btn-primary text-xs px-3 py-2 rounded">+ Grant</button>
         </div>
@@ -1903,13 +1570,14 @@ initSession();
 </html>
 """
 
-@app.get("/", response_class=HTMLResponse)
+# Support both GET and HEAD for Render health check
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def home():
     return HTMLResponse(HTML_UI)
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
-    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "4.0.0"}
+    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "4.0.1"}
 
 if __name__ == "__main__":
     import uvicorn
