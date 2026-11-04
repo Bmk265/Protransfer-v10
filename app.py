@@ -1,13 +1,15 @@
 # =========================================================================
-# NEXUS CORE ERP  —  app.py  —  v5.0.0 (MRQ1 backport from v4.2)
+# NEXUS CORE ERP  —  app.py  —  v5.0.0
 # =========================================================================
 # Consolidated build:
 #   - Base: Final Code v5.0.0 (TN01 with CC, Admin_Erp master, no sample
 #     users, rich standard schemas, Studio Safe Mode, CTST with print+export).
-#   - MRQ1 backend + frontend replaced with the v4.2.0 workflow:
-#       Pending → Issue (Store) → Accept (Requester), plus Cancel,
-#       per-category req_no prefixes, single-material lookup,
-#       print access checks, issued_to_name fallback in the PDF.
+#   - MRQ1 backend + frontend: v4.2.0 workflow (Pending → Issue → Accept,
+#     Cancel, per-category req_no prefixes, single-material lookup,
+#     print access checks, issued_to_name fallback in PDF).
+#   - SU01: Edit user modal with plant picker restored.
+#   - PFCG: user-centric access matrix (AUTO / GRANTED / NO ACCESS / ADMIN)
+#     with inline grant/revoke.
 # =========================================================================
 
 import io
@@ -344,7 +346,7 @@ def init_db():
                 (code, name, 1, cur_time),
             )
 
-    # --- Master Admin (v5.0 single account) ---
+    # --- Master Admin ---
     hashed = bcrypt.hashpw("Swami@265".encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
     cur.execute(q("SELECT username FROM users WHERE username='Admin_Erp'"))
     if cur.fetchone():
@@ -478,7 +480,6 @@ def init_db():
                      cur_time, cur_time),
                 )
 
-    # CTST/MRQ1/TN01 handled by dedicated endpoints — no generic schema
     cur.execute(q("DELETE FROM tcode_schemas WHERE code IN ('CTST','MRQ1','TN01')"))
     cur.execute(q("DELETE FROM tcode_layouts WHERE tcode_code IN ('CTST','MRQ1','TN01')"))
 
@@ -1615,7 +1616,7 @@ Record #{rec['id']} | Plant {esc_py(rec['plant'] or '—')} | Sample {esc_py(d.g
 
 
 # =========================================================================
-# MRQ1 — MATERIAL REQUISITION (v4.2 workflow BACKPORTED)
+# MRQ1 — MATERIAL REQUISITION (v4.2 workflow)
 # =========================================================================
 MRQ_CATEGORIES = {
     "stores": {"title": "Stores Issue", "icon": "ri-store-2-line",
@@ -2714,7 +2715,6 @@ async function api(p, o={}){
   return await r.json();
 }
 
-// ===== LOGON (no credentials shown) =====
 function renderLogon(err=""){
   $('#app_root').innerHTML = `
   <div class="min-h-screen bg-gradient-to-br from-slate-50 to-indigo-50 flex items-center justify-center p-4">
@@ -3005,7 +3005,7 @@ async function deleteCTST(id){
   catch(e) { alert(e); }
 }
 
-// ===== MRQ1 (v4.2 BACKPORT) =====
+// ===== MRQ1 =====
 let MRQ_CATEGORIES = {};
 let MRQ_ACTIVE_CATEGORY = null;
 let MRQ_CART = [];
@@ -3479,7 +3479,7 @@ async function mrqDelete(id) {
   catch(e) { alert(e); }
 }
 
-// ===== TN01 (v5.0 backport, full sheet + CC picker) =====
+// ===== TN01 =====
 let TN01_ROUTES = {}, TN01_ACTIVE_ROUTE = "PROD_TO_QC", TN01_HEADERS = [],
     TN01_ROWS = [], TN01_UNDO = [], TN01_REDO = [], TN01_CELL = { r: 0, c: 1 };
 let TN01_SELECTED_CC = [];
@@ -3835,7 +3835,7 @@ async function deleteTN01History(id){
   catch(e) { alert(e); }
 }
 
-// ===== SU01 / SPRO / PFCG / SE93 / STUDIO / STANDARD =====
+// ===== SU01 (with Edit User modal + plant picker) =====
 async function renderSU01(){
   if(!ME.is_master && ME.role !== 'admin') return setMsg("Denied", true);
   ALL_USERS_LIST = await api('/api/su01/users');
@@ -3847,16 +3847,18 @@ async function renderSU01(){
       </div>
       <div class="flex-1 mt-4 card overflow-auto">
         <table class="custom-table">
-          <thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Dept</th><th>Status</th><th>Actions</th></tr></thead>
+          <thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Dept</th><th>Plants</th><th>Status</th><th>Actions</th></tr></thead>
           <tbody>
             ${ALL_USERS_LIST.map(u => `<tr>
               <td class="font-mono font-bold text-indigo-600">${esc(u.username)}</td>
               <td>${esc(u.full_name)}</td>
               <td><span class="badge badge-slate">${u.role.toUpperCase()}</span></td>
               <td>${esc(u.department)}</td>
+              <td class="font-mono text-xs">${esc(u.plants || 'ALL')}</td>
               <td><span class="badge ${u.status==='approved'?'badge-emerald':'badge-red'}">${u.status}</span></td>
               <td>
-                <button onclick="showResetPassModal('${esc(u.username)}')" class="text-xs text-amber-600 font-semibold">Reset PW</button>
+                <button onclick="showEditUserModal('${esc(u.username)}')" class="text-xs text-indigo-600 font-semibold">Edit</button>
+                <button onclick="showResetPassModal('${esc(u.username)}')" class="text-xs text-amber-600 font-semibold ml-2">Reset PW</button>
                 ${u.role!=='master' ? `<button onclick="deleteUser('${esc(u.username)}')" class="text-xs text-red-600 font-semibold ml-2">Del</button>` : ''}
               </td>
             </tr>`).join('')}
@@ -3894,6 +3896,93 @@ async function submitCreateUser(){
   try { await api('/api/su01/create', {method:'POST', body:fd}); closeDialog(); renderSU01(); }
   catch(e) { alert(e); }
 }
+
+async function showEditUserModal(username){
+  const users = await api('/api/su01/users');
+  const u = users.find(x => x.username === username);
+  if(!u) return alert("User not found");
+  const sp = await api('/api/spro/overview');
+  const assigned = (u.plants || '').split(',').map(s => s.trim()).filter(Boolean);
+
+  openDialog(`
+    <div class="px-6 py-4 border-b bg-slate-50 flex justify-between items-center rounded-t-2xl">
+      <div>
+        <h3 class="font-bold text-sm">Edit User: ${esc(u.username)}</h3>
+        <p class="text-xs text-slate-500">Update details, department, role, or plant access</p>
+      </div>
+      <button onclick="closeDialog()"><i class="ri-close-line text-lg text-slate-500"></i></button>
+    </div>
+    <div class="p-6 space-y-4">
+      <div>
+        <label class="form-label">Full Name</label>
+        <input id="eu_fn" class="form-input" value="${esc(u.full_name)}">
+      </div>
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="form-label">Department</label>
+          <select id="eu_d" class="form-input">
+            ${sp.departments.map(d => `
+              <option value="${esc(d.name)}" ${d.name === u.department ? 'selected' : ''}>
+                ${esc(d.name)}
+              </option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label class="form-label">Role</label>
+          <select id="eu_r" class="form-input">
+            <option value="user"  ${u.role==='user'  ? 'selected' : ''}>User</option>
+            <option value="admin" ${u.role==='admin' ? 'selected' : ''}>Admin</option>
+            ${ME.is_master ? `<option value="master" ${u.role==='master' ? 'selected' : ''}>Master</option>` : ''}
+          </select>
+        </div>
+      </div>
+      <div>
+        <label class="form-label">Status</label>
+        <select id="eu_st" class="form-input">
+          <option value="approved" ${u.status==='approved' ? 'selected' : ''}>Approved</option>
+          <option value="locked"   ${u.status==='locked'   ? 'selected' : ''}>Locked</option>
+        </select>
+      </div>
+      <div>
+        <label class="form-label flex items-center justify-between">
+          <span>Plant Access</span>
+          <span class="text-[10px] text-slate-400 font-normal">Leave all unchecked = access to ALL plants</span>
+        </label>
+        <div class="grid grid-cols-2 gap-2 bg-slate-50 border border-slate-200 rounded-lg p-3">
+          ${sp.plants.map(p => `
+            <label class="flex items-center gap-2 text-xs cursor-pointer hover:bg-white rounded px-2 py-1.5">
+              <input type="checkbox" class="eu-plant" value="${esc(p.code)}"
+                     ${assigned.includes(p.code) ? 'checked' : ''}>
+              <span class="font-mono font-bold text-indigo-600">${esc(p.code)}</span>
+              <span class="text-slate-600">${esc(p.name)}</span>
+            </label>`).join('')}
+        </div>
+      </div>
+    </div>
+    <div class="px-6 py-4 bg-slate-50 border-t border-slate-200 flex justify-end gap-2 rounded-b-2xl">
+      <button onclick="closeDialog()" class="btn-secondary px-4 py-2 rounded-lg text-xs font-semibold">Cancel</button>
+      <button onclick="submitEditUser('${esc(u.username)}')" class="btn-primary px-5 py-2 rounded-lg text-xs font-bold">Save Changes</button>
+    </div>`);
+}
+
+async function submitEditUser(username){
+  const plants = Array.from(document.querySelectorAll('.eu-plant:checked'))
+                     .map(cb => cb.value).join(',');
+  const fd = new FormData();
+  fd.append("username",   username);
+  fd.append("full_name",  $('#eu_fn').value.trim());
+  fd.append("department", $('#eu_d').value);
+  fd.append("role",       $('#eu_r').value);
+  fd.append("status",     $('#eu_st').value);
+  fd.append("plants",     plants);
+  try {
+    await api('/api/su01/update', { method:'POST', body:fd });
+    closeDialog();
+    renderSU01();
+    setMsg(`Updated ${username}`);
+  } catch(e) { alert(e); }
+}
+
 function showResetPassModal(u){
   const p = prompt(`New password for ${u}:`); if(!p) return;
   const fd = new FormData(); fd.append("username", u); fd.append("new_password", p);
@@ -3907,6 +3996,7 @@ async function deleteUser(u){
   catch(e) { alert(e); }
 }
 
+// ===== SPRO / SE93 / STUDIO / STANDARD =====
 async function renderSPRO(){
   if(!ME.is_master && ME.role !== 'admin') return setMsg("Denied", true);
   const d = await api('/api/spro/overview');
@@ -3992,49 +4082,203 @@ async function submitSE93(ev){
   } catch(e) { alert(e); }
 }
 
+// ===== PFCG (user-centric access management) =====
 async function renderPFCG(){
   if(!ME.is_master && ME.role !== 'admin') return setMsg("Denied", true);
   const m = await api('/api/pfcg/matrix');
+
+  const userBy = {};
+  m.users.forEach(u => { userBy[u.username] = u; });
+  const tcodeBy = {};
+  m.tcodes.forEach(t => {
+    tcodeBy[t.code] = t;
+    t._allowed = (t.allowed_depts || '').split(',').map(s => s.trim()).filter(Boolean);
+  });
+  const grantsBy = {};
+  m.grants.forEach(g => {
+    if(!grantsBy[g.username]) grantsBy[g.username] = new Set();
+    grantsBy[g.username].add(g.tcode_code);
+  });
+
+  const effective = {};
+  m.users.forEach(u => {
+    effective[u.username] = {};
+    if(u.role === 'admin' || u.role === 'master'){
+      m.tcodes.forEach(t => { effective[u.username][t.code] = 'admin'; });
+      return;
+    }
+    m.tcodes.forEach(t => {
+      if(t._allowed.includes(u.department)){
+        effective[u.username][t.code] = 'auto';
+      } else if(grantsBy[u.username] && grantsBy[u.username].has(t.code)){
+        effective[u.username][t.code] = 'granted';
+      }
+    });
+  });
+
+  window._PFCG = { users: m.users, tcodes: m.tcodes, userBy, tcodeBy, grantsBy, effective, selUser: null };
+
   $('#main_screen').innerHTML = `
-    <div class="flex-1 flex flex-col p-6 overflow-hidden">
-      <div class="flex justify-between pb-4 border-b">
-        <h2 class="text-lg font-bold">Access Control (PFCG)</h2>
-        <div class="flex gap-2">
-          <select id="pfcg_u" class="form-input w-56">
-            ${m.users.map(u=>`<option value="${esc(u.username)}">${esc(u.full_name||u.username)}</option>`).join('')}
-          </select>
-          <select id="pfcg_t" class="form-input w-56">
-            ${m.tcodes.map(t=>`<option value="${esc(t.code)}">${esc(t.code)} - ${esc(t.title)}</option>`).join('')}
-          </select>
-          <button onclick="grantAccess()" class="btn-primary text-xs px-3 py-2 rounded">+ Grant</button>
+    <div class="flex-1 flex flex-col p-6 overflow-hidden select-text">
+      <div class="flex items-center justify-between pb-4 border-b border-slate-200 shrink-0">
+        <div>
+          <h2 class="text-lg font-bold text-slate-900">Access Control (PFCG)</h2>
+          <p class="text-xs text-slate-500">
+            Effective access = department default <span class="badge badge-indigo ml-1">AUTO</span>
+            or explicit grant <span class="badge badge-emerald ml-1">GRANTED</span>
+            · Admin/Master see all <span class="badge badge-slate ml-1">ADMIN</span>
+          </p>
+        </div>
+        <button onclick="renderPFCG()" class="btn-secondary text-xs px-3 py-1.5 rounded-lg">
+          <i class="ri-refresh-line"></i> Refresh
+        </button>
+      </div>
+
+      <div class="flex-1 mt-4 grid grid-cols-1 lg:grid-cols-3 gap-4 overflow-hidden">
+        <div class="card overflow-hidden flex flex-col">
+          <div class="p-3 border-b bg-slate-50">
+            <span class="text-xs font-bold uppercase text-slate-700">Users (${m.users.length})</span>
+          </div>
+          <div class="flex-1 overflow-auto">
+            <table class="custom-table">
+              <thead><tr><th>User</th><th>Dept</th><th>Role</th></tr></thead>
+              <tbody>
+                ${m.users.map(u => {
+                  return `<tr onclick="pfcgSelectUser('${esc(u.username)}')"
+                             class="cursor-pointer hover:bg-slate-50" data-user="${esc(u.username)}">
+                    <td>
+                      <div class="font-mono font-bold text-indigo-600">${esc(u.username)}</div>
+                      <div class="text-xs text-slate-500">${esc(u.full_name)}</div>
+                    </td>
+                    <td class="text-xs">${esc(u.department)}</td>
+                    <td><span class="badge badge-slate">${u.role.toUpperCase()}</span></td>
+                  </tr>`;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="lg:col-span-2 card overflow-hidden flex flex-col" id="pfcg_access_panel">
+          <div class="p-3 border-b bg-slate-50 flex items-center justify-between">
+            <span class="text-xs font-bold uppercase text-slate-700" id="pfcg_selected_label">
+              <i class="ri-shield-user-line text-indigo-500"></i> Select a user
+            </span>
+            <span class="text-xs text-slate-500" id="pfcg_selected_sub"></span>
+          </div>
+          <div class="flex-1 overflow-auto" id="pfcg_access_body">
+            <div class="text-xs text-slate-400 text-center pt-10">
+              Click a user on the left to view and manage their module access.
+            </div>
+          </div>
         </div>
       </div>
-      <div class="flex-1 mt-4 card overflow-auto">
-        <table class="custom-table">
-          <thead><tr><th>User</th><th>Module</th><th>By</th><th>Action</th></tr></thead>
-          <tbody>
-            ${m.grants.map(g=>`<tr>
-              <td class="font-mono">${esc(g.username)}</td>
-              <td class="font-mono">${esc(g.tcode_code)}</td>
-              <td>${esc(g.granted_by)}</td>
-              <td><button onclick="revokeAccess('${esc(g.username)}','${esc(g.tcode_code)}')" class="text-xs text-red-600 font-semibold">Revoke</button></td>
-            </tr>`).join('')}
-          </tbody>
-        </table>
-      </div>
     </div>`;
-}
-async function grantAccess(){
-  const fd = new FormData();
-  fd.append("username", $('#pfcg_u').value); fd.append("tcode", $('#pfcg_t').value);
-  await api('/api/pfcg/grant', {method:'POST', body:fd}); renderPFCG();
-}
-async function revokeAccess(u, t){
-  if(!confirm("Revoke?")) return;
-  const fd = new FormData(); fd.append("username", u); fd.append("tcode", t);
-  await api('/api/pfcg/revoke', {method:'POST', body:fd}); renderPFCG();
+
+  const first = m.users.find(u => u.role !== 'master') || m.users[0];
+  if(first) pfcgSelectUser(first.username);
 }
 
+function pfcgSelectUser(username){
+  const P = window._PFCG;
+  if(!P) return;
+  P.selUser = username;
+  const u = P.userBy[username];
+  if(!u) return;
+
+  document.querySelectorAll('#main_screen tbody tr[data-user]').forEach(tr => {
+    if(tr.getAttribute('data-user') === username){
+      tr.classList.add('bg-indigo-50');
+      tr.classList.remove('hover:bg-slate-50');
+    } else {
+      tr.classList.remove('bg-indigo-50');
+      tr.classList.add('hover:bg-slate-50');
+    }
+  });
+
+  const label = document.getElementById('pfcg_selected_label');
+  const sub = document.getElementById('pfcg_selected_sub');
+  const body = document.getElementById('pfcg_access_body');
+  if(!body) return;
+
+  label.innerHTML = `<i class="ri-shield-user-line text-indigo-500"></i> ${esc(u.full_name)} <span class="text-slate-400 font-mono">(${esc(u.username)})</span>`;
+  sub.textContent = `${u.department} · ${u.role}`;
+
+  const isAdminOrMaster = u.role === 'admin' || u.role === 'master';
+
+  body.innerHTML = `
+    <table class="custom-table">
+      <thead><tr>
+        <th>Module</th>
+        <th>Title</th>
+        <th>Dept Scope</th>
+        <th>Access</th>
+        <th>Action</th>
+      </tr></thead>
+      <tbody>
+        ${P.tcodes.map(t => {
+          const eff = P.effective[username][t.code];
+          let badge, action = '';
+          if(eff === 'admin'){
+            badge = '<span class="badge badge-slate">ADMIN (all)</span>';
+            action = '<span class="text-xs text-slate-400">—</span>';
+          } else if(eff === 'auto'){
+            badge = '<span class="badge badge-indigo">AUTO</span>';
+            action = `<button onclick="pfcgGrant('${esc(username)}','${esc(t.code)}')"
+                        class="text-xs text-emerald-600 font-semibold">+ Grant override</button>`;
+          } else if(eff === 'granted'){
+            badge = '<span class="badge badge-emerald">GRANTED</span>';
+            action = `<button onclick="pfcgRevoke('${esc(username)}','${esc(t.code)}')"
+                        class="text-xs text-red-600 font-semibold">Revoke</button>`;
+          } else {
+            badge = '<span class="badge badge-red">NO ACCESS</span>';
+            action = `<button onclick="pfcgGrant('${esc(username)}','${esc(t.code)}')"
+                        class="text-xs text-emerald-600 font-semibold">+ Grant</button>`;
+          }
+          return `<tr>
+            <td class="font-mono font-bold text-indigo-600">${esc(t.code)}</td>
+            <td class="text-xs">${esc(t.title)}</td>
+            <td class="text-xs text-slate-500">${esc((t.allowed_depts||'—'))}</td>
+            <td>${badge}</td>
+            <td>${action}</td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>
+
+    ${isAdminOrMaster ? `<div class="p-3 text-xs text-slate-500 bg-slate-50 border-t">
+      <i class="ri-information-line text-indigo-500"></i>
+      This user is an <b>${u.role.toUpperCase()}</b> — full access to all modules is granted by role, not by PFCG.
+    </div>` : ''}
+  `;
+}
+
+async function pfcgGrant(username, tcode){
+  const fd = new FormData();
+  fd.append("username", username);
+  fd.append("tcode",    tcode);
+  try {
+    await api('/api/pfcg/grant', { method:'POST', body:fd });
+    setMsg(`Granted ${tcode} → ${username}`);
+    await renderPFCG();
+    pfcgSelectUser(username);
+  } catch(e) { alert(e); }
+}
+
+async function pfcgRevoke(username, tcode){
+  if(!confirm(`Revoke ${tcode} access from ${username}?`)) return;
+  const fd = new FormData();
+  fd.append("username", username);
+  fd.append("tcode",    tcode);
+  try {
+    await api('/api/pfcg/revoke', { method:'POST', body:fd });
+    setMsg(`Revoked ${tcode} from ${username}`);
+    await renderPFCG();
+    pfcgSelectUser(username);
+  } catch(e) { alert(e); }
+}
+
+// ===== STUDIO =====
 async function renderStudio(){
   if(!ME.is_master) return setMsg("Master only", true);
   const hist = await api('/api/studio/history');
