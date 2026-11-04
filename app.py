@@ -1,21 +1,6 @@
 # =========================================================================
 # NEXUS CORE ERP  —  app.py  —  v3.9.0 + MRQ1 + TN01 CC
 # =========================================================================
-#
-# This is the expanded (readable) build. Every section has a comment header.
-# The AI Code Studio is hardened with a "Safe Mode" so core modules cannot
-# be destroyed by a bad paste. Every apply snapshots the full module state
-# before touching the DB — rollback restores schema + data + layouts.
-#
-# -------------------------------------------------------------------------
-#  IMPORTANT — STUDIO PROTECTION
-# -------------------------------------------------------------------------
-#  Codes in STUDIO_PROTECTED cannot be created, updated, or deleted via
-#  the AI Studio. To allow editing a protected module, remove its code
-#  from the set below. Sample users, seed modules, and all system
-#  modules live here.
-#
-# =========================================================================
 
 import io
 import json
@@ -34,19 +19,11 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import load_workbook, Workbook
 
-
-# =========================================================================
-# STUDIO PROTECTION SET
-# =========================================================================
 STUDIO_PROTECTED = {
     "TN01", "CTST", "SU01", "SPRO", "SE93", "PFCG", "STUDIO", "MRQ1",
     "PROD", "GCH0", "NCR0", "PLN0", "QCH0", "STD0",
 }
 
-
-# =========================================================================
-# DATABASE ENGINE SETUP
-# =========================================================================
 DATABASE_URL = os.environ.get("DATABASE_URL")
 USE_PG = bool(DATABASE_URL and DATABASE_URL.startswith("postgres"))
 
@@ -58,7 +35,6 @@ if USE_PG:
 
 DB_PATH = Path(__file__).parent / "nexus_erp.db"
 
-
 def get_conn():
     if USE_PG:
         return psycopg2.connect(DATABASE_URL, sslmode="require")
@@ -66,12 +42,8 @@ def get_conn():
     con.row_factory = sqlite3.Row
     return con
 
-
 def q(sql: str) -> str:
-    if USE_PG:
-        return sql.replace("?", "%s")
-    return sql
-
+    return sql.replace("?", "%s") if USE_PG else sql
 
 def fetch_all(sql: str, params=()):
     conn = get_conn()
@@ -83,7 +55,6 @@ def fetch_all(sql: str, params=()):
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
     finally:
         conn.close()
-
 
 def fetch_one(sql: str, params=()):
     conn = get_conn()
@@ -98,7 +69,6 @@ def fetch_one(sql: str, params=()):
     finally:
         conn.close()
 
-
 def exec_write(sql: str, params=()):
     conn = get_conn()
     try:
@@ -112,16 +82,12 @@ def exec_write(sql: str, params=()):
     finally:
         conn.close()
 
-
 def now() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-
 def esc_py(s) -> str:
-    if s is None:
-        return ""
+    if s is None: return ""
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
 
 def json_serial(obj):
     if isinstance(obj, (datetime.datetime, datetime.date)):
@@ -130,27 +96,14 @@ def json_serial(obj):
         return obj.strftime("%Y-%m-%d")
     return str(obj)
 
-
-# =========================================================================
-# FIELD TYPE INFERENCE (used by SE93 auto-create from file)
-# =========================================================================
 def infer_field_type(sample_values):
-    if not sample_values:
-        return "text"
-
+    if not sample_values: return "text"
     is_num = True
     is_date = True
     is_long = False
-
-    date_patterns = [
-        r"^\d{4}-\d{2}-\d{2}",
-        r"^\d{2}/\d{2}/\d{4}",
-        r"^\d{2}-\d{2}-\d{4}",
-    ]
-
+    date_patterns = [r"^\d{4}-\d{2}-\d{2}", r"^\d{2}/\d{2}/\d{4}", r"^\d{2}-\d{2}-\d{4}"]
     for v in sample_values:
-        if v is None or v == "":
-            continue
+        if v is None or v == "": continue
         if isinstance(v, (datetime.datetime, datetime.date)):
             is_num = False
             continue
@@ -166,520 +119,226 @@ def infer_field_type(sample_values):
         if len(s) > 1 and s[0] == "0" and s.isdigit():
             is_num = False
         else:
-            try:
-                float(s.replace(",", ""))
-            except ValueError:
-                is_num = False
-        if not any(re.match(p, s) for p in date_patterns):
-            is_date = False
-
-    if is_date:
-        return "date"
-    if is_num:
-        return "number"
-    if is_long:
-        return "textarea"
+            try: float(s.replace(",", ""))
+            except ValueError: is_num = False
+        if not any(re.match(p, s) for p in date_patterns): is_date = False
+    if is_date: return "date"
+    if is_num: return "number"
+    if is_long: return "textarea"
     return "text"
 
-
-# =========================================================================
-# DATABASE INITIALISATION
-# =========================================================================
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
 
     if USE_PG:
         try:
-            cur.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name='tcodes' AND column_name='color';"
-            )
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='tcodes' AND column_name='color';")
             if cur.fetchone():
-                cur.execute(
-                    "DROP TABLE IF EXISTS tcodes CASCADE; "
-                    "DROP TABLE IF EXISTS tcode_schemas CASCADE; "
-                    "DROP TABLE IF EXISTS tcode_layouts CASCADE;"
-                )
-
-            cur.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name='users' AND column_name='sub_department';"
-            )
-            if cur.fetchone():
-                cur.execute("DROP TABLE IF EXISTS users CASCADE;")
-
-            cur.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name='plants' AND column_name='code';"
-            )
-            if not cur.fetchone():
-                cur.execute("DROP TABLE IF EXISTS plants CASCADE;")
-
-            cur.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name='org' AND column_name='system_id';"
-            )
-            if not cur.fetchone():
-                cur.execute("DROP TABLE IF EXISTS org CASCADE;")
-
-            cur.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name='tcode_records' AND column_name='plant';"
-            )
-            if not cur.fetchone():
-                cur.execute(
-                    "ALTER TABLE tcode_records ADD COLUMN IF NOT EXISTS plant TEXT DEFAULT '';"
-                )
-
+                cur.execute("DROP TABLE IF EXISTS tcodes CASCADE; DROP TABLE IF EXISTS tcode_schemas CASCADE; DROP TABLE IF EXISTS tcode_layouts CASCADE;")
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users' AND column_name='sub_department';")
+            if cur.fetchone(): cur.execute("DROP TABLE IF EXISTS users CASCADE;")
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='plants' AND column_name='code';")
+            if not cur.fetchone(): cur.execute("DROP TABLE IF EXISTS plants CASCADE;")
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='org' AND column_name='system_id';")
+            if not cur.fetchone(): cur.execute("DROP TABLE IF EXISTS org CASCADE;")
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='tcode_records' AND column_name='plant';")
+            if not cur.fetchone(): cur.execute("ALTER TABLE tcode_records ADD COLUMN IF NOT EXISTS plant TEXT DEFAULT '';")
             conn.commit()
         except Exception as e:
             print("Auto-migration notice:", e)
             conn.rollback()
 
     schema_template = """
-    CREATE TABLE IF NOT EXISTS users (
-        username TEXT PRIMARY KEY, password_hash TEXT, full_name TEXT,
-        role TEXT, department TEXT, plants TEXT DEFAULT '',
-        status TEXT DEFAULT 'approved', created_at TEXT, updated_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS sessions (
-        token TEXT PRIMARY KEY, username TEXT, expires TEXT
-    );
-    CREATE TABLE IF NOT EXISTS departments (
-        name TEXT PRIMARY KEY, active INT DEFAULT 1, created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS plants (
-        code TEXT PRIMARY KEY, name TEXT, active INT DEFAULT 1, created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS org (
-        id INT PRIMARY KEY, name TEXT, system_id TEXT, client TEXT
-    );
-    CREATE TABLE IF NOT EXISTS tcodes (
-        code TEXT PRIMARY KEY, title TEXT, description TEXT, module TEXT,
-        allowed_depts TEXT, active INT DEFAULT 1, created_at TEXT,
-        updated_at TEXT, created_by TEXT
-    );
-    CREATE TABLE IF NOT EXISTS tcode_schemas (
-        code TEXT PRIMARY KEY, fields TEXT, layout TEXT, updated_at TEXT, updated_by TEXT
-    );
-    CREATE TABLE IF NOT EXISTS tcode_records (
-        id {IDTYPE}, tcode_code TEXT, plant TEXT DEFAULT '',
-        data TEXT, status TEXT DEFAULT 'active', created_by TEXT,
-        created_by_name TEXT, created_at TEXT, updated_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS tcode_layouts (
-        id {IDTYPE}, tcode_code TEXT, layout_code TEXT UNIQUE, name TEXT,
-        title TEXT, is_default INT DEFAULT 0, fields TEXT, layout_config TEXT,
-        description TEXT, created_by TEXT, created_by_name TEXT,
-        created_at TEXT, updated_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS access_grants (
-        id {IDTYPE}, username TEXT, tcode_code TEXT, granted_by TEXT,
-        granted_at TEXT, UNIQUE(username, tcode_code)
-    );
-    CREATE TABLE IF NOT EXISTS transfer_notes (
-        id {IDTYPE}, note_no TEXT UNIQUE, layout_key TEXT, route TEXT,
-        from_plant TEXT, from_dept TEXT, from_user TEXT, from_user_name TEXT,
-        to_plant TEXT, to_dept TEXT, to_user TEXT, to_user_name TEXT,
-        entry_count INT DEFAULT 0, sheet_headers TEXT, sheet_data TEXT,
-        status TEXT DEFAULT 'sent', remarks TEXT DEFAULT '', created_at TEXT,
-        received_at TEXT DEFAULT '', received_by TEXT DEFAULT '',
-        received_by_name TEXT DEFAULT '',
-        cc_users TEXT DEFAULT ''
-    );
-    CREATE TABLE IF NOT EXISTS module_specs (
-        id {IDTYPE}, tcode_code TEXT, version INT, action TEXT, spec TEXT,
-        applied_by TEXT, applied_at TEXT, note TEXT
-    );
-    CREATE TABLE IF NOT EXISTS mrq_materials (
-        material_code TEXT PRIMARY KEY, description TEXT NOT NULL,
-        category TEXT DEFAULT 'stores', uom TEXT DEFAULT 'NOS', created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS mrq_requisitions (
-        id {IDTYPE}, req_no TEXT UNIQUE, category TEXT NOT NULL,
-        from_dept TEXT NOT NULL, from_plant TEXT DEFAULT '',
-        to_dept TEXT DEFAULT 'Store', status TEXT DEFAULT 'pending',
-        remarks TEXT DEFAULT '', requested_by TEXT, requested_by_name TEXT,
-        issued_by TEXT, issued_by_name TEXT, issued_to_name TEXT,
-        received_by TEXT, received_by_name TEXT,
-        created_at TEXT, updated_at TEXT, cancelled_at TEXT,
-        cancelled_by TEXT, cancel_reason TEXT DEFAULT ''
-    );
-    CREATE TABLE IF NOT EXISTS mrq_lines (
-        id {IDTYPE}, req_id INT, material_code TEXT, description TEXT,
-        qty_required REAL DEFAULT 0, batch_no TEXT DEFAULT '',
-        qty_issued REAL DEFAULT 0, uom TEXT DEFAULT 'NOS',
-        sort_order INT DEFAULT 0
-    );
+    CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password_hash TEXT, full_name TEXT, role TEXT, department TEXT, plants TEXT DEFAULT '', status TEXT DEFAULT 'approved', created_at TEXT, updated_at TEXT);
+    CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, username TEXT, expires TEXT);
+    CREATE TABLE IF NOT EXISTS departments (name TEXT PRIMARY KEY, active INT DEFAULT 1, created_at TEXT);
+    CREATE TABLE IF NOT EXISTS plants (code TEXT PRIMARY KEY, name TEXT, active INT DEFAULT 1, created_at TEXT);
+    CREATE TABLE IF NOT EXISTS org (id INT PRIMARY KEY, name TEXT, system_id TEXT, client TEXT);
+    CREATE TABLE IF NOT EXISTS tcodes (code TEXT PRIMARY KEY, title TEXT, description TEXT, module TEXT, allowed_depts TEXT, active INT DEFAULT 1, created_at TEXT, updated_at TEXT, created_by TEXT);
+    CREATE TABLE IF NOT EXISTS tcode_schemas (code TEXT PRIMARY KEY, fields TEXT, layout TEXT, updated_at TEXT, updated_by TEXT);
+    CREATE TABLE IF NOT EXISTS tcode_records (id {IDTYPE}, tcode_code TEXT, plant TEXT DEFAULT '', data TEXT, status TEXT DEFAULT 'active', created_by TEXT, created_by_name TEXT, created_at TEXT, updated_at TEXT);
+    CREATE TABLE IF NOT EXISTS tcode_layouts (id {IDTYPE}, tcode_code TEXT, layout_code TEXT UNIQUE, name TEXT, title TEXT, is_default INT DEFAULT 0, fields TEXT, layout_config TEXT, description TEXT, created_by TEXT, created_by_name TEXT, created_at TEXT, updated_at TEXT);
+    CREATE TABLE IF NOT EXISTS access_grants (id {IDTYPE}, username TEXT, tcode_code TEXT, granted_by TEXT, granted_at TEXT, UNIQUE(username, tcode_code));
+    CREATE TABLE IF NOT EXISTS transfer_notes (id {IDTYPE}, note_no TEXT UNIQUE, layout_key TEXT, route TEXT, from_plant TEXT, from_dept TEXT, from_user TEXT, from_user_name TEXT, to_plant TEXT, to_dept TEXT, to_user TEXT, to_user_name TEXT, entry_count INT DEFAULT 0, sheet_headers TEXT, sheet_data TEXT, status TEXT DEFAULT 'sent', remarks TEXT DEFAULT '', created_at TEXT, received_at TEXT DEFAULT '', received_by TEXT DEFAULT '', received_by_name TEXT DEFAULT '', cc_users TEXT DEFAULT '');
+    CREATE TABLE IF NOT EXISTS module_specs (id {IDTYPE}, tcode_code TEXT, version INT, action TEXT, spec TEXT, applied_by TEXT, applied_at TEXT, note TEXT);
+    CREATE TABLE IF NOT EXISTS mrq_materials (material_code TEXT PRIMARY KEY, description TEXT NOT NULL, category TEXT DEFAULT 'stores', uom TEXT DEFAULT 'NOS', created_at TEXT);
+    CREATE TABLE IF NOT EXISTS mrq_requisitions (id {IDTYPE}, req_no TEXT UNIQUE, category TEXT NOT NULL, from_dept TEXT NOT NULL, from_plant TEXT DEFAULT '', to_dept TEXT DEFAULT 'Store', status TEXT DEFAULT 'pending', remarks TEXT DEFAULT '', requested_by TEXT, requested_by_name TEXT, issued_by TEXT, issued_by_name TEXT, issued_to_name TEXT, received_by TEXT, received_by_name TEXT, created_at TEXT, updated_at TEXT, cancelled_at TEXT, cancelled_by TEXT, cancel_reason TEXT DEFAULT '');
+    CREATE TABLE IF NOT EXISTS mrq_lines (id {IDTYPE}, req_id INT, material_code TEXT, description TEXT, qty_required REAL DEFAULT 0, batch_no TEXT DEFAULT '', qty_issued REAL DEFAULT 0, uom TEXT DEFAULT 'NOS', sort_order INT DEFAULT 0);
     """
 
     if USE_PG:
         cur.execute(schema_template.replace("{IDTYPE}", "SERIAL PRIMARY KEY"))
         try:
-            cur.execute(
-                "SELECT setval(pg_get_serial_sequence('tcode_records','id'), "
-                "COALESCE((SELECT MAX(id)+1 FROM tcode_records), 1), false);"
-            )
-            cur.execute(
-                "SELECT setval(pg_get_serial_sequence('transfer_notes','id'), "
-                "COALESCE((SELECT MAX(id)+1 FROM transfer_notes), 1), false);"
-            )
+            cur.execute("SELECT setval(pg_get_serial_sequence('tcode_records','id'), COALESCE((SELECT MAX(id)+1 FROM tcode_records), 1), false);")
+            cur.execute("SELECT setval(pg_get_serial_sequence('transfer_notes','id'), COALESCE((SELECT MAX(id)+1 FROM transfer_notes), 1), false);")
             conn.commit()
-        except Exception:
-            conn.rollback()
+        except Exception: conn.rollback()
     else:
-        cur.executescript(
-            schema_template.replace("{IDTYPE}", "INTEGER PRIMARY KEY AUTOINCREMENT")
-        )
+        cur.executescript(schema_template.replace("{IDTYPE}", "INTEGER PRIMARY KEY AUTOINCREMENT"))
 
     conn.commit()
 
-    # --- Legacy column guards (additive only, non-destructive) ---
     for tbl, col, ddl in [
-        ("mrq_requisitions", "issued_to_name",
-         "ALTER TABLE mrq_requisitions ADD COLUMN issued_to_name TEXT"),
-        ("transfer_notes", "cc_users",
-         "ALTER TABLE transfer_notes ADD COLUMN cc_users TEXT DEFAULT ''"),
+        ("mrq_requisitions", "issued_to_name", "ALTER TABLE mrq_requisitions ADD COLUMN issued_to_name TEXT"),
+        ("transfer_notes", "cc_users", "ALTER TABLE transfer_notes ADD COLUMN cc_users TEXT DEFAULT ''"),
     ]:
-        try:
-            cur.execute(q(f"SELECT {col} FROM {tbl} LIMIT 1"))
+        try: cur.execute(q(f"SELECT {col} FROM {tbl} LIMIT 1"))
         except Exception:
             conn.rollback()
             try:
                 cur.execute(ddl)
                 conn.commit()
-            except Exception:
-                conn.rollback()
+            except Exception: conn.rollback()
 
     cur_time = now()
     cur.execute(q("SELECT 1 FROM org WHERE id=1"))
     if not cur.fetchone():
-        cur.execute(
-            q("INSERT INTO org (id, name, system_id, client) VALUES (?,?,?,?)"),
-            (1, "Thermocables Limited", "NX-01", "GLOBAL"),
-        )
+        cur.execute(q("INSERT INTO org (id, name, system_id, client) VALUES (?,?,?,?)"), (1, "Thermocables Limited", "NX-01", "GLOBAL"))
 
-    for dept_name in [
-        "Production", "Final Testing", "Quality Control",
-        "Commercial", "Store", "Planning", "Engineering",
-    ]:
+    for dept_name in ["Production", "Final Testing", "Quality Control", "Commercial", "Store", "Planning", "Engineering"]:
         cur.execute(q("SELECT 1 FROM departments WHERE name=?"), (dept_name,))
         if not cur.fetchone():
-            cur.execute(
-                q("INSERT INTO departments (name, active, created_at) VALUES (?,?,?)"),
-                (dept_name, 1, cur_time),
-            )
+            cur.execute(q("INSERT INTO departments (name, active, created_at) VALUES (?,?,?)"), (dept_name, 1, cur_time))
 
-    for code, name in [
-        ("1000", "Gooty Central Plant"),
-        ("1400", "Extrusion Unit 1400"),
-        ("2000", "Hyderabad Works"),
-        ("CORP", "Corporate Headquarters"),
-    ]:
+    for code, name in [("1000", "Gooty Central Plant"), ("1400", "Extrusion Unit 1400"), ("2000", "Hyderabad Works"), ("CORP", "Corporate Headquarters")]:
         cur.execute(q("SELECT 1 FROM plants WHERE code=?"), (code,))
         if not cur.fetchone():
-            cur.execute(
-                q("INSERT INTO plants (code, name, active, created_at) VALUES (?,?,?,?)"),
-                (code, name, 1, cur_time),
-            )
+            cur.execute(q("INSERT INTO plants (code, name, active, created_at) VALUES (?,?,?,?)"), (code, name, 1, cur_time))
 
-    hashed = bcrypt.hashpw("Admin@123".encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-    cur.execute(q("SELECT username FROM users WHERE username='admin'"))
+    # Admin credentials updated
+    hashed = bcrypt.hashpw("Swami@265".encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    cur.execute(q("SELECT username FROM users WHERE username='Admin_Erp'"))
     if cur.fetchone():
-        cur.execute(
-            q("UPDATE users SET password_hash=?, status='approved', role='master' "
-              "WHERE username='admin'"),
-            (hashed,),
-        )
+        cur.execute(q("UPDATE users SET password_hash=?, status='approved', role='master' WHERE username='Admin_Erp'"), (hashed,))
     else:
-        cur.execute(
-            q("INSERT INTO users (username, password_hash, full_name, role, "
-              "department, plants, status, created_at, updated_at) "
-              "VALUES (?,?,?,?,?,?,?,?,?)"),
-            (
-                "admin", hashed, "Master System Administrator", "master",
-                "IT & Systems", "1000,1400,2000,CORP", "approved",
-                cur_time, cur_time,
-            ),
-        )
+        cur.execute(q("INSERT INTO users (username, password_hash, full_name, role, department, plants, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"), ("Admin_Erp", hashed, "Master System Administrator", "master", "IT & Systems", "1000,1400,2000,CORP", "approved", cur_time, cur_time))
 
-    for uname, fname, dept, plts in [
-        ("prod_user", "Production Supervisor", "Production", "1000"),
-        ("testing_lead", "Final Testing Incharge", "Final Testing", "1000"),
-        ("comm_lead", "Commercial Manager", "Commercial", "1000"),
-        ("store_head", "Store Incharge", "Store", "1000"),
-        ("qc_lead", "Quality Control Incharge", "Quality Control", "1000"),
-    ]:
+    for uname, fname, dept, plts in [("prod_user", "Production Supervisor", "Production", "1000"), ("testing_lead", "Final Testing Incharge", "Final Testing", "1000"), ("comm_lead", "Commercial Manager", "Commercial", "1000"), ("store_head", "Store Incharge", "Store", "1000"), ("qc_lead", "Quality Control Incharge", "Quality Control", "1000")]:
         cur.execute(q("SELECT 1 FROM users WHERE username=?"), (uname,))
         if not cur.fetchone():
-            cur.execute(
-                q("INSERT INTO users (username, password_hash, full_name, role, "
-                  "department, plants, status, created_at, updated_at) "
-                  "VALUES (?,?,?,?,?,?,?,?,?)"),
-                (uname, hashed, fname, "user", dept, plts, "approved",
-                 cur_time, cur_time),
-            )
+            cur.execute(q("INSERT INTO users (username, password_hash, full_name, role, department, plants, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"), (uname, hashed, fname, "user", dept, plts, "approved", cur_time, cur_time))
 
     for code, title, desc, mod, depts in [
-        ("TN01", "Transfer Note & Handover Sheet",
-         "Inter-department material handover & batch transfer note",
-         "MM",
-         "Production,Final Testing,Commercial,Store,Quality Control,Planning"),
-        ("CTST", "Cable Type-Test Calculator",
-         "CR, Braid Coverage, Tubular & Dumbbell mechanical tests",
-         "QC", "Quality Control,Final Testing,Engineering"),
-        ("MRQ1", "Material Requisition",
-         "Department-to-Stores material request (Stores / Inhouse / Conductor)",
-         "MM",
-         "Production,Final Testing,Quality Control,Commercial,Store,Planning,Engineering"),
-        ("PROD", "Production Handover Report",
-         "Manufacturing batch & lot transfer logs",
-         "PROD", "Production,Quality Control"),
-        ("GCH0", "Quality Green Card Release",
-         "Incoming QA & physical cable release inspection",
-         "QC", "Quality Control,Production"),
-        ("NCR0", "Non-Conformance Incidents",
-         "QC deviation & defect corrective tracking",
-         "QC", "Quality Control,Final Testing,Production"),
-        ("PLN0", "Production Planning Details",
-         "Machine allocation and manufacturing order queue",
-         "PLAN", "Planning,Production,Store"),
-        ("QCH0", "Stage QC to Final Clearance",
-         "Clearance release slips before shipment",
-         "QC", "Quality Control,Final Testing"),
-        ("STD0", "Inventory Transfer Orders",
-         "Inter-plant and store material movements",
-         "INV", "Store,Planning,Production"),
+        ("TN01", "Transfer Note & Handover Sheet", "Inter-department material handover & batch transfer note", "MM", "Production,Final Testing,Commercial,Store,Quality Control,Planning"),
+        ("CTST", "Cable Type-Test Calculator", "CR, Braid Coverage, Tubular & Dumbbell mechanical tests", "QC", "Production,Final Testing,Quality Control,Commercial,Store,Planning,Engineering"),
+        ("MRQ1", "Material Requisition", "Department-to-Stores material request (Stores / Inhouse / Conductor)", "MM", "Production,Final Testing,Quality Control,Commercial,Store,Planning,Engineering"),
+        ("PROD", "Production Handover Report", "Manufacturing batch & lot transfer logs", "PROD", "Production,Quality Control"),
+        ("GCH0", "Quality Green Card Release", "Incoming QA & physical cable release inspection", "QC", "Quality Control,Production"),
+        ("NCR0", "Non-Conformance Incidents", "QC deviation & defect corrective tracking", "QC", "Quality Control,Final Testing,Production"),
+        ("PLN0", "Production Planning Details", "Machine allocation and manufacturing order queue", "PLAN", "Planning,Production,Store"),
+        ("QCH0", "Stage QC to Final Clearance", "Clearance release slips before shipment", "QC", "Quality Control,Final Testing"),
+        ("STD0", "Inventory Transfer Orders", "Inter-plant and store material movements", "INV", "Store,Planning,Production"),
     ]:
         cur.execute(q("SELECT 1 FROM tcodes WHERE code=?"), (code,))
         if not cur.fetchone():
-            cur.execute(
-                q("INSERT INTO tcodes (code, title, description, module, "
-                  "allowed_depts, active, created_at, updated_at, created_by) "
-                  "VALUES (?,?,?,?,?,?,?,?,?)"),
-                (code, title, desc, mod, depts, 1, cur_time, cur_time, "SYSTEM"),
-            )
+            cur.execute(q("INSERT INTO tcodes (code, title, description, module, allowed_depts, active, created_at, updated_at, created_by) VALUES (?,?,?,?,?,?,?,?,?)"), (code, title, desc, mod, depts, 1, cur_time, cur_time, "SYSTEM"))
+        else:
+            # Force update CTST departments to allow all existing users to access it
+            if code == "CTST":
+                cur.execute(q("UPDATE tcodes SET allowed_depts=? WHERE code='CTST'"), (depts,))
 
     cur.execute(q("DELETE FROM tcode_schemas WHERE code='CTST'"))
     cur.execute(q("DELETE FROM tcode_layouts WHERE tcode_code='CTST'"))
-
     conn.commit()
     conn.close()
 
-
 init_db()
 
-
-# =========================================================================
-# AUTHENTICATION HELPERS
-# =========================================================================
 def get_user(req: Request):
     token = None
     auth_header = req.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
         token = auth_header.split(" ")[1].strip()
-    if not token:
-        token = req.cookies.get("nexus_session")
-    if not token:
-        return None
-
+    if not token: token = req.cookies.get("nexus_session")
+    if not token: return None
     session = fetch_one("SELECT * FROM sessions WHERE token=?", (token,))
-    if not session:
-        return None
-
+    if not session: return None
     user = fetch_one("SELECT * FROM users WHERE username=?", (session["username"],))
-    if user and user["status"] == "approved":
-        return user
+    if user and user["status"] == "approved": return user
     return None
-
 
 def need(req: Request):
     user = get_user(req)
-    if not user:
-        raise HTTPException(401, "Authentication required.")
+    if not user: raise HTTPException(401, "Authentication required.")
     return user
 
-
 def is_master(user) -> bool:
-    return user["role"] == "master" or user["username"] == "admin"
-
+    return user["role"] == "master" or user["username"] == "Admin_Erp"
 
 def need_admin(req: Request):
     user = need(req)
-    if user["role"] not in ["admin", "master"]:
-        raise HTTPException(403, "Admin access required.")
+    if user["role"] not in ["admin", "master"]: raise HTTPException(403, "Admin access required.")
     return user
-
 
 def need_master(req: Request):
     user = need(req)
-    if not is_master(user):
-        raise HTTPException(403, "Master access required.")
+    if not is_master(user): raise HTTPException(403, "Master access required.")
     return user
-
 
 def check_tcode_access(user, code: str) -> bool:
     code = code.upper().strip()
-    if is_master(user) or user["role"] == "admin":
-        return True
-
+    if is_master(user) or user["role"] == "admin": return True
     tc = fetch_one("SELECT * FROM tcodes WHERE code=? AND active=1", (code,))
-    if not tc:
-        return False
-
+    if not tc: return False
     allowed = [x.strip() for x in (tc["allowed_depts"] or "").split(",") if x.strip()]
-    if user["department"] in allowed:
-        return True
-
-    granted = fetch_one(
-        "SELECT 1 FROM access_grants WHERE username=? AND tcode_code=?",
-        (user["username"], code),
-    )
+    if user["department"] in allowed: return True
+    granted = fetch_one("SELECT 1 FROM access_grants WHERE username=? AND tcode_code=?", (user["username"], code))
     return bool(granted)
 
-
-# =========================================================================
-# FASTAPI APP
-# =========================================================================
 app = FastAPI(title="Nexus Core ERP", version="3.9.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-
-# =========================================================================
-# AUTH ENDPOINTS
-# =========================================================================
 @app.post("/api/login")
 def api_login(res: Response, username: str = Form(...), password: str = Form(...)):
     username = username.lower().strip()
     user = fetch_one("SELECT * FROM users WHERE username=?", (username,))
-
-    if not user or not bcrypt.checkpw(
-        password.encode("utf-8"), user["password_hash"].encode("utf-8")
-    ):
+    if not user or not bcrypt.checkpw(password.encode("utf-8"), user["password_hash"].encode("utf-8")):
         raise HTTPException(401, "Invalid username or password.")
-
-    if user["status"] != "approved":
-        raise HTTPException(403, "Account is locked or pending approval.")
-
+    if user["status"] != "approved": raise HTTPException(403, "Account is locked or pending approval.")
     token = secrets.token_hex(32)
-    expires = (
-        datetime.datetime.now() + datetime.timedelta(days=7)
-    ).strftime("%Y-%m-%d %H:%M:%S")
-
-    exec_write(
-        "INSERT INTO sessions (token, username, expires) VALUES (?,?,?)",
-        (token, username, expires),
-    )
-
-    res.set_cookie(
-        "nexus_session", token, httponly=True, samesite="lax", max_age=86400 * 7
-    )
-
-    return {
-        "ok": True,
-        "token": token,
-        "user": {
-            "username": user["username"],
-            "full_name": user["full_name"],
-            "role": user["role"],
-        },
-    }
-
+    expires = (datetime.datetime.now() + datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    exec_write("INSERT INTO sessions (token, username, expires) VALUES (?,?,?)", (token, username, expires))
+    res.set_cookie("nexus_session", token, httponly=True, samesite="lax", max_age=86400 * 7)
+    return {"ok": True, "token": token, "user": {"username": user["username"], "full_name": user["full_name"], "role": user["role"]}}
 
 @app.post("/api/logout")
 def api_logout(res: Response, req: Request):
-    token = (
-        req.headers.get("Authorization", "").replace("Bearer ", "").strip()
-        or req.cookies.get("nexus_session")
-    )
-    if token:
-        exec_write("DELETE FROM sessions WHERE token=?", (token,))
+    token = (req.headers.get("Authorization", "").replace("Bearer ", "").strip() or req.cookies.get("nexus_session"))
+    if token: exec_write("DELETE FROM sessions WHERE token=?", (token,))
     res.delete_cookie("nexus_session")
     return {"ok": True}
-
 
 @app.get("/api/me")
 def api_me(req: Request):
     user = need(req)
     org_info = fetch_one("SELECT * FROM org WHERE id=1") or {}
+    return {"username": user["username"], "full_name": user["full_name"], "role": user["role"], "department": user["department"], "plants": [p for p in (user["plants"] or "").split(",") if p], "is_master": is_master(user), "system": org_info.get("system_id", "NX-01"), "client": org_info.get("client", "GLOBAL"), "company": org_info.get("name", "Thermocables Limited")}
 
-    return {
-        "username": user["username"],
-        "full_name": user["full_name"],
-        "role": user["role"],
-        "department": user["department"],
-        "plants": [p for p in (user["plants"] or "").split(",") if p],
-        "is_master": is_master(user),
-        "system": org_info.get("system_id", "NX-01"),
-        "client": org_info.get("client", "GLOBAL"),
-        "company": org_info.get("name", "Thermocables Limited"),
-    }
-
-
-# =========================================================================
-# SPRO — ENTERPRISE STRUCTURE
-# =========================================================================
 @app.get("/api/spro/overview")
 def spro_overview(req: Request):
     need(req)
-    return {
-        "org": fetch_one("SELECT * FROM org WHERE id=1"),
-        "departments": fetch_all("SELECT * FROM departments ORDER BY name"),
-        "plants": fetch_all("SELECT * FROM plants ORDER BY code"),
-    }
-
+    return {"org": fetch_one("SELECT * FROM org WHERE id=1"), "departments": fetch_all("SELECT * FROM departments ORDER BY name"), "plants": fetch_all("SELECT * FROM plants ORDER BY code")}
 
 @app.post("/api/admin/org/update")
-def spro_update_org(
-    req: Request,
-    name: str = Form(...),
-    system_id: str = Form(...),
-    client: str = Form(...),
-):
+def spro_update_org(req: Request, name: str = Form(...), system_id: str = Form(...), client: str = Form(...)):
     need_master(req)
-    exec_write(
-        "UPDATE org SET name=?, system_id=?, client=? WHERE id=1",
-        (name.strip(), system_id.strip(), client.strip()),
-    )
+    exec_write("UPDATE org SET name=?, system_id=?, client=? WHERE id=1", (name.strip(), system_id.strip(), client.strip()))
     return {"ok": True}
-
 
 @app.post("/api/admin/plants/create")
 def spro_create_plant(req: Request, code: str = Form(...), name: str = Form(...)):
     need_master(req)
     code = code.upper().strip()
-
-    if fetch_one("SELECT 1 FROM plants WHERE code=?", (code,)):
-        raise HTTPException(400, f"Plant '{code}' already exists.")
-
-    exec_write(
-        "INSERT INTO plants (code, name, active, created_at) VALUES (?,?,?,?)",
-        (code, name.strip(), 1, now()),
-    )
+    if fetch_one("SELECT 1 FROM plants WHERE code=?", (code,)): raise HTTPException(400, f"Plant '{code}' already exists.")
+    exec_write("INSERT INTO plants (code, name, active, created_at) VALUES (?,?,?,?)", (code, name.strip(), 1, now()))
     return {"ok": True}
-
 
 @app.post("/api/admin/plants/update")
-def spro_update_plant(
-    req: Request,
-    code: str = Form(...),
-    name: str = Form(...),
-    active: int = Form(1),
-):
+def spro_update_plant(req: Request, code: str = Form(...), name: str = Form(...), active: int = Form(1)):
     need_master(req)
-    exec_write(
-        "UPDATE plants SET name=?, active=? WHERE code=?",
-        (name.strip(), active, code.upper().strip()),
-    )
+    exec_write("UPDATE plants SET name=?, active=? WHERE code=?", (name.strip(), active, code.upper().strip()))
     return {"ok": True}
-
 
 @app.post("/api/admin/plants/delete")
 def spro_delete_plant(req: Request, code: str = Form(...)):
@@ -687,21 +346,13 @@ def spro_delete_plant(req: Request, code: str = Form(...)):
     exec_write("DELETE FROM plants WHERE code=?", (code.strip(),))
     return {"ok": True}
 
-
 @app.post("/api/admin/departments/create")
 def spro_create_dept(req: Request, name: str = Form(...)):
     need_master(req)
     name = name.strip()
-
-    if fetch_one("SELECT 1 FROM departments WHERE name=?", (name,)):
-        raise HTTPException(400, "Department already exists.")
-
-    exec_write(
-        "INSERT INTO departments (name, active, created_at) VALUES (?,?,?)",
-        (name, 1, now()),
-    )
+    if fetch_one("SELECT 1 FROM departments WHERE name=?", (name,)): raise HTTPException(400, "Department already exists.")
+    exec_write("INSERT INTO departments (name, active, created_at) VALUES (?,?,?)", (name, 1, now()))
     return {"ok": True}
-
 
 @app.post("/api/admin/departments/delete")
 def spro_delete_dept(req: Request, name: str = Form(...)):
@@ -709,374 +360,170 @@ def spro_delete_dept(req: Request, name: str = Form(...)):
     exec_write("DELETE FROM departments WHERE name=?", (name.strip(),))
     return {"ok": True}
 
-
-# =========================================================================
-# SU01 — USER DIRECTORY
-# =========================================================================
 @app.get("/api/su01/users")
 def su01_list_users(req: Request):
     need_admin(req)
-    return fetch_all(
-        "SELECT username, full_name, role, department, plants, status, "
-        "created_at, updated_at FROM users ORDER BY username"
-    )
-
+    return fetch_all("SELECT username, full_name, role, department, plants, status, created_at, updated_at FROM users ORDER BY username")
 
 @app.post("/api/su01/create")
-def su01_create_user(
-    req: Request,
-    username: str = Form(...),
-    password: str = Form(...),
-    full_name: str = Form(...),
-    department: str = Form(...),
-    plants: str = Form(""),
-    role: str = Form("user"),
-):
+def su01_create_user(req: Request, username: str = Form(...), password: str = Form(...), full_name: str = Form(...), department: str = Form(...), plants: str = Form(""), role: str = Form("user")):
     caller = need_admin(req)
     username = username.lower().strip()
-
-    if role == "master" and not is_master(caller):
-        raise HTTPException(403, "Only Master Admins can create master accounts.")
-
-    if fetch_one("SELECT 1 FROM users WHERE username=?", (username,)):
-        raise HTTPException(400, f"User '{username}' already exists.")
-
+    if role == "master" and not is_master(caller): raise HTTPException(403, "Only Master Admins can create master accounts.")
+    if fetch_one("SELECT 1 FROM users WHERE username=?", (username,)): raise HTTPException(400, f"User '{username}' already exists.")
     hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
     cur_time = now()
-
-    exec_write(
-        "INSERT INTO users (username, password_hash, full_name, role, department, "
-        "plants, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        (username, hashed, full_name.strip(), role, department.strip(),
-         plants.strip(), "approved", cur_time, cur_time),
-    )
+    exec_write("INSERT INTO users (username, password_hash, full_name, role, department, plants, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)", (username, hashed, full_name.strip(), role, department.strip(), plants.strip(), "approved", cur_time, cur_time))
     return {"ok": True}
 
-
 @app.post("/api/su01/update")
-def su01_update_user(
-    req: Request,
-    username: str = Form(...),
-    full_name: str = Form(...),
-    department: str = Form(...),
-    plants: str = Form(""),
-    role: str = Form(...),
-    status: str = Form(...),
-):
+def su01_update_user(req: Request, username: str = Form(...), full_name: str = Form(...), department: str = Form(...), plants: str = Form(""), role: str = Form(...), status: str = Form(...)):
     caller = need_admin(req)
     username = username.lower().strip()
     target = fetch_one("SELECT * FROM users WHERE username=?", (username,))
-
-    if not target:
-        raise HTTPException(404, "User not found.")
-
-    if is_master(target) and not is_master(caller):
-        raise HTTPException(403, "Cannot modify a Master Administrator.")
-
-    if role == "master" and not is_master(caller):
-        raise HTTPException(403, "Cannot grant Master privileges.")
-
-    exec_write(
-        "UPDATE users SET full_name=?, department=?, plants=?, role=?, status=?, "
-        "updated_at=? WHERE username=?",
-        (full_name.strip(), department.strip(), plants.strip(), role, status,
-         now(), username),
-    )
+    if not target: raise HTTPException(404, "User not found.")
+    if is_master(target) and not is_master(caller): raise HTTPException(403, "Cannot modify a Master Administrator.")
+    if role == "master" and not is_master(caller): raise HTTPException(403, "Cannot grant Master privileges.")
+    exec_write("UPDATE users SET full_name=?, department=?, plants=?, role=?, status=?, updated_at=? WHERE username=?", (full_name.strip(), department.strip(), plants.strip(), role, status, now(), username))
     return {"ok": True}
-
 
 @app.post("/api/su01/delete")
 def su01_delete_user(req: Request, username: str = Form(...)):
     caller = need_admin(req)
     username = username.lower().strip()
     target = fetch_one("SELECT * FROM users WHERE username=?", (username,))
-
-    if not target:
-        raise HTTPException(404, "User not found.")
-
-    if is_master(target):
-        raise HTTPException(400, "Master account is protected from deletion.")
-
-    if target["role"] == "admin" and not is_master(caller):
-        raise HTTPException(403, "Only Master Admins can delete admin accounts.")
-
-    if username == caller["username"]:
-        raise HTTPException(400, "You cannot delete your own account.")
-
+    if not target: raise HTTPException(404, "User not found.")
+    if is_master(target): raise HTTPException(400, "Master account is protected from deletion.")
+    if target["role"] == "admin" and not is_master(caller): raise HTTPException(403, "Only Master Admins can delete admin accounts.")
+    if username == caller["username"]: raise HTTPException(400, "You cannot delete your own account.")
     exec_write("DELETE FROM users WHERE username=?", (username,))
     exec_write("DELETE FROM sessions WHERE username=?", (username,))
     exec_write("DELETE FROM access_grants WHERE username=?", (username,))
     return {"ok": True}
 
-
 @app.post("/api/su01/reset-password")
-def su01_reset_password(
-    req: Request,
-    username: str = Form(...),
-    new_password: str = Form(...),
-):
+def su01_reset_password(req: Request, username: str = Form(...), new_password: str = Form(...)):
     caller = need_admin(req)
     username = username.lower().strip()
     target = fetch_one("SELECT * FROM users WHERE username=?", (username,))
-
-    if not target:
-        raise HTTPException(404, "User not found.")
-
-    if is_master(target) and not is_master(caller):
-        raise HTTPException(403, "Cannot reset master account.")
-
-    hashed = bcrypt.hashpw(
-        new_password.encode("utf-8"), bcrypt.gensalt()
-    ).decode("utf-8")
-
-    exec_write(
-        "UPDATE users SET password_hash=?, updated_at=? WHERE username=?",
-        (hashed, now(), username),
-    )
+    if not target: raise HTTPException(404, "User not found.")
+    if is_master(target) and not is_master(caller): raise HTTPException(403, "Cannot reset master account.")
+    hashed = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    exec_write("UPDATE users SET password_hash=?, updated_at=? WHERE username=?", (hashed, now(), username))
     exec_write("DELETE FROM sessions WHERE username=?", (username,))
     return {"ok": True}
 
-
-# =========================================================================
-# PFCG — ACCESS CONTROL
-# =========================================================================
 @app.get("/api/pfcg/matrix")
 def pfcg_matrix(req: Request):
     need_admin(req)
-    return {
-        "users": fetch_all(
-            "SELECT username, full_name, role, department FROM users ORDER BY username"
-        ),
-        "tcodes": fetch_all(
-            "SELECT code, title, module, allowed_depts FROM tcodes "
-            "WHERE active=1 ORDER BY code"
-        ),
-        "grants": fetch_all("SELECT * FROM access_grants"),
-    }
-
+    return {"users": fetch_all("SELECT username, full_name, role, department FROM users ORDER BY username"), "tcodes": fetch_all("SELECT code, title, module, allowed_depts FROM tcodes WHERE active=1 ORDER BY code"), "grants": fetch_all("SELECT * FROM access_grants")}
 
 @app.post("/api/pfcg/grant")
 def pfcg_grant(req: Request, username: str = Form(...), tcode: str = Form(...)):
     caller = need_admin(req)
     u_val = username.lower().strip()
     tc_val = tcode.upper().strip()
-
     if USE_PG:
-        exec_write(
-            "INSERT INTO access_grants (username, tcode_code, granted_by, "
-            "granted_at) VALUES (?,?,?,?) "
-            "ON CONFLICT (username, tcode_code) DO NOTHING",
-            (u_val, tc_val, caller["username"], now()),
-        )
+        exec_write("INSERT INTO access_grants (username, tcode_code, granted_by, granted_at) VALUES (?,?,?,?) ON CONFLICT (username, tcode_code) DO NOTHING", (u_val, tc_val, caller["username"], now()))
     else:
-        exec_write(
-            "INSERT OR IGNORE INTO access_grants (username, tcode_code, "
-            "granted_by, granted_at) VALUES (?,?,?,?)",
-            (u_val, tc_val, caller["username"], now()),
-        )
+        exec_write("INSERT OR IGNORE INTO access_grants (username, tcode_code, granted_by, granted_at) VALUES (?,?,?,?)", (u_val, tc_val, caller["username"], now()))
     return {"ok": True}
-
 
 @app.post("/api/pfcg/revoke")
 def pfcg_revoke(req: Request, username: str = Form(...), tcode: str = Form(...)):
     need_admin(req)
-    exec_write(
-        "DELETE FROM access_grants WHERE username=? AND tcode_code=?",
-        (username.lower().strip(), tcode.upper().strip()),
-    )
+    exec_write("DELETE FROM access_grants WHERE username=? AND tcode_code=?", (username.lower().strip(), tcode.upper().strip()))
     return {"ok": True}
 
-
-# =========================================================================
-# SE93 — MODULE STUDIO
-# =========================================================================
 @app.get("/api/se93/list")
 def se93_list(req: Request):
     user = need(req)
     all_tcodes = fetch_all("SELECT * FROM tcodes ORDER BY code")
-
     for t in all_tcodes:
-        t["layout_count"] = fetch_one(
-            "SELECT COUNT(*) AS c FROM tcode_layouts WHERE tcode_code=?",
-            (t["code"],),
-        )["c"]
-        t["record_count"] = fetch_one(
-            "SELECT COUNT(*) AS c FROM tcode_records "
-            "WHERE tcode_code=? AND status='active'",
-            (t["code"],),
-        )["c"]
+        t["layout_count"] = fetch_one("SELECT COUNT(*) AS c FROM tcode_layouts WHERE tcode_code=?", (t["code"],))["c"]
+        t["record_count"] = fetch_one("SELECT COUNT(*) AS c FROM tcode_records WHERE tcode_code=? AND status='active'", (t["code"],))["c"]
         t["has_access"] = check_tcode_access(user, t["code"])
-
     return all_tcodes
 
-
 @app.post("/api/se93/auto-create")
-async def se93_auto_create(
-    req: Request,
-    code: str = Form(...),
-    title: str = Form(...),
-    description: str = Form(""),
-    module: str = Form("PROD"),
-    allowed_depts: str = Form("Production,Quality Control"),
-    import_sample_data: int = Form(1),
-    file: UploadFile = File(...),
-):
+async def se93_auto_create(req: Request, code: str = Form(...), title: str = Form(...), description: str = Form(""), module: str = Form("PROD"), allowed_depts: str = Form("Production,Quality Control"), import_sample_data: int = Form(1), file: UploadFile = File(...)):
     user = need_admin(req)
     code = code.upper().strip()
-
-    if not code:
-        raise HTTPException(400, "T-Code identifier is required.")
-
-    if fetch_one("SELECT 1 FROM tcodes WHERE code=?", (code,)):
-        raise HTTPException(400, f"Module '{code}' already exists.")
-
+    if not code: raise HTTPException(400, "T-Code identifier is required.")
+    if fetch_one("SELECT 1 FROM tcodes WHERE code=?", (code,)): raise HTTPException(400, f"Module '{code}' already exists.")
     contents = await file.read()
     filename = file.filename.lower()
     headers = []
     data_rows = []
-
     try:
         if filename.endswith(".xlsx") or filename.endswith(".xls"):
             wb = load_workbook(io.BytesIO(contents), data_only=True)
             rows = list(wb.active.iter_rows(values_only=True))
             if rows:
-                headers = [str(h).strip() for h in rows[0]
-                           if h is not None and str(h).strip()]
+                headers = [str(h).strip() for h in rows[0] if h is not None and str(h).strip()]
                 data_rows = rows[1:]
-
         elif filename.endswith(".csv"):
             text = contents.decode("utf-8", errors="ignore")
             rows = list(csv.reader(io.StringIO(text)))
             if rows:
                 headers = [str(h).strip() for h in rows[0] if str(h).strip()]
                 data_rows = rows[1:]
-
         elif filename.endswith(".json"):
             parsed = json.loads(contents.decode("utf-8", errors="ignore"))
             if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
                 headers = list(parsed[0].keys())
-                for item in parsed:
-                    data_rows.append([item.get(k, "") for k in headers])
-        else:
-            raise HTTPException(400, "Upload .xlsx / .xls / .csv / .json only.")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(400, f"Template error: {str(e)}")
-
-    if not headers:
-        raise HTTPException(400, "No valid column headers found.")
-
+                for item in parsed: data_rows.append([item.get(k, "") for k in headers])
+        else: raise HTTPException(400, "Upload .xlsx / .xls / .csv / .json only.")
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(400, f"Template error: {str(e)}")
+    if not headers: raise HTTPException(400, "No valid column headers found.")
     col_samples = {idx: [] for idx in range(len(headers))}
     for row in data_rows[:25]:
         for ci in range(len(headers)):
-            if ci < len(row) and row[ci] is not None:
-                col_samples[ci].append(row[ci])
-
+            if ci < len(row) and row[ci] is not None: col_samples[ci].append(row[ci])
     fields = []
     for idx, h in enumerate(headers):
         clean_key = re.sub(r"[^a-zA-Z0-9_]", "_", h.lower().strip())
         clean_key = re.sub(r"_+", "_", clean_key).strip("_") or f"col_{idx+1}"
         ftype = infer_field_type(col_samples[idx])
-        fields.append({
-            "key": clean_key,
-            "label": h,
-            "type": ftype,
-            "required": False,
-            "width": 2 if ftype == "textarea" else 1,
-        })
-
+        fields.append({"key": clean_key, "label": h, "type": ftype, "required": False, "width": 2 if ftype == "textarea" else 1})
     cur_time = now()
-
-    exec_write(
-        "INSERT INTO tcodes (code, title, description, module, allowed_depts, "
-        "active, created_at, updated_at, created_by) VALUES (?,?,?,?,?,?,?,?,?)",
-        (code, title.strip() or f"{code} Module", description.strip(),
-         module.strip(), allowed_depts.strip(), 1, cur_time, cur_time,
-         user["username"]),
-    )
-
+    exec_write("INSERT INTO tcodes (code, title, description, module, allowed_depts, active, created_at, updated_at, created_by) VALUES (?,?,?,?,?,?,?,?,?)", (code, title.strip() or f"{code} Module", description.strip(), module.strip(), allowed_depts.strip(), 1, cur_time, cur_time, user["username"]))
     fields_json = json.dumps(fields)
-    exec_write(
-        "INSERT INTO tcode_schemas (code, fields, layout, updated_at, updated_by) "
-        "VALUES (?,?,?,?,?)",
-        (code, fields_json, json.dumps({"columns": 3}), cur_time,
-         user["username"]),
-    )
-    exec_write(
-        "INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, "
-        "is_default, fields, layout_config, description, created_by, "
-        "created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (code, f"GRID_{code}_01", "Default Grid", title or code, 1,
-         fields_json, json.dumps({"columns": 3}), "Auto-generated",
-         user["username"], user["full_name"], cur_time, cur_time),
-    )
-
+    exec_write("INSERT INTO tcode_schemas (code, fields, layout, updated_at, updated_by) VALUES (?,?,?,?,?)", (code, fields_json, json.dumps({"columns": 3}), cur_time, user["username"]))
+    exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (code, f"GRID_{code}_01", "Default Grid", title or code, 1, fields_json, json.dumps({"columns": 3}), "Auto-generated", user["username"], user["full_name"], cur_time, cur_time))
     imported = 0
     if import_sample_data and data_rows:
         conn = get_conn()
         try:
             cur = conn.cursor()
-            insert_sql = q(
-                "INSERT INTO tcode_records (tcode_code, plant, data, status, "
-                "created_by, created_by_name, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?)"
-            )
-            default_plant = (
-                (user.get("plants") or "1000").split(",")[0].strip() or "1000"
-            )
-
+            insert_sql = q("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)")
+            default_plant = ((user.get("plants") or "1000").split(",")[0].strip() or "1000")
             for row in data_rows:
-                if not any(row):
-                    continue
+                if not any(row): continue
                 rec = {}
                 row_plant = default_plant
                 for idx in range(len(headers)):
                     if idx < len(row):
                         v = row[idx]
-                        if v is None:
-                            v = ""
+                        if v is None: v = ""
                         elif isinstance(v, (datetime.datetime, datetime.date)):
-                            if isinstance(v, datetime.datetime):
-                                v = v.strftime("%Y-%m-%d %H:%M:%S")
-                            else:
-                                v = v.strftime("%Y-%m-%d")
+                            if isinstance(v, datetime.datetime): v = v.strftime("%Y-%m-%d %H:%M:%S")
+                            else: v = v.strftime("%Y-%m-%d")
                         key = fields[idx]["key"]
-                        if key in ["plant", "facility"]:
-                            row_plant = str(v or default_plant).strip()
-                        else:
-                            rec[key] = v
-                cur.execute(insert_sql, (
-                    code, row_plant,
-                    json.dumps(rec, default=json_serial), "active",
-                    user["username"], user["full_name"], cur_time, cur_time,
-                ))
+                        if key in ["plant", "facility"]: row_plant = str(v or default_plant).strip()
+                        else: rec[key] = v
+                cur.execute(insert_sql, (code, row_plant, json.dumps(rec, default=json_serial), "active", user["username"], user["full_name"], cur_time, cur_time))
                 imported += 1
             conn.commit()
-        finally:
-            conn.close()
-
-    return {
-        "ok": True,
-        "code": code,
-        "title": title,
-        "columns_count": len(fields),
-        "imported_count": imported,
-    }
-
+        finally: conn.close()
+    return {"ok": True, "code": code, "title": title, "columns_count": len(fields), "imported_count": imported}
 
 @app.post("/api/se93/delete")
 def se93_delete(req: Request, code: str = Form(...)):
     need_master(req)
     code = code.upper().strip()
-
-    if code in STUDIO_PROTECTED:
-        raise HTTPException(
-            403,
-            f"'{code}' is a protected system module and cannot be deleted.",
-        )
-
+    if code in STUDIO_PROTECTED: raise HTTPException(403, f"'{code}' is a protected system module and cannot be deleted.")
     exec_write("DELETE FROM tcodes WHERE code=?", (code,))
     exec_write("DELETE FROM tcode_schemas WHERE code=?", (code,))
     exec_write("DELETE FROM tcode_layouts WHERE tcode_code=?", (code,))
@@ -1084,50 +531,25 @@ def se93_delete(req: Request, code: str = Form(...)):
     exec_write("DELETE FROM access_grants WHERE tcode_code=?", (code,))
     return {"ok": True}
 
-
-# =========================================================================
-# AI CODE STUDIO — SAFE MODE
-# =========================================================================
 VALID_TYPES = {"text", "number", "date", "textarea", "select", "email", "tel"}
 RESERVED_CODES = {"TN01", "SU01", "SPRO", "SE93", "PFCG", "STUDIO", "CTST", "MRQ1"}
-
 
 def _snapshot_module(code: str) -> dict:
     tc = fetch_one("SELECT * FROM tcodes WHERE code=?", (code,))
     schema = fetch_one("SELECT * FROM tcode_schemas WHERE code=?", (code,))
     layouts = fetch_all("SELECT * FROM tcode_layouts WHERE tcode_code=?", (code,))
-    records = fetch_all(
-        "SELECT id, plant, data, status, created_by, created_by_name, "
-        "created_at, updated_at FROM tcode_records WHERE tcode_code=?",
-        (code,),
-    )
+    records = fetch_all("SELECT id, plant, data, status, created_by, created_by_name, created_at, updated_at FROM tcode_records WHERE tcode_code=?", (code,))
     grants = fetch_all("SELECT * FROM access_grants WHERE tcode_code=?", (code,))
-
     if schema:
-        try:
-            schema["fields"] = json.loads(schema["fields"])
-        except Exception:
-            pass
+        try: schema["fields"] = json.loads(schema["fields"])
+        except Exception: pass
     for lay in layouts:
-        try:
-            lay["fields"] = json.loads(lay["fields"])
-        except Exception:
-            pass
+        try: lay["fields"] = json.loads(lay["fields"])
+        except Exception: pass
     for rec in records:
-        try:
-            rec["data"] = json.loads(rec["data"])
-        except Exception:
-            pass
-
-    return {
-        "tcode": tc,
-        "schema": schema,
-        "layouts": layouts,
-        "records": records,
-        "grants": grants,
-        "snapshot_at": now(),
-    }
-
+        try: rec["data"] = json.loads(rec["data"])
+        except Exception: pass
+    return {"tcode": tc, "schema": schema, "layouts": layouts, "records": records, "grants": grants, "snapshot_at": now()}
 
 def _restore_module(code: str, snapshot: dict):
     exec_write("DELETE FROM tcodes WHERE code=?", (code,))
@@ -1135,379 +557,151 @@ def _restore_module(code: str, snapshot: dict):
     exec_write("DELETE FROM tcode_layouts WHERE tcode_code=?", (code,))
     exec_write("DELETE FROM tcode_records WHERE tcode_code=?", (code,))
     exec_write("DELETE FROM access_grants WHERE tcode_code=?", (code,))
-
     tc = snapshot.get("tcode")
     if tc:
-        exec_write(
-            "INSERT INTO tcodes (code, title, description, module, "
-            "allowed_depts, active, created_at, updated_at, created_by) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (tc["code"], tc["title"], tc.get("description") or "",
-             tc.get("module") or "", tc.get("allowed_depts") or "",
-             tc.get("active", 1), tc.get("created_at") or now(),
-             tc.get("updated_at") or now(), tc.get("created_by") or ""),
-        )
-
+        exec_write("INSERT INTO tcodes (code, title, description, module, allowed_depts, active, created_at, updated_at, created_by) VALUES (?,?,?,?,?,?,?,?,?)", (tc["code"], tc["title"], tc.get("description") or "", tc.get("module") or "", tc.get("allowed_depts") or "", tc.get("active", 1), tc.get("created_at") or now(), tc.get("updated_at") or now(), tc.get("created_by") or ""))
     sch = snapshot.get("schema")
     if sch:
-        exec_write(
-            "INSERT INTO tcode_schemas (code, fields, layout, updated_at, "
-            "updated_by) VALUES (?,?,?,?,?)",
-            (sch["code"],
-             json.dumps(sch.get("fields", [])),
-             json.dumps(sch.get("layout") or {}),
-             sch.get("updated_at") or now(),
-             sch.get("updated_by") or ""),
-        )
-
+        exec_write("INSERT INTO tcode_schemas (code, fields, layout, updated_at, updated_by) VALUES (?,?,?,?,?)", (sch["code"], json.dumps(sch.get("fields", [])), json.dumps(sch.get("layout") or {}), sch.get("updated_at") or now(), sch.get("updated_by") or ""))
     for lay in snapshot.get("layouts", []):
-        exec_write(
-            "INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, "
-            "is_default, fields, layout_config, description, created_by, "
-            "created_by_name, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (lay["tcode_code"], lay["layout_code"], lay.get("name") or "",
-             lay.get("title") or "", lay.get("is_default", 0),
-             json.dumps(lay.get("fields", [])),
-             lay.get("layout_config") or "{}",
-             lay.get("description") or "",
-             lay.get("created_by") or "",
-             lay.get("created_by_name") or "",
-             lay.get("created_at") or now(),
-             lay.get("updated_at") or now()),
-        )
-
+        exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (lay["tcode_code"], lay["layout_code"], lay.get("name") or "", lay.get("title") or "", lay.get("is_default", 0), json.dumps(lay.get("fields", [])), lay.get("layout_config") or "{}", lay.get("description") or "", lay.get("created_by") or "", lay.get("created_by_name") or "", lay.get("created_at") or now(), lay.get("updated_at") or now()))
     for rec in snapshot.get("records", []):
-        exec_write(
-            "INSERT INTO tcode_records (id, tcode_code, plant, data, status, "
-            "created_by, created_by_name, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (rec["id"], code, rec.get("plant") or "",
-             json.dumps(rec.get("data") or {}, default=json_serial),
-             rec.get("status") or "active",
-             rec.get("created_by") or "",
-             rec.get("created_by_name") or "",
-             rec.get("created_at") or now(),
-             rec.get("updated_at") or now()),
-        )
-
+        exec_write("INSERT INTO tcode_records (id, tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)", (rec["id"], code, rec.get("plant") or "", json.dumps(rec.get("data") or {}, default=json_serial), rec.get("status") or "active", rec.get("created_by") or "", rec.get("created_by_name") or "", rec.get("created_at") or now(), rec.get("updated_at") or now()))
     for g in snapshot.get("grants", []):
-        exec_write(
-            "INSERT INTO access_grants (username, tcode_code, granted_by, "
-            "granted_at) VALUES (?,?,?,?)",
-            (g["username"], g["tcode_code"], g.get("granted_by") or "",
-             g.get("granted_at") or now()),
-        )
-
+        exec_write("INSERT INTO access_grants (username, tcode_code, granted_by, granted_at) VALUES (?,?,?,?)", (g["username"], g["tcode_code"], g.get("granted_by") or "", g.get("granted_at") or now()))
 
 def _validate_spec(spec: dict):
     errors = []
-
-    if not isinstance(spec, dict):
-        return None, ["Spec must be a JSON object."]
-
+    if not isinstance(spec, dict): return None, ["Spec must be a JSON object."]
     action = (spec.get("action") or "upsert").lower()
-    if action not in ("upsert", "delete"):
-        errors.append("action must be 'upsert' or 'delete'.")
-
+    if action not in ("upsert", "delete"): errors.append("action must be 'upsert' or 'delete'.")
     code = str(spec.get("code") or "").upper().strip()
-
-    if not re.match(r"^[A-Z][A-Z0-9_]{1,10}$", code):
-        errors.append(
-            "code must be 2-11 chars, start with a letter, A-Z/0-9/_ only."
-        )
-
+    if not re.match(r"^[A-Z][A-Z0-9_]{1,10}$", code): errors.append("code must be 2-11 chars, start with a letter, A-Z/0-9/_ only.")
     if code in STUDIO_PROTECTED:
-        errors.append(
-            f"'{code}' is a protected system module. "
-            f"Remove it from STUDIO_PROTECTED in app.py to allow Studio edits."
-        )
+        errors.append(f"'{code}' is a protected system module. Remove it from STUDIO_PROTECTED in app.py to allow Studio edits.")
         return {"action": action, "code": code}, errors
-
-    if code in RESERVED_CODES:
-        errors.append(f"'{code}' is reserved.")
-
+    if code in RESERVED_CODES: errors.append(f"'{code}' is reserved.")
     clean = {"action": action, "code": code}
-
-    if action == "delete":
-        return clean, errors
-
+    if action == "delete": return clean, errors
     clean["title"] = str(spec.get("title") or code).strip()[:120]
     clean["description"] = str(spec.get("description") or "").strip()[:500]
     clean["module"] = str(spec.get("module") or "CUSTOM").strip()[:16].upper()
-
     depts = spec.get("allowed_depts") or ""
-    if isinstance(depts, list):
-        depts = ",".join(str(d).strip() for d in depts)
+    if isinstance(depts, list): depts = ",".join(str(d).strip() for d in depts)
     clean["allowed_depts"] = str(depts).strip()
-
     fields = spec.get("fields") or []
     if not isinstance(fields, list) or not fields:
         errors.append("fields must be a non-empty array.")
         return clean, errors
-
     clean_fields = []
     seen_keys = set()
-
     for i, f in enumerate(fields):
         if not isinstance(f, dict):
             errors.append(f"fields[{i}] must be an object.")
             continue
-
-        key = re.sub(
-            r"[^a-z0-9_]",
-            "_",
-            str(f.get("key") or f.get("label") or f"col_{i+1}").lower().strip(),
-        )
+        key = re.sub(r"[^a-z0-9_]", "_", str(f.get("key") or f.get("label") or f"col_{i+1}").lower().strip())
         key = re.sub(r"_+", "_", key).strip("_") or f"col_{i+1}"
-
         if key in seen_keys:
             errors.append(f"duplicate field key '{key}'.")
             continue
         seen_keys.add(key)
-
         ftype = str(f.get("type") or "text").lower()
         if ftype not in VALID_TYPES:
             errors.append(f"field '{key}' has invalid type '{ftype}'.")
             ftype = "text"
-
-        clean_fields.append({
-            "key": key,
-            "label": str(f.get("label") or key).strip()[:120],
-            "type": ftype,
-            "required": bool(f.get("required", False)),
-            "width": 2 if ftype == "textarea" else int(f.get("width", 1) or 1),
-            "options": f.get("options") if ftype == "select" else None,
-        })
-
+        clean_fields.append({"key": key, "label": str(f.get("label") or key).strip()[:120], "type": ftype, "required": bool(f.get("required", False)), "width": 2 if ftype == "textarea" else int(f.get("width", 1) or 1), "options": f.get("options") if ftype == "select" else None})
     clean["fields"] = clean_fields
-
     seeds = spec.get("seed_rows") or []
     if not isinstance(seeds, list):
         errors.append("seed_rows must be an array.")
         seeds = []
     clean["seed_rows"] = [r for r in seeds if isinstance(r, dict)][:500]
-
     return clean, errors
-
 
 def _diff_preview(code: str, clean: dict) -> dict:
     existing = fetch_one("SELECT * FROM tcodes WHERE code=?", (code,))
-
     if not existing:
-        return {
-            "kind": "create",
-            "before_rows": 0,
-            "before_fields": [],
-            "after_fields": [f["key"] for f in clean["fields"]],
-            "added_fields": [f["key"] for f in clean["fields"]],
-            "removed_fields": [],
-            "rows_preserved": True,
-        }
-
+        return {"kind": "create", "before_rows": 0, "before_fields": [], "after_fields": [f["key"] for f in clean["fields"]], "added_fields": [f["key"] for f in clean["fields"]], "removed_fields": [], "rows_preserved": True}
     schema = fetch_one("SELECT fields FROM tcode_schemas WHERE code=?", (code,))
-    try:
-        prev_fields = json.loads(schema["fields"]) if schema else []
-    except Exception:
-        prev_fields = []
-
+    try: prev_fields = json.loads(schema["fields"]) if schema else []
+    except Exception: prev_fields = []
     prev_keys = [f.get("key", "") for f in prev_fields]
     new_keys = [f["key"] for f in clean["fields"]]
-
     added = [k for k in new_keys if k not in prev_keys]
     removed = [k for k in prev_keys if k not in new_keys]
-
-    before_rows = fetch_one(
-        "SELECT COUNT(*) AS c FROM tcode_records WHERE tcode_code=?", (code,)
-    )["c"]
-
-    return {
-        "kind": "update",
-        "before_rows": before_rows,
-        "before_fields": prev_keys,
-        "after_fields": new_keys,
-        "added_fields": added,
-        "removed_fields": removed,
-        "rows_preserved": True,
-    }
-
+    before_rows = fetch_one("SELECT COUNT(*) AS c FROM tcode_records WHERE tcode_code=?", (code,))["c"]
+    return {"kind": "update", "before_rows": before_rows, "before_fields": prev_keys, "after_fields": new_keys, "added_fields": added, "removed_fields": removed, "rows_preserved": True}
 
 def _apply_spec(clean: dict, user: dict, note: str = ""):
     code = clean["code"]
     action = clean["action"]
-
-    if code in STUDIO_PROTECTED:
-        raise HTTPException(
-            403,
-            f"'{code}' is protected. Edit STUDIO_PROTECTED in app.py to unlock.",
-        )
-
+    if code in STUDIO_PROTECTED: raise HTTPException(403, f"'{code}' is protected. Edit STUDIO_PROTECTED in app.py to unlock.")
     cur_time = now()
     existing = fetch_one("SELECT code FROM tcodes WHERE code=?", (code,))
-
     before_snapshot = _snapshot_module(code) if existing else None
-
     if action == "delete":
-        if not existing:
-            raise HTTPException(404, f"Module '{code}' does not exist.")
+        if not existing: raise HTTPException(404, f"Module '{code}' does not exist.")
         exec_write("DELETE FROM tcodes WHERE code=?", (code,))
         exec_write("DELETE FROM tcode_schemas WHERE code=?", (code,))
         exec_write("DELETE FROM tcode_layouts WHERE tcode_code=?", (code,))
         exec_write("DELETE FROM tcode_records WHERE tcode_code=?", (code,))
         exec_write("DELETE FROM access_grants WHERE tcode_code=?", (code,))
         summary = {"action": "delete", "code": code}
-
     else:
         fields_json = json.dumps(clean["fields"])
         layout_cfg = json.dumps({"columns": 3})
-
         if existing:
-            exec_write(
-                "UPDATE tcodes SET title=?, description=?, module=?, "
-                "allowed_depts=?, updated_at=?, created_by=? WHERE code=?",
-                (clean["title"], clean["description"], clean["module"],
-                 clean["allowed_depts"], cur_time, user["username"], code),
-            )
-            exec_write(
-                "UPDATE tcode_schemas SET fields=?, layout=?, updated_at=?, "
-                "updated_by=? WHERE code=?",
-                (fields_json, layout_cfg, cur_time, user["username"], code),
-            )
-            default_layout = fetch_one(
-                "SELECT id FROM tcode_layouts WHERE tcode_code=? AND is_default=1",
-                (code,),
-            )
+            exec_write("UPDATE tcodes SET title=?, description=?, module=?, allowed_depts=?, updated_at=?, created_by=? WHERE code=?", (clean["title"], clean["description"], clean["module"], clean["allowed_depts"], cur_time, user["username"], code))
+            exec_write("UPDATE tcode_schemas SET fields=?, layout=?, updated_at=?, updated_by=? WHERE code=?", (fields_json, layout_cfg, cur_time, user["username"], code))
+            default_layout = fetch_one("SELECT id FROM tcode_layouts WHERE tcode_code=? AND is_default=1", (code,))
             if default_layout:
-                exec_write(
-                    "UPDATE tcode_layouts SET fields=?, layout_config=?, "
-                    "updated_at=? WHERE id=?",
-                    (fields_json, layout_cfg, cur_time, default_layout["id"]),
-                )
+                exec_write("UPDATE tcode_layouts SET fields=?, layout_config=?, updated_at=? WHERE id=?", (fields_json, layout_cfg, cur_time, default_layout["id"]))
             else:
-                exec_write(
-                    "INSERT INTO tcode_layouts (tcode_code, layout_code, name, "
-                    "title, is_default, fields, layout_config, description, "
-                    "created_by, created_by_name, created_at, updated_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (code, f"GRID_{code}_01", "Default Grid", clean["title"], 1,
-                     fields_json, layout_cfg, "Managed by AI Studio",
-                     user["username"], user["full_name"], cur_time, cur_time),
-                )
+                exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (code, f"GRID_{code}_01", "Default Grid", clean["title"], 1, fields_json, layout_cfg, "Managed by AI Studio", user["username"], user["full_name"], cur_time, cur_time))
             summary = {"action": "updated", "code": code}
-
         else:
-            exec_write(
-                "INSERT INTO tcodes (code, title, description, module, "
-                "allowed_depts, active, created_at, updated_at, created_by) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
-                (code, clean["title"], clean["description"], clean["module"],
-                 clean["allowed_depts"], 1, cur_time, cur_time, user["username"]),
-            )
-            exec_write(
-                "INSERT INTO tcode_schemas (code, fields, layout, updated_at, "
-                "updated_by) VALUES (?,?,?,?,?)",
-                (code, fields_json, layout_cfg, cur_time, user["username"]),
-            )
-            exec_write(
-                "INSERT INTO tcode_layouts (tcode_code, layout_code, name, "
-                "title, is_default, fields, layout_config, description, "
-                "created_by, created_by_name, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (code, f"GRID_{code}_01", "Default Grid", clean["title"], 1,
-                 fields_json, layout_cfg, "Created via AI Studio",
-                 user["username"], user["full_name"], cur_time, cur_time),
-            )
+            exec_write("INSERT INTO tcodes (code, title, description, module, allowed_depts, active, created_at, updated_at, created_by) VALUES (?,?,?,?,?,?,?,?,?)", (code, clean["title"], clean["description"], clean["module"], clean["allowed_depts"], 1, cur_time, cur_time, user["username"]))
+            exec_write("INSERT INTO tcode_schemas (code, fields, layout, updated_at, updated_by) VALUES (?,?,?,?,?)", (code, fields_json, layout_cfg, cur_time, user["username"]))
+            exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (code, f"GRID_{code}_01", "Default Grid", clean["title"], 1, fields_json, layout_cfg, "Created via AI Studio", user["username"], user["full_name"], cur_time, cur_time))
             summary = {"action": "created", "code": code}
-
         seeded = 0
         field_keys = {f["key"] for f in clean["fields"]}
         for row in clean["seed_rows"]:
             rec = {k: row[k] for k in row if k in field_keys}
-            if not rec:
-                continue
-            plant = str(
-                row.get("plant")
-                or (user.get("plants") or "1000").split(",")[0].strip()
-                or "1000"
-            )
-            exec_write(
-                "INSERT INTO tcode_records (tcode_code, plant, data, status, "
-                "created_by, created_by_name, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (code, plant, json.dumps(rec, default=json_serial), "active",
-                 user["username"], user["full_name"], cur_time, cur_time),
-            )
+            if not rec: continue
+            plant = str(row.get("plant") or (user.get("plants") or "1000").split(",")[0].strip() or "1000")
+            exec_write("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)", (code, plant, json.dumps(rec, default=json_serial), "active", user["username"], user["full_name"], cur_time, cur_time))
             seeded += 1
         summary["seeded_rows"] = seeded
-
-    prev = fetch_one(
-        "SELECT COALESCE(MAX(version), 0) AS v FROM module_specs "
-        "WHERE tcode_code=?",
-        (code,),
-    )
+    prev = fetch_one("SELECT COALESCE(MAX(version), 0) AS v FROM module_specs WHERE tcode_code=?", (code,))
     version = (prev["v"] if prev else 0) + 1
-
-    history_payload = {
-        "clean_spec": clean,
-        "before_snapshot": before_snapshot,
-    }
-
-    exec_write(
-        "INSERT INTO module_specs (tcode_code, version, action, spec, "
-        "applied_by, applied_at, note) VALUES (?,?,?,?,?,?,?)",
-        (code, version, action,
-         json.dumps(history_payload, default=json_serial),
-         user["username"], cur_time, note or ""),
-    )
-
+    history_payload = {"clean_spec": clean, "before_snapshot": before_snapshot}
+    exec_write("INSERT INTO module_specs (tcode_code, version, action, spec, applied_by, applied_at, note) VALUES (?,?,?,?,?,?,?)", (code, version, action, json.dumps(history_payload, default=json_serial), user["username"], cur_time, note or ""))
     summary["version"] = version
     return summary
-
 
 @app.post("/api/studio/validate")
 def studio_validate(req: Request, payload: dict):
     need_master(req)
     clean, errors = _validate_spec(payload.get("spec", payload))
-
-    result = {
-        "ok": not errors,
-        "errors": errors,
-        "clean": clean,
-        "diff": None,
-        "protected": clean and clean.get("code") in STUDIO_PROTECTED,
-    }
-
-    if clean and not errors and clean.get("code"):
-        result["diff"] = _diff_preview(clean["code"], clean)
-
+    result = {"ok": not errors, "errors": errors, "clean": clean, "diff": None, "protected": clean and clean.get("code") in STUDIO_PROTECTED}
+    if clean and not errors and clean.get("code"): result["diff"] = _diff_preview(clean["code"], clean)
     return result
-
 
 @app.post("/api/studio/apply")
 def studio_apply(req: Request, payload: dict):
     user = need_master(req)
     clean, errors = _validate_spec(payload.get("spec", payload))
-
-    if errors:
-        raise HTTPException(400, "Spec invalid: " + "; ".join(errors))
-
+    if errors: raise HTTPException(400, "Spec invalid: " + "; ".join(errors))
     if clean["action"] == "delete" and not payload.get("confirmed", False):
-        raise HTTPException(
-            400,
-            "Delete requires confirmed=true. Review the diff, then re-apply.",
-        )
-
+        raise HTTPException(400, "Delete requires confirmed=true. Review the diff, then re-apply.")
     summary = _apply_spec(clean, user, note=str(payload.get("note", "") or ""))
     return {"ok": True, **summary}
-
 
 @app.get("/api/studio/history")
 def studio_history(req: Request, code: str = ""):
     need_master(req)
-    sql = (
-        "SELECT id, tcode_code, version, action, applied_by, applied_at, note "
-        "FROM module_specs"
-    )
+    sql = "SELECT id, tcode_code, version, action, applied_by, applied_at, note FROM module_specs"
     params = []
     if code:
         sql += " WHERE tcode_code=?"
@@ -1515,151 +709,60 @@ def studio_history(req: Request, code: str = ""):
     sql += " ORDER BY id DESC LIMIT 200"
     return fetch_all(sql, tuple(params))
 
-
 @app.get("/api/studio/spec/{code}")
 def studio_get_spec(req: Request, code: str):
     need_master(req)
     code = code.upper().strip()
-
     tc = fetch_one("SELECT * FROM tcodes WHERE code=?", (code,))
-    if not tc:
-        raise HTTPException(404, "Module not found.")
-
+    if not tc: raise HTTPException(404, "Module not found.")
     schema = fetch_one("SELECT fields FROM tcode_schemas WHERE code=?", (code,))
-    try:
-        fields = json.loads(schema["fields"]) if schema else []
-    except Exception:
-        fields = []
-
-    return {
-        "action": "upsert",
-        "code": code,
-        "title": tc["title"],
-        "description": tc["description"] or "",
-        "module": tc["module"] or "CUSTOM",
-        "allowed_depts": tc["allowed_depts"] or "",
-        "fields": [
-            {
-                "key": f.get("key"),
-                "label": f.get("label"),
-                "type": f.get("type", "text"),
-                "required": f.get("required", False),
-                "width": f.get("width", 1),
-            }
-            for f in fields
-        ],
-        "seed_rows": [],
-        "protected": code in STUDIO_PROTECTED,
-    }
-
+    try: fields = json.loads(schema["fields"]) if schema else []
+    except Exception: fields = []
+    return {"action": "upsert", "code": code, "title": tc["title"], "description": tc["description"] or "", "module": tc["module"] or "CUSTOM", "allowed_depts": tc["allowed_depts"] or "", "fields": [{"key": f.get("key"), "label": f.get("label"), "type": f.get("type", "text"), "required": f.get("required", False), "width": f.get("width", 1)} for f in fields], "seed_rows": [], "protected": code in STUDIO_PROTECTED}
 
 @app.post("/api/studio/rollback/{msid}")
 def studio_rollback(req: Request, msid: int):
     user = need_master(req)
     row = fetch_one("SELECT * FROM module_specs WHERE id=?", (msid,))
-
-    if not row:
-        raise HTTPException(404, "History entry not found.")
-
-    try:
-        payload = json.loads(row["spec"])
-    except Exception:
-        raise HTTPException(400, "Stored spec is corrupt.")
-
+    if not row: raise HTTPException(404, "History entry not found.")
+    try: payload = json.loads(row["spec"])
+    except Exception: raise HTTPException(400, "Stored spec is corrupt.")
     before_snapshot = payload.get("before_snapshot")
     clean_spec = payload.get("clean_spec") or payload
-
     code = clean_spec.get("code")
-    if not code:
-        raise HTTPException(400, "History entry is missing a module code.")
-
-    if code in STUDIO_PROTECTED:
-        raise HTTPException(
-            403,
-            f"'{code}' is protected. Rollback blocked.",
-        )
-
-    if before_snapshot:
-        _restore_module(code, before_snapshot)
+    if not code: raise HTTPException(400, "History entry is missing a module code.")
+    if code in STUDIO_PROTECTED: raise HTTPException(403, f"'{code}' is protected. Rollback blocked.")
+    if before_snapshot: _restore_module(code, before_snapshot)
     else:
         clean, errors = _validate_spec(clean_spec)
-        if errors:
-            raise HTTPException(400, "Cannot rollback: " + "; ".join(errors))
+        if errors: raise HTTPException(400, "Cannot rollback: " + "; ".join(errors))
         _apply_spec(clean, user, note=f"Rollback v{row['version']}")
-
     cur_time = now()
-    prev = fetch_one(
-        "SELECT COALESCE(MAX(version), 0) AS v FROM module_specs "
-        "WHERE tcode_code=?",
-        (code,),
-    )
+    prev = fetch_one("SELECT COALESCE(MAX(version), 0) AS v FROM module_specs WHERE tcode_code=?", (code,))
     new_version = (prev["v"] if prev else 0) + 1
-    exec_write(
-        "INSERT INTO module_specs (tcode_code, version, action, spec, "
-        "applied_by, applied_at, note) VALUES (?,?,?,?,?,?,?)",
-        (code, new_version, "rollback",
-         json.dumps({"clean_spec": clean_spec, "before_snapshot": None}),
-         user["username"], cur_time, f"Restored from v{row['version']}"),
-    )
+    exec_write("INSERT INTO module_specs (tcode_code, version, action, spec, applied_by, applied_at, note) VALUES (?,?,?,?,?,?,?)", (code, new_version, "rollback", json.dumps({"clean_spec": clean_spec, "before_snapshot": None}), user["username"], cur_time, f"Restored from v{row['version']}"))
+    return {"ok": True, "code": code, "version": new_version, "restored_from": row["version"]}
 
-    return {"ok": True, "code": code, "version": new_version,
-            "restored_from": row["version"]}
-
-
-# =========================================================================
-# CTST — CABLE TYPE-TEST CALCULATOR
-# =========================================================================
 CTST_TESTS = {
-    "cr": {
-        "title": "CR — Conductor Resistance",
-        "icon": "ri-pulse-line",
-        "desc": "Temperature-corrected resistance with auto per-km value "
-                "and HIGH / LOW verdict vs spec",
-    },
-    "braid": {
-        "title": "Braid / Shield Coverage",
-        "icon": "ri-shield-check-line",
-        "desc": "Fill factor and % coverage for wire braid screens",
-    },
-    "tubular": {
-        "title": "Tubular Mechanical Test",
-        "icon": "ri-circle-line",
-        "desc": "Area, tensile strength, elongation for tube specimen",
-    },
-    "dumbbell": {
-        "title": "Dumbbell Mechanical Test",
-        "icon": "ri-shape-line",
-        "desc": "Area, tensile strength, elongation for dumbbell specimen",
-    },
-    "hotset": {
-        "title": "Hot Set & Permanent Set",
-        "icon": "ri-temp-hot-line",
-        "desc": "Hot-set and permanent-set elongation percentages",
-    },
+    "cr": {"title": "CR — Conductor Resistance", "icon": "ri-pulse-line", "desc": "Temperature-corrected resistance with auto per-km value and HIGH / LOW verdict vs spec"},
+    "braid": {"title": "Braid / Shield Coverage", "icon": "ri-shield-check-line", "desc": "Fill factor and % coverage for wire braid screens"},
+    "tubular": {"title": "Tubular Mechanical Test", "icon": "ri-circle-line", "desc": "Area, tensile strength, elongation for tube specimen"},
+    "dumbbell": {"title": "Dumbbell Mechanical Test", "icon": "ri-shape-line", "desc": "Area, tensile strength, elongation for dumbbell specimen"},
+    "hotset": {"title": "Hot Set & Permanent Set", "icon": "ri-temp-hot-line", "desc": "Hot-set and permanent-set elongation percentages"},
 }
-
 
 def _n(v):
     try:
-        if v is None or str(v).strip() == "":
-            return None
+        if v is None or str(v).strip() == "": return None
         return float(str(v).replace(",", ""))
-    except Exception:
-        return None
-
+    except Exception: return None
 
 def _compute_by_test(tt: str, d: dict) -> dict:
     out = {}
-
     if tt == "cr":
-        obd = _n(d.get("obd_cr_reading"))
-        t = _n(d.get("temp_c"))
-        L = _n(d.get("length_m"))
-        spec = _n(d.get("specified_cr"))
+        obd, t, L, spec = _n(d.get("obd_cr_reading")), _n(d.get("temp_c")), _n(d.get("length_m")), _n(d.get("specified_cr"))
         tol = _n(d.get("cr_tolerance_pct")) or 5.0
-
         observed_cr = None
-
         if obd is not None and t is not None:
             if -50 <= t <= 100:
                 factor = 250.0 / (230.0 + t)
@@ -1669,381 +772,150 @@ def _compute_by_test(tt: str, d: dict) -> dict:
                     observed_cr = corrected / L * 1000.0
                     out["cr_total_per_km"] = round(observed_cr, 6)
                     out["observed_cr"] = round(observed_cr, 6)
-            else:
-                out["cr_warning"] = "Temp outside −50 to 100 °C — check entry"
-
+            else: out["cr_warning"] = "Temp outside −50 to 100 °C — check entry"
         if spec and observed_cr is not None and spec != 0:
             dev = (observed_cr - spec) / spec * 100.0
             out["cr_deviation_pct"] = round(dev, 4)
-            if abs(dev) < 0.001:
-                out["cr_verdict"] = "ON SPEC"
-            elif dev > 0:
-                out["cr_verdict"] = "HIGH"
-            else:
-                out["cr_verdict"] = "LOW"
+            if abs(dev) < 0.001: out["cr_verdict"] = "ON SPEC"
+            elif dev > 0: out["cr_verdict"] = "HIGH"
+            else: out["cr_verdict"] = "LOW"
             out["cr_within_tolerance"] = abs(dev) <= tol
             out["cr_tolerance_pct"] = tol
-
     elif tt == "braid":
-        bd = _n(d.get("braid_d"))
-        uD = _n(d.get("under_braid_D"))
-        wpc = _n(d.get("wires_per_carrier"))
-        carr = _n(d.get("carriers"))
-        lay = _n(d.get("lay_length"))
-
-        if (all(v is not None for v in (bd, uD, wpc, carr, lay))
-                and uD > 0 and lay > 0):
+        bd, uD, wpc, carr, lay = _n(d.get("braid_d")), _n(d.get("under_braid_D")), _n(d.get("wires_per_carrier")), _n(d.get("carriers")), _n(d.get("lay_length"))
+        if (all(v is not None for v in (bd, uD, wpc, carr, lay)) and uD > 0 and lay > 0):
             N = wpc * carr
-            F = (N * bd) / (2 * math.pi * uD) * math.sqrt(
-                1 + (math.pi * uD / lay) ** 2
-            )
+            F = (N * bd) / (2 * math.pi * uD) * math.sqrt(1 + (math.pi * uD / lay) ** 2)
             out["braid_total_wires"] = int(N)
             out["braid_filling_factor"] = round(F, 6)
             out["braid_coverage_pct"] = round((2 * F - F * F) * 100.0, 3)
-
     elif tt in ("tubular", "dumbbell"):
         if tt == "tubular":
-            D = _n(d.get("tub_outer_d"))
-            wall = _n(d.get("tub_wall"))
-            if D and wall and D > wall:
-                out["area_mm2"] = round(math.pi * (D - wall) * wall, 4)
-            load = _n(d.get("break_load_tub"))
-            final = _n(d.get("elong_tub_final"))
+            D, wall = _n(d.get("tub_outer_d")), _n(d.get("tub_wall"))
+            if D and wall and D > wall: out["area_mm2"] = round(math.pi * (D - wall) * wall, 4)
+            load, final = _n(d.get("break_load_tub")), _n(d.get("elong_tub_final"))
         else:
-            w = _n(d.get("dumb_width"))
-            th = _n(d.get("dumb_thk"))
-            if w and th:
-                out["area_mm2"] = round(w * th, 4)
-            load = _n(d.get("break_load_dumb"))
-            final = _n(d.get("elong_dumb_final"))
-
+            w, th = _n(d.get("dumb_width")), _n(d.get("dumb_thk"))
+            if w and th: out["area_mm2"] = round(w * th, 4)
+            load, final = _n(d.get("break_load_dumb")), _n(d.get("elong_dumb_final"))
         init = _n(d.get("initial_gauge"))
-        if load is not None and out.get("area_mm2"):
-            out["tensile_nmm2"] = round(load / out["area_mm2"], 4)
-        if init and final is not None and init != 0:
-            out["elongation_pct"] = round((final - init) / init * 100.0, 4)
-
+        if load is not None and out.get("area_mm2"): out["tensile_nmm2"] = round(load / out["area_mm2"], 4)
+        if init and final is not None and init != 0: out["elongation_pct"] = round((final - init) / init * 100.0, 4)
     elif tt == "hotset":
-        init = _n(d.get("initial_gauge"))
-        hs = _n(d.get("hotset_elong_final"))
-        ps = _n(d.get("permset_cooled"))
-
-        if init and hs is not None and init != 0:
-            out["hotset_pct"] = round((hs - init) / init * 100.0, 4)
-        if init and ps is not None and init != 0:
-            out["permset_pct"] = round((ps - init) / init * 100.0, 4)
-
+        init, hs, ps = _n(d.get("initial_gauge")), _n(d.get("hotset_elong_final")), _n(d.get("permset_cooled"))
+        if init and hs is not None and init != 0: out["hotset_pct"] = round((hs - init) / init * 100.0, 4)
+        if init and ps is not None and init != 0: out["permset_pct"] = round((ps - init) / init * 100.0, 4)
     return out
 
-
 def _filter_by_test(base_sql: str, test_type: str):
-    if not test_type:
-        return base_sql, []
-    if USE_PG:
-        return base_sql + " AND data::json->>'_test_type' = %s", [test_type]
+    if not test_type: return base_sql, []
+    if USE_PG: return base_sql + " AND data::json->>'_test_type' = %s", [test_type]
     return base_sql + " AND json_extract(data, '$._test_type') = ?", [test_type]
-
 
 @app.get("/api/ctst/tests")
 def ctst_tests(req: Request):
     need(req)
     return CTST_TESTS
 
-
 @app.get("/api/ctst/records")
 def ctst_list(req: Request, test_type: str = "", limit: int = 200):
     user = need(req)
-    if not check_tcode_access(user, "CTST"):
-        raise HTTPException(403, "Access denied.")
-
-    base = (
-        "SELECT * FROM tcode_records WHERE tcode_code='CTST' "
-        "AND status='active'"
-    )
+    if not check_tcode_access(user, "CTST"): raise HTTPException(403, "Access denied.")
+    base = "SELECT * FROM tcode_records WHERE tcode_code='CTST' AND status='active'"
     sql, params = _filter_by_test(base, test_type)
     sql += " ORDER BY id DESC LIMIT ?" if not USE_PG else " ORDER BY id DESC LIMIT %s"
     params.append(limit)
-
     rows = fetch_all(sql, tuple(params))
     for r in rows:
-        try:
-            r["data"] = json.loads(r["data"])
-        except Exception:
-            r["data"] = {}
+        try: r["data"] = json.loads(r["data"])
+        except Exception: r["data"] = {}
         tt = r["data"].get("_test_type", "")
         r["computed"] = _compute_by_test(tt, r["data"]) if tt else {}
     return rows
-
 
 @app.post("/api/ctst/compute")
 def ctst_compute(req: Request, payload: dict):
     need(req)
     tt = str(payload.get("_test_type", "")).strip()
-    if tt not in CTST_TESTS:
-        raise HTTPException(400, "Unknown test type.")
+    if tt not in CTST_TESTS: raise HTTPException(400, "Unknown test type.")
     return {"computed": _compute_by_test(tt, payload)}
-
 
 @app.post("/api/ctst/save")
 def ctst_save(req: Request, payload: dict):
     user = need(req)
-    if not check_tcode_access(user, "CTST"):
-        raise HTTPException(403, "Access denied.")
-
+    if not check_tcode_access(user, "CTST"): raise HTTPException(403, "Access denied.")
     tt = str(payload.get("_test_type", "")).strip()
-    if tt not in CTST_TESTS:
-        raise HTTPException(400, "Unknown test type.")
-
-    plant = str(
-        payload.pop("_plant", "")
-        or (user.get("plants") or "1000").split(",")[0].strip()
-        or "1000"
-    ).strip()
+    if tt not in CTST_TESTS: raise HTTPException(400, "Unknown test type.")
+    plant = str(payload.pop("_plant", "") or (user.get("plants") or "1000").split(",")[0].strip() or "1000").strip()
     cur_time = now()
-
-    exec_write(
-        "INSERT INTO tcode_records (tcode_code, plant, data, status, "
-        "created_by, created_by_name, created_at, updated_at) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        ("CTST", plant, json.dumps(payload, default=json_serial), "active",
-         user["username"], user["full_name"], cur_time, cur_time),
-    )
+    exec_write("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)", ("CTST", plant, json.dumps(payload, default=json_serial), "active", user["username"], user["full_name"], cur_time, cur_time))
     return {"ok": True, "computed": _compute_by_test(tt, payload)}
-
 
 @app.delete("/api/ctst/records/{rid}")
 def ctst_delete(req: Request, rid: int):
     user = need(req)
-    if not check_tcode_access(user, "CTST"):
-        raise HTTPException(403, "Access denied.")
-
-    rec = fetch_one(
-        "SELECT * FROM tcode_records WHERE id=? AND tcode_code='CTST'", (rid,)
-    )
-    if not rec:
-        raise HTTPException(404, "Record not found.")
-
-    if (rec["created_by"] != user["username"]
-            and not is_master(user)
-            and user["role"] != "admin"):
-        raise HTTPException(403, "You can only delete your own records.")
-
-    exec_write(
-        "UPDATE tcode_records SET status='deleted', updated_at=? WHERE id=?",
-        (now(), rid),
-    )
+    if not check_tcode_access(user, "CTST"): raise HTTPException(403, "Access denied.")
+    rec = fetch_one("SELECT * FROM tcode_records WHERE id=? AND tcode_code='CTST'", (rid,))
+    if not rec: raise HTTPException(404, "Record not found.")
+    if (rec["created_by"] != user["username"] and not is_master(user) and user["role"] != "admin"): raise HTTPException(403, "You can only delete your own records.")
+    exec_write("UPDATE tcode_records SET status='deleted', updated_at=? WHERE id=?", (now(), rid))
     return {"ok": True}
-
 
 @app.get("/api/ctst/export")
 def ctst_export(req: Request, test_type: str = ""):
     user = need(req)
-    if not check_tcode_access(user, "CTST"):
-        raise HTTPException(403, "Access denied.")
-
-    base = (
-        "SELECT * FROM tcode_records WHERE tcode_code='CTST' "
-        "AND status='active'"
-    )
+    if not check_tcode_access(user, "CTST"): raise HTTPException(403, "Access denied.")
+    base = "SELECT * FROM tcode_records WHERE tcode_code='CTST' AND status='active'"
     sql, params = _filter_by_test(base, test_type)
     sql += " ORDER BY id ASC"
     rows = fetch_all(sql, tuple(params))
-
     wb = Workbook()
     ws = wb.active
     ws.title = (test_type.upper() if test_type else "CTST") + "_DATA"
-    ws.append([
-        "ID", "Plant", "Test Type", "Sample ID", "Cable Type", "Date",
-        "Result", "Computed", "Remarks", "Created By", "Created At",
-    ])
-
+    ws.append(["ID", "Plant", "Test Type", "Sample ID", "Cable Type", "Date", "Result", "Computed", "Remarks", "Created By", "Created At"])
     for r in rows:
-        try:
-            d = json.loads(r["data"])
-        except Exception:
-            d = {}
+        try: d = json.loads(r["data"])
+        except Exception: d = {}
         tt = d.get("_test_type", "")
         c = _compute_by_test(tt, d)
         computed_str = "; ".join(f"{k}={v}" for k, v in c.items())
-        ws.append([
-            r["id"], r["plant"], tt, d.get("sample_id", ""),
-            d.get("cable_type", ""), d.get("test_date", ""),
-            d.get("result", ""), computed_str, d.get("remarks", ""),
-            r["created_by_name"] or r["created_by"], r["created_at"],
-        ])
-
+        ws.append([r["id"], r["plant"], tt, d.get("sample_id", ""), d.get("cable_type", ""), d.get("test_date", ""), d.get("result", ""), computed_str, d.get("remarks", ""), r["created_by_name"] or r["created_by"], r["created_at"]])
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)
     tag = test_type.upper() if test_type else "ALL"
-    return StreamingResponse(
-        bio,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition":
-                f"attachment; filename=CTST_{tag}_"
-                f"{datetime.date.today().strftime('%Y%m%d')}.xlsx"
-        },
-    )
-
+    return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=CTST_{tag}_{datetime.date.today().strftime('%Y%m%d')}.xlsx"})
 
 @app.get("/api/ctst/print/{rid}", response_class=HTMLResponse)
 def ctst_print(req: Request, rid: int):
     user = need(req)
-    if not check_tcode_access(user, "CTST"):
-        return HTMLResponse("Access denied", 403)
-
-    rec = fetch_one(
-        "SELECT * FROM tcode_records WHERE id=? AND tcode_code='CTST'", (rid,)
-    )
-    if not rec:
-        return HTMLResponse("Record not found", 404)
-
-    try:
-        d = json.loads(rec["data"])
-    except Exception:
-        d = {}
-
+    if not check_tcode_access(user, "CTST"): return HTMLResponse("Access denied", 403)
+    rec = fetch_one("SELECT * FROM tcode_records WHERE id=? AND tcode_code='CTST'", (rid,))
+    if not rec: return HTMLResponse("Record not found", 404)
+    try: d = json.loads(rec["data"])
+    except Exception: d = {}
     tt = d.get("_test_type", "")
     c = _compute_by_test(tt, d)
     org = fetch_one("SELECT * FROM org WHERE id=1") or {}
     title = CTST_TESTS.get(tt, {}).get("title", tt.upper())
+    def cell(l, v, u=""): return f"<tr><td style='padding:4px 8px;border:1px solid #cbd5e1;font-size:11px;background:#f8fafc'>{l}</td><td style='padding:4px 8px;border:1px solid #cbd5e1;font-size:11px;font-weight:600'>{v or ''} {u}</td></tr>"
+    labels = {"obd_cr_reading": ("OBD CR Reading", "Ω"), "temp_c": ("Test Temp", "°C"), "length_m": ("Length", "m"), "specified_cr": ("Specified CR", "Ω/km"), "cr_tolerance_pct": ("Tolerance", "%"), "braid_d": ("Braid Wire Ø", "mm"), "under_braid_D": ("Ø Under Braid", "mm"), "wires_per_carrier": ("Wires/Carrier", ""), "carriers": ("Carriers", ""), "lay_length": ("Lay Length", "mm"), "tub_outer_d": ("Tubular Outer Ø", "mm"), "tub_wall": ("Tubular Wall", "mm"), "dumb_width": ("Dumbbell Width", "mm"), "dumb_thk": ("Dumbbell Thickness", "mm"), "break_load_tub": ("Break Load (Tub)", "N"), "break_load_dumb": ("Break Load (Dumb)", "N"), "elong_tub_final": ("Tubular Final Gauge", "mm"), "elong_dumb_final": ("Dumbbell Final Gauge", "mm"), "initial_gauge": ("Initial Gauge", "mm"), "hotset_elong_final": ("Hot Set Final", "mm"), "permset_cooled": ("Perm Set Cooled", "mm")}
+    comp_labels = {"cr_1m": ("CR 1 m", "Ω"), "cr_total_per_km": ("CR per km", "Ω/km"), "observed_cr": ("Observed CR (auto, Ω/km)", "Ω/km"), "cr_deviation_pct": ("CR Deviation vs Spec", "%"), "cr_verdict": ("vs Spec", ""), "cr_within_tolerance": ("Within Tolerance", ""), "cr_tolerance_pct": ("Tolerance", "%"), "braid_total_wires": ("Total Wires", ""), "braid_filling_factor": ("Filling Factor", ""), "braid_coverage_pct": ("Coverage", "%"), "area_mm2": ("Area", "mm²"), "tensile_nmm2": ("Tensile Strength", "N/mm²"), "elongation_pct": ("Elongation", "%"), "hotset_pct": ("Hot Set", "%"), "permset_pct": ("Permanent Set", "%")}
+    irows = "".join(cell(l, d.get(k, ""), u_) for k, (l, u_) in labels.items() if k in d)
+    orows = "".join(cell(l, c.get(k, ""), u_) for k, (l, u_) in comp_labels.items() if k in c)
+    if c.get("cr_warning"): orows += f"<tr><td colspan='2' style='padding:6px 8px;background:#fef3c7;border:1px solid #fcd34d;font-size:11px;color:#92400e'>⚠ {esc_py(c['cr_warning'])}</td></tr>"
+    return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>CTST #{rec['id']}</title><style>body {{ font-family: sans-serif; margin: 30px; color: #0f172a; }} table {{ width: 100%; border-collapse: collapse; margin-bottom: 16px; }} @media print {{ .no-print {{ display: none; }} body {{ margin: 0; }} }}</style></head><body><div class="no-print" style="text-align:right;margin-bottom:12px"><button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:600">Print / Save PDF</button></div><h2 style="margin:0">{esc_py(org.get('name', 'Thermocables Limited'))}</h2><h4 style="margin:4px 0 12px;color:#4f46e5">{esc_py(title)}</h4><div style="font-size:11px;color:#475569;margin-bottom:16px">Record #{rec['id']} | Plant {esc_py(rec['plant'] or '—')} | Sample {esc_py(d.get('sample_id', '—'))} | {esc_py(d.get('cable_type', '—'))} | By {esc_py(rec['created_by_name'] or rec['created_by'])} | {esc_py(rec['created_at'])}</div><h4 style="font-size:12px;color:#4338ca;text-transform:uppercase;margin-bottom:6px">Inputs</h4><table>{irows}</table><h4 style="font-size:12px;color:#4338ca;text-transform:uppercase;margin-bottom:6px">Computed Results</h4><table>{orows or '<tr><td style="padding:6px;font-size:11px;color:#64748b">None</td></tr>'}</table><h4 style="font-size:12px;color:#4338ca;text-transform:uppercase;margin-bottom:6px">Verdict</h4><table>{cell('Result', d.get('result', ''))}{cell('Remarks', d.get('remarks', ''))}</table></body></html>""")
 
-    def cell(l, v, u=""):
-        return (
-            f"<tr>"
-            f"<td style='padding:4px 8px;border:1px solid #cbd5e1;"
-            f"font-size:11px;background:#f8fafc'>{l}</td>"
-            f"<td style='padding:4px 8px;border:1px solid #cbd5e1;"
-            f"font-size:11px;font-weight:600'>{v or ''} {u}</td>"
-            f"</tr>"
-        )
-
-    labels = {
-        "obd_cr_reading": ("OBD CR Reading", "Ω"),
-        "temp_c": ("Test Temp", "°C"),
-        "length_m": ("Length", "m"),
-        "specified_cr": ("Specified CR", "Ω/km"),
-        "cr_tolerance_pct": ("Tolerance", "%"),
-        "braid_d": ("Braid Wire Ø", "mm"),
-        "under_braid_D": ("Ø Under Braid", "mm"),
-        "wires_per_carrier": ("Wires/Carrier", ""),
-        "carriers": ("Carriers", ""),
-        "lay_length": ("Lay Length", "mm"),
-        "tub_outer_d": ("Tubular Outer Ø", "mm"),
-        "tub_wall": ("Tubular Wall", "mm"),
-        "dumb_width": ("Dumbbell Width", "mm"),
-        "dumb_thk": ("Dumbbell Thickness", "mm"),
-        "break_load_tub": ("Break Load (Tub)", "N"),
-        "break_load_dumb": ("Break Load (Dumb)", "N"),
-        "elong_tub_final": ("Tubular Final Gauge", "mm"),
-        "elong_dumb_final": ("Dumbbell Final Gauge", "mm"),
-        "initial_gauge": ("Initial Gauge", "mm"),
-        "hotset_elong_final": ("Hot Set Final", "mm"),
-        "permset_cooled": ("Perm Set Cooled", "mm"),
-    }
-
-    comp_labels = {
-        "cr_1m": ("CR 1 m", "Ω"),
-        "cr_total_per_km": ("CR per km", "Ω/km"),
-        "observed_cr": ("Observed CR (auto, Ω/km)", "Ω/km"),
-        "cr_deviation_pct": ("CR Deviation vs Spec", "%"),
-        "cr_verdict": ("vs Spec", ""),
-        "cr_within_tolerance": ("Within Tolerance", ""),
-        "cr_tolerance_pct": ("Tolerance", "%"),
-        "braid_total_wires": ("Total Wires", ""),
-        "braid_filling_factor": ("Filling Factor", ""),
-        "braid_coverage_pct": ("Coverage", "%"),
-        "area_mm2": ("Area", "mm²"),
-        "tensile_nmm2": ("Tensile Strength", "N/mm²"),
-        "elongation_pct": ("Elongation", "%"),
-        "hotset_pct": ("Hot Set", "%"),
-        "permset_pct": ("Permanent Set", "%"),
-    }
-
-    irows = "".join(
-        cell(l, d.get(k, ""), u_)
-        for k, (l, u_) in labels.items() if k in d
-    )
-    orows = "".join(
-        cell(l, c.get(k, ""), u_)
-        for k, (l, u_) in comp_labels.items() if k in c
-    )
-
-    if c.get("cr_warning"):
-        orows += (
-            f"<tr><td colspan='2' style='padding:6px 8px;"
-            f"background:#fef3c7;border:1px solid #fcd34d;"
-            f"font-size:11px;color:#92400e'>"
-            f"⚠ {esc_py(c['cr_warning'])}</td></tr>"
-        )
-
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>CTST #{rec['id']}</title>
-<style>
-body {{ font-family: sans-serif; margin: 30px; color: #0f172a; }}
-table {{ width: 100%; border-collapse: collapse; margin-bottom: 16px; }}
-@media print {{ .no-print {{ display: none; }} body {{ margin: 0; }} }}
-</style>
-</head>
-<body>
-<div class="no-print" style="text-align:right;margin-bottom:12px">
-  <button onclick="window.print()"
-    style="background:#4f46e5;color:white;border:none;padding:8px 16px;
-    border-radius:6px;cursor:pointer;font-weight:600">Print / Save PDF</button>
-</div>
-<h2 style="margin:0">{esc_py(org.get('name', 'Thermocables Limited'))}</h2>
-<h4 style="margin:4px 0 12px;color:#4f46e5">{esc_py(title)}</h4>
-<div style="font-size:11px;color:#475569;margin-bottom:16px">
-Record #{rec['id']} | Plant {esc_py(rec['plant'] or '—')}
-| Sample {esc_py(d.get('sample_id', '—'))}
-| {esc_py(d.get('cable_type', '—'))}
-| By {esc_py(rec['created_by_name'] or rec['created_by'])}
-| {esc_py(rec['created_at'])}
-</div>
-<h4 style="font-size:12px;color:#4338ca;text-transform:uppercase;
-margin-bottom:6px">Inputs</h4>
-<table>{irows}</table>
-<h4 style="font-size:12px;color:#4338ca;text-transform:uppercase;
-margin-bottom:6px">Computed Results</h4>
-<table>{orows or '<tr><td style="padding:6px;font-size:11px;color:#64748b">None</td></tr>'}</table>
-<h4 style="font-size:12px;color:#4338ca;text-transform:uppercase;
-margin-bottom:6px">Verdict</h4>
-<table>{cell('Result', d.get('result', ''))}{cell('Remarks', d.get('remarks', ''))}</table>
-</body>
-</html>""")
-
-
-# =========================================================================
-# MRQ1 — MATERIAL REQUISITION
-# =========================================================================
 MRQ_CATEGORIES = {
-    "stores": {
-        "title": "Stores Issue",
-        "icon": "ri-store-2-line",
-        "desc": "General consumables & spares from Stores",
-    },
-    "inhouse": {
-        "title": "Inhouse Material Issue",
-        "icon": "ri-home-gear-line",
-        "desc": "In-house fabricated / semi-finished material",
-    },
-    "conductor": {
-        "title": "Conductor Issue",
-        "icon": "ri-plug-line",
-        "desc": "Copper / aluminium conductor stock",
-    },
+    "stores": {"title": "Stores Issue", "icon": "ri-store-2-line", "desc": "General consumables & spares from Stores"},
+    "inhouse": {"title": "Inhouse Material Issue", "icon": "ri-home-gear-line", "desc": "In-house fabricated / semi-finished material"},
+    "conductor": {"title": "Conductor Issue", "icon": "ri-plug-line", "desc": "Copper / aluminium conductor stock"},
 }
-
 
 @app.get("/api/mrq/categories")
 def mrq_categories(req: Request):
     need(req)
     return MRQ_CATEGORIES
-
 
 @app.get("/api/mrq/materials")
 def mrq_list_materials(req: Request, category: str = ""):
@@ -2056,49 +928,34 @@ def mrq_list_materials(req: Request, category: str = ""):
     sql += " ORDER BY material_code"
     return fetch_all(sql, tuple(params))
 
-
 @app.post("/api/mrq/materials/import")
 async def mrq_import_materials(req: Request, file: UploadFile = File(...)):
     need_admin(req)
     contents = await file.read()
     fn = file.filename.lower()
     rows = []
-
     try:
         is_zip = contents.startswith(b'PK\x03\x04')
         if fn.endswith(".xlsx") or is_zip:
-            if not is_zip:
-                raise HTTPException(400, "The .xlsx file is corrupted. Save as CSV.")
+            if not is_zip: raise HTTPException(400, "The .xlsx file is corrupted. Save as CSV.")
             wb = load_workbook(io.BytesIO(contents), data_only=True)
             all_rows = list(wb.active.iter_rows(values_only=True))
-            if not all_rows:
-                raise HTTPException(400, "Empty file.")
+            if not all_rows: raise HTTPException(400, "Empty file.")
             headers = [str(h).strip().lower() for h in all_rows[0]]
-            for r in all_rows[1:]:
-                rows.append(dict(zip(headers, r)))
-
+            for r in all_rows[1:]: rows.append(dict(zip(headers, r)))
         elif fn.endswith(".csv"):
             text = contents.decode("utf-8-sig", errors="ignore")
             lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
-            if not lines:
-                raise HTTPException(400, "Empty file.")
+            if not lines: raise HTTPException(400, "Empty file.")
             header_line = lines[0]
-            headers = [h.strip().lower().strip('"').strip("'")
-                       for h in header_line.split(',')]
+            headers = [h.strip().lower().strip('"').strip("'") for h in header_line.split(',')]
             for line in lines[1:]:
-                if not line.strip():
-                    continue
+                if not line.strip(): continue
                 parsed = next(csv.reader([line]))
                 rows.append(dict(zip(headers, parsed)))
-
-        else:
-            raise HTTPException(400, "Upload .xlsx or .csv")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(400, f"Parse error: {e}")
-
+        else: raise HTTPException(400, "Upload .xlsx or .csv")
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(400, f"Parse error: {e}")
     imported, updated, skipped = 0, 0, 0
     for r in rows:
         code = str(r.get("material code") or r.get("code") or "").strip().upper()
@@ -2108,32 +965,14 @@ async def mrq_import_materials(req: Request, file: UploadFile = File(...)):
         if not code or not desc:
             skipped += 1
             continue
-        exists = fetch_one(
-            "SELECT 1 FROM mrq_materials WHERE material_code=?", (code,)
-        )
+        exists = fetch_one("SELECT 1 FROM mrq_materials WHERE material_code=?", (code,))
         if exists:
-            exec_write(
-                "UPDATE mrq_materials SET description=?, category=?, uom=? "
-                "WHERE material_code=?",
-                (desc, cat, uom, code),
-            )
+            exec_write("UPDATE mrq_materials SET description=?, category=?, uom=? WHERE material_code=?", (desc, cat, uom, code))
             updated += 1
         else:
-            exec_write(
-                "INSERT INTO mrq_materials (material_code, description, "
-                "category, uom, created_at) VALUES (?,?,?,?,?)",
-                (code, desc, cat, uom, now()),
-            )
+            exec_write("INSERT INTO mrq_materials (material_code, description, category, uom, created_at) VALUES (?,?,?,?,?)", (code, desc, cat, uom, now()))
             imported += 1
-
-    return {
-        "ok": True,
-        "imported": imported,
-        "updated": updated,
-        "skipped": skipped,
-        "total_rows": len(rows),
-    }
-
+    return {"ok": True, "imported": imported, "updated": updated, "skipped": skipped, "total_rows": len(rows)}
 
 @app.get("/api/mrq/requisitions")
 def mrq_list(req: Request, category: str = "", status: str = ""):
@@ -2152,648 +991,226 @@ def mrq_list(req: Request, category: str = "", status: str = ""):
         params.append(status)
     sql += " ORDER BY id DESC LIMIT 300"
     rows = fetch_all(sql, tuple(params))
-
     for r in rows:
-        agg = fetch_one(
-            "SELECT COUNT(*) AS c, COALESCE(SUM(qty_required),0) AS q "
-            "FROM mrq_lines WHERE req_id=?",
-            (r["id"],),
-        )
+        agg = fetch_one("SELECT COUNT(*) AS c, COALESCE(SUM(qty_required),0) AS q FROM mrq_lines WHERE req_id=?", (r["id"],))
         r["line_count"] = agg["c"]
         r["total_qty"] = agg["q"]
     return rows
-
 
 @app.get("/api/mrq/requisition/{rid}")
 def mrq_get(req: Request, rid: int):
     user = need(req)
     r = fetch_one("SELECT * FROM mrq_requisitions WHERE id=?", (rid,))
-    if not r:
-        raise HTTPException(404, "Not found.")
+    if not r: raise HTTPException(404, "Not found.")
     is_admin = is_master(user) or user["role"] == "admin"
-    if not is_admin and user["department"] not in (r["from_dept"], r["to_dept"]):
-        raise HTTPException(403, "Access denied.")
-    r["lines"] = fetch_all(
-        "SELECT * FROM mrq_lines WHERE req_id=? ORDER BY sort_order, id",
-        (rid,),
-    )
+    if not is_admin and user["department"] not in (r["from_dept"], r["to_dept"]): raise HTTPException(403, "Access denied.")
+    r["lines"] = fetch_all("SELECT * FROM mrq_lines WHERE req_id=? ORDER BY sort_order, id", (rid,))
     return r
-
 
 @app.post("/api/mrq/requisition")
 def mrq_create(req: Request, payload: dict):
     user = need(req)
     category = str(payload.get("category") or "").strip().lower()
-    if category not in MRQ_CATEGORIES:
-        raise HTTPException(400, "Invalid category.")
-
+    if category not in MRQ_CATEGORIES: raise HTTPException(400, "Invalid category.")
     lines = payload.get("lines") or []
     clean_lines = []
     for i, ln in enumerate(lines):
         code = str(ln.get("material_code") or "").strip().upper()
         qty = float(ln.get("qty_required") or 0)
-        if not code or qty <= 0:
-            continue
-        mat = fetch_one(
-            "SELECT * FROM mrq_materials WHERE material_code=?", (code,)
-        )
-        if not mat:
-            continue
-        clean_lines.append({
-            "material_code": code,
-            "description": mat["description"],
-            "uom": mat["uom"],
-            "qty_required": qty,
-            "batch_no": "",
-            "qty_issued": 0,
-            "sort_order": i,
-        })
-
-    req_no = (
-        f"MRQ-{datetime.date.today().strftime('%Y%m%d')}-"
-        f"{secrets.token_hex(2).upper()}"
-    )
+        if not code or qty <= 0: continue
+        mat = fetch_one("SELECT * FROM mrq_materials WHERE material_code=?", (code,))
+        if not mat: continue
+        clean_lines.append({"material_code": code, "description": mat["description"], "uom": mat["uom"], "qty_required": qty, "batch_no": "", "qty_issued": 0, "sort_order": i})
+    req_no = f"MRQ-{datetime.date.today().strftime('%Y%m%d')}-{secrets.token_hex(2).upper()}"
     ct = now()
-    exec_write(
-        "INSERT INTO mrq_requisitions (req_no, category, from_dept, from_plant, "
-        "to_dept, status, remarks, requested_by, requested_by_name, "
-        "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (req_no, category, user["department"], "1000", "Store", "pending",
-         "", user["username"], user["full_name"], ct, ct),
-    )
-    header = fetch_one(
-        "SELECT id FROM mrq_requisitions WHERE req_no=?", (req_no,)
-    )
+    exec_write("INSERT INTO mrq_requisitions (req_no, category, from_dept, from_plant, to_dept, status, remarks, requested_by, requested_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (req_no, category, user["department"], "1000", "Store", "pending", "", user["username"], user["full_name"], ct, ct))
+    header = fetch_one("SELECT id FROM mrq_requisitions WHERE req_no=?", (req_no,))
     req_id = header["id"]
-
     for ln in clean_lines:
-        exec_write(
-            "INSERT INTO mrq_lines (req_id, material_code, description, "
-            "qty_required, batch_no, qty_issued, uom, sort_order) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (req_id, ln["material_code"], ln["description"],
-             ln["qty_required"], ln["batch_no"], ln["qty_issued"],
-             ln["uom"], ln["sort_order"]),
-        )
-
+        exec_write("INSERT INTO mrq_lines (req_id, material_code, description, qty_required, batch_no, qty_issued, uom, sort_order) VALUES (?,?,?,?,?,?,?,?)", (req_id, ln["material_code"], ln["description"], ln["qty_required"], ln["batch_no"], ln["qty_issued"], ln["uom"], ln["sort_order"]))
     return {"ok": True, "id": req_id, "req_no": req_no}
-
 
 @app.post("/api/mrq/requisition/{rid}/issue")
 def mrq_issue(req: Request, rid: int, payload: dict = None):
     user = need(req)
     r = fetch_one("SELECT * FROM mrq_requisitions WHERE id=?", (rid,))
-    if not r:
-        raise HTTPException(404, "Not found.")
+    if not r: raise HTTPException(404, "Not found.")
     is_admin = is_master(user) or user["role"] == "admin"
-    if not is_admin and user["department"] != r["to_dept"]:
-        raise HTTPException(403, "Only receiver can issue.")
-
+    if not is_admin and user["department"] != r["to_dept"]: raise HTTPException(403, "Only receiver can issue.")
     payload = payload or {}
     issued_to_name = str(payload.get("issued_to_name") or "").strip()
     lines_in = payload.get("lines") or []
     line_map = {int(x["id"]): x for x in lines_in if "id" in x}
-
     for ln in fetch_all("SELECT * FROM mrq_lines WHERE req_id=?", (rid,)):
         patch = line_map.get(ln["id"])
-        if not patch:
-            continue
-        exec_write(
-            "UPDATE mrq_lines SET batch_no=?, qty_issued=? WHERE id=?",
-            (str(patch.get("batch_no") or "").strip(),
-             float(patch.get("qty_issued") or 0), ln["id"]),
-        )
-
+        if not patch: continue
+        exec_write("UPDATE mrq_lines SET batch_no=?, qty_issued=? WHERE id=?", (str(patch.get("batch_no") or "").strip(), float(patch.get("qty_issued") or 0), ln["id"]))
     ct = now()
-    exec_write(
-        "UPDATE mrq_requisitions SET status='issued', issued_by=?, "
-        "issued_by_name=?, issued_to_name=?, updated_at=? WHERE id=?",
-        (user["username"], user["full_name"], issued_to_name, ct, rid),
-    )
+    exec_write("UPDATE mrq_requisitions SET status='issued', issued_by=?, issued_by_name=?, issued_to_name=?, updated_at=? WHERE id=?", (user["username"], user["full_name"], issued_to_name, ct, rid))
     return {"ok": True}
-
 
 @app.post("/api/mrq/requisition/{rid}/receive")
 def mrq_receive(req: Request, rid: int):
     user = need(req)
     r = fetch_one("SELECT * FROM mrq_requisitions WHERE id=?", (rid,))
-    if not r:
-        raise HTTPException(404, "Not found.")
+    if not r: raise HTTPException(404, "Not found.")
     is_admin = is_master(user) or user["role"] == "admin"
-    if not is_admin and user["department"] != r["from_dept"]:
-        raise HTTPException(403, "Only requester can receive.")
+    if not is_admin and user["department"] != r["from_dept"]: raise HTTPException(403, "Only requester can receive.")
     ct = now()
-    exec_write(
-        "UPDATE mrq_requisitions SET status='received', received_by=?, "
-        "received_by_name=?, updated_at=? WHERE id=?",
-        (user["username"], user["full_name"], ct, rid),
-    )
+    exec_write("UPDATE mrq_requisitions SET status='received', received_by=?, received_by_name=?, updated_at=? WHERE id=?", (user["username"], user["full_name"], ct, rid))
     return {"ok": True}
-
 
 @app.delete("/api/mrq/requisition/{rid}")
 def mrq_delete(req: Request, rid: int):
     user = need(req)
-    if not (is_master(user) or user["role"] == "admin"):
-        raise HTTPException(403, "Admin only.")
+    if not (is_master(user) or user["role"] == "admin"): raise HTTPException(403, "Admin only.")
     exec_write("DELETE FROM mrq_lines WHERE req_id=?", (rid,))
     exec_write("DELETE FROM mrq_requisitions WHERE id=?", (rid,))
     return {"ok": True}
 
-
 @app.get("/api/mrq/print/{rid}", response_class=HTMLResponse)
 def mrq_print(req: Request, rid: int):
     r = fetch_one("SELECT * FROM mrq_requisitions WHERE id=?", (rid,))
-    if not r:
-        return HTMLResponse("Not found", 404)
-    lines = fetch_all(
-        "SELECT * FROM mrq_lines WHERE req_id=? ORDER BY sort_order, id",
-        (rid,),
-    )
+    if not r: return HTMLResponse("Not found", 404)
+    lines = fetch_all("SELECT * FROM mrq_lines WHERE req_id=? ORDER BY sort_order, id", (rid,))
     org = fetch_one("SELECT * FROM org WHERE id=1") or {}
-    cat_title = MRQ_CATEGORIES.get(r["category"], {}).get(
-        "title", r["category"].upper()
-    )
-
-    th = (
-        "<th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; "
-        "background:#e0e7ff; text-align:left'>S.No</th>"
-        "<th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; "
-        "background:#e0e7ff; text-align:left'>Material Code</th>"
-        "<th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; "
-        "background:#e0e7ff; text-align:left'>Description</th>"
-        "<th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; "
-        "background:#e0e7ff; text-align:right'>Qty Required</th>"
-        "<th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; "
-        "background:#e0e7ff; text-align:left'>Batch No.</th>"
-        "<th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; "
-        "background:#e0e7ff; text-align:right'>Qty Issued</th>"
-    )
-
+    cat_title = MRQ_CATEGORIES.get(r["category"], {}).get("title", r["category"].upper())
+    th = ("<th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; background:#e0e7ff; text-align:left'>S.No</th><th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; background:#e0e7ff; text-align:left'>Material Code</th><th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; background:#e0e7ff; text-align:left'>Description</th><th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; background:#e0e7ff; text-align:right'>Qty Required</th><th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; background:#e0e7ff; text-align:left'>Batch No.</th><th style='border:1px solid #0f172a; padding:6px 8px; font-size:10.5px; background:#e0e7ff; text-align:right'>Qty Issued</th>")
     trs = ""
     for i, ln in enumerate(lines, 1):
-        trs += (
-            f"<tr><td style='border:1px solid #cbd5e1; padding:6px 8px; "
-            f"font-size:11px'>{i}</td>"
-            f"<td style='border:1px solid #cbd5e1; padding:6px 8px; "
-            f"font-size:11px; font-family:monospace'>"
-            f"{esc_py(ln['material_code'])}</td>"
-            f"<td style='border:1px solid #cbd5e1; padding:6px 8px; "
-            f"font-size:11px'>{esc_py(ln['description'])}</td>"
-            f"<td style='border:1px solid #cbd5e1; padding:6px 8px; "
-            f"font-size:11px; text-align:right'>"
-            f"{ln['qty_required']} {esc_py(ln['uom'])}</td>"
-            f"<td style='border:1px solid #cbd5e1; padding:6px 8px; "
-            f"font-size:11px; font-family:monospace'>"
-            f"{esc_py(ln['batch_no'])}</td>"
-            f"<td style='border:1px solid #cbd5e1; padding:6px 8px; "
-            f"font-size:11px; text-align:right'>"
-            f"{(ln['qty_issued'] or 0)} {esc_py(ln['uom'])}</td></tr>"
-        )
+        trs += (f"<tr><td style='border:1px solid #cbd5e1; padding:6px 8px; font-size:11px'>{i}</td><td style='border:1px solid #cbd5e1; padding:6px 8px; font-size:11px; font-family:monospace'>{esc_py(ln['material_code'])}</td><td style='border:1px solid #cbd5e1; padding:6px 8px; font-size:11px'>{esc_py(ln['description'])}</td><td style='border:1px solid #cbd5e1; padding:6px 8px; font-size:11px; text-align:right'>{ln['qty_required']} {esc_py(ln['uom'])}</td><td style='border:1px solid #cbd5e1; padding:6px 8px; font-size:11px; font-family:monospace'>{esc_py(ln['batch_no'])}</td><td style='border:1px solid #cbd5e1; padding:6px 8px; font-size:11px; text-align:right'>{(ln['qty_issued'] or 0)} {esc_py(ln['uom'])}</td></tr>")
+    status_color = {"pending": "#b45309", "issued": "#0369a1", "received": "#047857", "cancelled": "#b91c1c"}.get(r["status"], "#475569")
+    cancel_html = f"<div style='margin-top:12px; padding:8px 12px; background:#fef2f2; border:1px solid #fecaca; border-radius:8px; color:#b91c1c; font-size:11px'><b>CANCELLED</b> on {esc_py(r['cancelled_at'])} by {esc_py(r['cancelled_by'])} — Reason: {esc_py(r['cancel_reason'])}</div>" if r["status"] == "cancelled" else ""
+    return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>Material Requisition {r['req_no']}</title><style>body {{ font-family: sans-serif; margin: 30px; color: #0f172a; }} table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }} .signs {{ display: grid; grid-template-columns: repeat(3,1fr); gap: 30px; margin-top: 40px; text-align: center; font-size: 11px; font-weight: bold; }} .sign-box {{ border-top: 1px solid #0f172a; padding-top: 8px; }} @media print {{ .no-print {{ display: none; }} body {{ margin: 0; }} }}</style></head><body><div class="no-print" style="text-align:right;margin-bottom:12px"><button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:bold">Print / Save PDF</button></div><div style="display:flex; justify-content:space-between; border-bottom:2px solid #4f46e5; padding-bottom:12px; margin-bottom:14px;"><div><h2 style="margin:0; font-size:18px">{esc_py(org.get('name', 'Thermocables Limited'))}</h2><div style="font-size:11px; color:#475569; margin-top:2px">System: {esc_py(org.get('system_id', 'NX-01'))} · Client: {esc_py(org.get('client', 'GLOBAL'))}</div></div><div style="text-align:right"><div style="font-size:16px; font-weight:700; color:#4f46e5">MATERIAL REQUISITION</div><div style="font-family:monospace; font-weight:700; font-size:13px; margin-top:4px">{r['req_no']}</div><div style="font-size:11px; color:#475569">{esc_py(r['created_at'])}</div></div></div><div style="display:grid; grid-template-columns:repeat(4,1fr); gap:10px; font-size:11px; background:#f8fafc; padding:12px; border:1px solid #e2e8f0; margin-bottom:14px"><div><b>Category:</b><br>{esc_py(cat_title)}</div><div><b>From Dept:</b><br>{esc_py(r['from_dept'])}</div><div><b>From Plant:</b><br>{esc_py(r['from_plant'])}</div><div><b>To Dept:</b><br>{esc_py(r['to_dept'])}</div><div><b>Status:</b><br><span style="color:{status_color}; font-weight:700">{r['status'].upper()}</span></div><div><b>Requested By:</b><br>{esc_py(r['requested_by_name'] or r['requested_by'])}</div><div><b>Issued By:</b><br>{esc_py(r['issued_by_name'] or r['issued_by'] or '—')}</div><div><b>Received By:</b><br>{esc_py(r['received_by_name'] or r['received_by'] or '—')}</div></div><table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table><div style="margin-top:14px; font-size:11px"><b>Remarks:</b> {esc_py(r['remarks'] or '—')}</div>{cancel_html}<div class="signs"><div class="sign-box">Requested By<br><span style="font-weight:400;color:#475569">{esc_py(r['requested_by_name'] or r['requested_by'])}</span></div><div class="sign-box">Issued By (Stores)<br><span style="font-weight:400;color:#475569">{esc_py(r['issued_by_name'] or r['issued_by'] or '____________')}</span></div><div class="sign-box">Received By<br><span style="font-weight:400;color:#475569">{esc_py(r['received_by_name'] or r['received_by'] or r['issued_to_name'] or '____________')}</span></div></div></body></html>""")
 
-    status_color = {
-        "pending": "#b45309",
-        "issued": "#0369a1",
-        "received": "#047857",
-        "cancelled": "#b91c1c",
-    }.get(r["status"], "#475569")
-
-    cancel_html = ""
-    if r["status"] == "cancelled":
-        cancel_html = (
-            f"<div style='margin-top:12px; padding:8px 12px; background:#fef2f2; "
-            f"border:1px solid #fecaca; border-radius:8px; color:#b91c1c; "
-            f"font-size:11px'><b>CANCELLED</b> on {esc_py(r['cancelled_at'])} "
-            f"by {esc_py(r['cancelled_by'])} — Reason: "
-            f"{esc_py(r['cancel_reason'])}</div>"
-        )
-
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Material Requisition {r['req_no']}</title>
-<style>
-body {{ font-family: sans-serif; margin: 30px; color: #0f172a; }}
-table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
-.signs {{ display: grid; grid-template-columns: repeat(3,1fr); gap: 30px;
-margin-top: 40px; text-align: center; font-size: 11px; font-weight: bold; }}
-.sign-box {{ border-top: 1px solid #0f172a; padding-top: 8px; }}
-@media print {{ .no-print {{ display: none; }} body {{ margin: 0; }} }}
-</style>
-</head>
-<body>
-<div class="no-print" style="text-align:right;margin-bottom:12px">
-  <button onclick="window.print()" style="background:#4f46e5;color:white;
-    border:none;padding:8px 16px;border-radius:6px;cursor:pointer;
-    font-weight:bold">Print / Save PDF</button>
-</div>
-<div style="display:flex; justify-content:space-between;
-border-bottom:2px solid #4f46e5; padding-bottom:12px; margin-bottom:14px;">
-  <div>
-    <h2 style="margin:0; font-size:18px">
-      {esc_py(org.get('name', 'Thermocables Limited'))}
-    </h2>
-    <div style="font-size:11px; color:#475569; margin-top:2px">
-      System: {esc_py(org.get('system_id', 'NX-01'))} · Client:
-      {esc_py(org.get('client', 'GLOBAL'))}
-    </div>
-  </div>
-  <div style="text-align:right">
-    <div style="font-size:16px; font-weight:700; color:#4f46e5">
-      MATERIAL REQUISITION
-    </div>
-    <div style="font-family:monospace; font-weight:700; font-size:13px;
-    margin-top:4px">{r['req_no']}</div>
-    <div style="font-size:11px; color:#475569">
-      {esc_py(r['created_at'])}
-    </div>
-  </div>
-</div>
-<div style="display:grid; grid-template-columns:repeat(4,1fr); gap:10px;
-font-size:11px; background:#f8fafc; padding:12px; border:1px solid #e2e8f0;
-margin-bottom:14px">
-  <div><b>Category:</b><br>{esc_py(cat_title)}</div>
-  <div><b>From Dept:</b><br>{esc_py(r['from_dept'])}</div>
-  <div><b>From Plant:</b><br>{esc_py(r['from_plant'])}</div>
-  <div><b>To Dept:</b><br>{esc_py(r['to_dept'])}</div>
-  <div><b>Status:</b><br>
-    <span style="color:{status_color}; font-weight:700">
-      {r['status'].upper()}
-    </span>
-  </div>
-  <div><b>Requested By:</b><br>
-    {esc_py(r['requested_by_name'] or r['requested_by'])}
-  </div>
-  <div><b>Issued By:</b><br>
-    {esc_py(r['issued_by_name'] or r['issued_by'] or '—')}
-  </div>
-  <div><b>Received By:</b><br>
-    {esc_py(r['received_by_name'] or r['received_by'] or '—')}
-  </div>
-</div>
-<table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table>
-<div style="margin-top:14px; font-size:11px">
-  <b>Remarks:</b> {esc_py(r['remarks'] or '—')}
-</div>
-{cancel_html}
-<div class="signs">
-  <div class="sign-box">Requested By<br>
-    <span style="font-weight:400;color:#475569">
-      {esc_py(r['requested_by_name'] or r['requested_by'])}
-    </span>
-  </div>
-  <div class="sign-box">Issued By (Stores)<br>
-    <span style="font-weight:400;color:#475569">
-      {esc_py(r['issued_by_name'] or r['issued_by'] or '____________')}
-    </span>
-  </div>
-  <div class="sign-box">Received By<br>
-    <span style="font-weight:400;color:#475569">
-      {esc_py(r['received_by_name'] or r['received_by']
-              or r['issued_to_name'] or '____________')}
-    </span>
-  </div>
-</div>
-</body>
-</html>""")
-
-
-# =========================================================================
-# TN01 — TRANSFER NOTE
-# =========================================================================
 TN01_ROUTES = {
-    "PROD_TO_QC": {
-        "title": "Production to Final Testing",
-        "route": "Production ➔ Final Testing",
-        "from_dept": "Production",
-        "to_dept": "Final Testing",
-        "columns": [
-            "Sr. No.", "Job No.", "Customer Name", "Material Description",
-            "Specified Length", "Entry Length", "Drum Size", "Drum Code",
-            "Batch No.",
-        ],
-    },
-    "QC_TO_COMM": {
-        "title": "Final Testing to Commercial",
-        "route": "Final Testing ➔ Commercial",
-        "from_dept": "Final Testing",
-        "to_dept": "Commercial",
-        "columns": [
-            "Sr. No.", "Job / Prod Order #", "Batch / Heat Lot",
-            "Cable Description / Spec", "Drum #", "Tested Length (Mtrs)",
-            "HV Test Result", "Insulation Resistance", "QC Inspector",
-            "Release Status",
-        ],
-    },
-    "PROD_TO_STORE": {
-        "title": "Production to Store",
-        "route": "Production ➔ Store",
-        "from_dept": "Production",
-        "to_dept": "Store",
-        "columns": [
-            "Sr. No.", "Work Order #", "Item Code / Material",
-            "Batch / Heat Lot", "Quantity (Mtrs/Kgs)", "Weight (Kgs)",
-            "Drum / Pack #", "Handover Person", "Remarks",
-        ],
-    },
-    "QC_TO_PROD": {
-        "title": "Final Testing to Production (Rework/Reject)",
-        "route": "Final Testing ➔ Production",
-        "from_dept": "Final Testing",
-        "to_dept": "Production",
-        "columns": [
-            "Sr. No.", "Job Order #", "Batch / Heat Lot", "Cable Size",
-            "Defect Observed", "Length (Mtrs)", "QC Engineer",
-            "Rework Instructions",
-        ],
-    },
-    "COMM_TO_QC": {
-        "title": "Commercial to Final Testing (Inspection Request)",
-        "route": "Commercial ➔ Final Testing",
-        "from_dept": "Commercial",
-        "to_dept": "Final Testing",
-        "columns": [
-            "Sr. No.", "Customer Name", "Order / PO #", "Item Description",
-            "Ordered Qty", "Inspection Agency", "Target Date",
-            "Special Testing Notes",
-        ],
-    },
-    "STORE_TO_PROD": {
-        "title": "Store to Production (Raw Material Issue)",
-        "route": "Store ➔ Production",
-        "from_dept": "Store",
-        "to_dept": "Production",
-        "columns": [
-            "Sr. No.", "Material Code", "Material Description",
-            "Lot / GRN #", "Issued Qty", "UOM", "Issued By",
-            "Received For Work Order",
-        ],
-    },
+    "PROD_TO_QC": {"title": "Production to Final Testing", "route": "Production ➔ Final Testing", "from_dept": "Production", "to_dept": "Final Testing", "columns": ["Sr. No.", "Job No.", "Customer Name", "Material Description", "Specified Length", "Entry Length", "Drum Size", "Drum Code", "Batch No."]},
+    "QC_TO_COMM": {"title": "Final Testing to Commercial", "route": "Final Testing ➔ Commercial", "from_dept": "Final Testing", "to_dept": "Commercial", "columns": ["Sr. No.", "Job / Prod Order #", "Batch / Heat Lot", "Cable Description / Spec", "Drum #", "Tested Length (Mtrs)", "HV Test Result", "Insulation Resistance", "QC Inspector", "Release Status"]},
+    "PROD_TO_STORE": {"title": "Production to Store", "route": "Production ➔ Store", "from_dept": "Production", "to_dept": "Store", "columns": ["Sr. No.", "Work Order #", "Item Code / Material", "Batch / Heat Lot", "Quantity (Mtrs/Kgs)", "Weight (Kgs)", "Drum / Pack #", "Handover Person", "Remarks"]},
+    "QC_TO_PROD": {"title": "Final Testing to Production (Rework/Reject)", "route": "Final Testing ➔ Production", "from_dept": "Final Testing", "to_dept": "Production", "columns": ["Sr. No.", "Job Order #", "Batch / Heat Lot", "Cable Size", "Defect Observed", "Length (Mtrs)", "QC Engineer", "Rework Instructions"]},
+    "COMM_TO_QC": {"title": "Commercial to Final Testing (Inspection Request)", "route": "Commercial ➔ Final Testing", "from_dept": "Commercial", "to_dept": "Final Testing", "columns": ["Sr. No.", "Customer Name", "Order / PO #", "Item Description", "Ordered Qty", "Inspection Agency", "Target Date", "Special Testing Notes"]},
+    "STORE_TO_PROD": {"title": "Store to Production (Raw Material Issue)", "route": "Store ➔ Production", "from_dept": "Store", "to_dept": "Production", "columns": ["Sr. No.", "Material Code", "Material Description", "Lot / GRN #", "Issued Qty", "UOM", "Issued By", "Received For Work Order"]},
 }
-
 
 @app.get("/api/tn01/routes")
 def tn01_get_routes(req: Request):
     need(req)
     return TN01_ROUTES
 
-
 @app.get("/api/tn01/suggest-users")
 def tn01_suggest_users(req: Request, plant: str = "", dept: str = ""):
     need(req)
-    sql = (
-        "SELECT username, full_name, department, plants, role "
-        "FROM users WHERE status='approved'"
-    )
+    sql = "SELECT username, full_name, department, plants, role FROM users WHERE status='approved'"
     params = []
     if dept:
         sql += " AND department = ?"
         params.append(dept)
-
     users = fetch_all(sql, tuple(params))
-
     if plant:
-        return [
-            u for u in users
-            if not (u.get("plants") or "").strip()
-            or plant in [p.strip() for p in (u.get("plants") or "").split(",")]
-        ]
+        return [u for u in users if not (u.get("plants") or "").strip() or plant in [p.strip() for p in (u.get("plants") or "").split(",")]]
     return users
-
 
 @app.get("/api/tn01/layouts")
 def tn01_get_layouts(req: Request):
     need(req)
-    rows = fetch_all(
-        "SELECT * FROM tcode_layouts WHERE tcode_code='TN01' "
-        "ORDER BY is_default DESC, id ASC"
-    )
+    rows = fetch_all("SELECT * FROM tcode_layouts WHERE tcode_code='TN01' ORDER BY is_default DESC, id ASC")
     for r in rows:
-        try:
-            r["fields"] = json.loads(r["fields"])
-        except Exception:
-            r["fields"] = []
+        try: r["fields"] = json.loads(r["fields"])
+        except Exception: r["fields"] = []
     return rows
-
 
 @app.post("/api/tn01/layouts/save")
 def tn01_save_layout(req: Request, payload: dict):
     user = need_admin(req)
-
     name = payload.get("name", "Custom Layout").strip()
     key = payload.get("key", "").strip().upper()
     columns = payload.get("columns", [])
-
     if not key:
-        cnt = fetch_one(
-            "SELECT COUNT(*) AS c FROM tcode_layouts WHERE tcode_code='TN01'"
-        )["c"]
+        cnt = fetch_one("SELECT COUNT(*) AS c FROM tcode_layouts WHERE tcode_code='TN01'")["c"]
         key = f"TN01_VAR_{cnt + 1:02d}"
-
     cur_time = now()
-    existing = fetch_one(
-        "SELECT id FROM tcode_layouts WHERE tcode_code='TN01' AND layout_code=?",
-        (key,),
-    )
-
+    existing = fetch_one("SELECT id FROM tcode_layouts WHERE tcode_code='TN01' AND layout_code=?", (key,))
     if existing:
-        exec_write(
-            "UPDATE tcode_layouts SET name=?, title=?, fields=?, updated_at=? "
-            "WHERE id=?",
-            (name, name, json.dumps(columns), cur_time, existing["id"]),
-        )
+        exec_write("UPDATE tcode_layouts SET name=?, title=?, fields=?, updated_at=? WHERE id=?", (name, name, json.dumps(columns), cur_time, existing["id"]))
     else:
-        exec_write(
-            "INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, "
-            "is_default, fields, layout_config, description, created_by, "
-            "created_by_name, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            ("TN01", key, name, name, 0, json.dumps(columns), "{}",
-             "Custom Format", user["username"], user["full_name"],
-             cur_time, cur_time),
-        )
+        exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", ("TN01", key, name, name, 0, json.dumps(columns), "{}", "Custom Format", user["username"], user["full_name"], cur_time, cur_time))
     return {"ok": True, "key": key}
-
 
 @app.delete("/api/tn01/layouts/{lid}")
 def tn01_delete_layout(req: Request, lid: int):
     need_admin(req)
-    exec_write(
-        "DELETE FROM tcode_layouts WHERE id=? AND tcode_code='TN01'", (lid,)
-    )
+    exec_write("DELETE FROM tcode_layouts WHERE id=? AND tcode_code='TN01'", (lid,))
     return {"ok": True}
-
 
 @app.post("/api/tn01/send")
 def tn01_send(req: Request, payload: dict):
     user = need(req)
     cur_time = now()
-
     today_tag = datetime.date.today().strftime("%Y%m%d")
-    cnt = fetch_one(
-        "SELECT COUNT(*) AS c FROM transfer_notes WHERE created_at LIKE ?",
-        (f"{datetime.date.today().strftime('%Y-%m-%d')}%",),
-    )
+    cnt = fetch_one("SELECT COUNT(*) AS c FROM transfer_notes WHERE created_at LIKE ?", (f"{datetime.date.today().strftime('%Y-%m-%d')}%",))
     note_no = f"TN-{today_tag}-{(cnt['c'] if cnt else 0) + 1:04d}"
-
     headers = payload.get("headers", [])
     rows = payload.get("rows", [])
-
-    # ------------------------------------------------------------------
-    # Row normalization: guarantees every row has len(headers) cells
-    # and forces Sr. No. (col 0). Also repairs a common paste bug where
-    # an Excel copy introduces a leading empty cell so "Job No." (col 1)
-    # ends up blank and every later column shifts right by one.
-    # ------------------------------------------------------------------
     header_count = len(headers) if headers else 0
     normalized_rows = []
     for i, raw in enumerate(rows, 1):
-        if not isinstance(raw, (list, tuple)):
-            continue
+        if not isinstance(raw, (list, tuple)): continue
         row = ["" if c is None else str(c) for c in raw]
-
-        # Detect the shift-right paste artifact:
-        #   col 0 empty, col 1 has data, last col empty
-        # and at least 3 columns exist. Repair by shifting left.
-        if (header_count >= 3
-                and row[0].strip() == ""
-                and len(row) >= 2
-                and row[1].strip() != ""
-                and row[-1].strip() == ""):
+        if (header_count >= 3 and row[0].strip() == "" and len(row) >= 2 and row[1].strip() != "" and row[-1].strip() == ""):
             row = row[1:] + [""]
-
-        # Pad short rows to header count; trim long rows.
-        while len(row) < header_count:
-            row.append("")
-        if header_count:
-            row = row[:header_count]
-
-        # Force Sr. No.
+        while len(row) < header_count: row.append("")
+        if header_count: row = row[:header_count]
         row[0] = str(i)
         normalized_rows.append(row)
-
-    # Drop fully-blank data rows (only Sr. No. filled)
-    normalized_rows = [
-        r for r in normalized_rows
-        if any(str(x).strip() for x in r[1:])
-    ]
-
+    normalized_rows = [r for r in normalized_rows if any(str(x).strip() for x in r[1:])]
     to_user = payload.get("to_user", "").strip().lower()
-
-    target = fetch_one(
-        "SELECT username, full_name FROM users WHERE username=?", (to_user,)
-    )
+    target = fetch_one("SELECT username, full_name FROM users WHERE username=?", (to_user,))
     to_user_name = target["full_name"] if target else to_user
-
     cc_users_raw = payload.get("cc_users") or []
-    if isinstance(cc_users_raw, str):
-        cc_users_raw = [cc_users_raw]
-    cc_users = ",".join(
-        str(x).strip().lower() for x in cc_users_raw if str(x).strip()
-    )
-
-    from_plant = (
-        payload.get("from_plant", "").strip()
-        or (user.get("plants") or "1000").split(",")[0].strip()
-    )
-
-    exec_write(
-        "INSERT INTO transfer_notes (note_no, layout_key, route, "
-        "from_plant, from_dept, from_user, from_user_name, "
-        "to_plant, to_dept, to_user, to_user_name, entry_count, "
-        "sheet_headers, sheet_data, status, remarks, created_at, cc_users) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (
-            note_no,
-            payload.get("layout_key", "STANDARD"),
-            payload.get("route", "Transfer"),
-            from_plant,
-            user["department"],
-            user["username"],
-            user["full_name"],
-            payload.get("to_plant", "").strip(),
-            payload.get("to_dept", "").strip(),
-            to_user,
-            to_user_name,
-            len(normalized_rows),
-            json.dumps(headers),
-            json.dumps(normalized_rows, default=json_serial),
-            "sent",
-            payload.get("remarks", "").strip(),
-            cur_time,
-            cc_users,
-        ),
-    )
+    if isinstance(cc_users_raw, str): cc_users_raw = [cc_users_raw]
+    cc_users = ",".join(str(x).strip().lower() for x in cc_users_raw if str(x).strip())
+    from_plant = (payload.get("from_plant", "").strip() or (user.get("plants") or "1000").split(",")[0].strip())
+    exec_write("INSERT INTO transfer_notes (note_no, layout_key, route, from_plant, from_dept, from_user, from_user_name, to_plant, to_dept, to_user, to_user_name, entry_count, sheet_headers, sheet_data, status, remarks, created_at, cc_users) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (note_no, payload.get("layout_key", "STANDARD"), payload.get("route", "Transfer"), from_plant, user["department"], user["username"], user["full_name"], payload.get("to_plant", "").strip(), payload.get("to_dept", "").strip(), to_user, to_user_name, len(normalized_rows), json.dumps(headers), json.dumps(normalized_rows, default=json_serial), "sent", payload.get("remarks", "").strip(), cur_time, cc_users))
     return {"ok": True, "note_no": note_no, "entries": len(normalized_rows)}
-
 
 @app.get("/api/tn01/inbox")
 def tn01_inbox(req: Request):
     user = need(req)
     uname = user["username"].lower()
-    return fetch_all(
-        "SELECT * FROM transfer_notes "
-        "WHERE to_user = ? "
-        "   OR (to_dept = ? AND to_user = '') "
-        "   OR (',' || cc_users || ',') LIKE ? "
-        "ORDER BY id DESC",
-        (uname, user["department"], f"%,{uname},%"),
-    )
-
+    return fetch_all("SELECT * FROM transfer_notes WHERE to_user = ? OR (to_dept = ? AND to_user = '') OR (',' || cc_users || ',') LIKE ? ORDER BY id DESC", (uname, user["department"], f"%,{uname},%"))
 
 @app.post("/api/tn01/receive/{nid}")
 def tn01_receive(req: Request, nid: int):
     user = need(req)
     cur_time = now()
-    exec_write(
-        "UPDATE transfer_notes SET status='received', received_at=?, "
-        "received_by=?, received_by_name=? WHERE id=?",
-        (cur_time, user["username"], user["full_name"], nid),
-    )
+    exec_write("UPDATE transfer_notes SET status='received', received_at=?, received_by=?, received_by_name=? WHERE id=?", (cur_time, user["username"], user["full_name"], nid))
     return {"ok": True, "received_at": cur_time}
 
+@app.delete("/api/tn01/delete/{nid}")
+def tn01_delete(req: Request, nid: int):
+    user = need(req)
+    if not (is_master(user) or user["role"] == "admin"): raise HTTPException(403, "Only Admin can delete history")
+    exec_write("DELETE FROM transfer_notes WHERE id=?", (nid,))
+    return {"ok": True}
 
 @app.get("/api/tn01/history")
-def tn01_history(
-    req: Request,
-    plant: str = "",
-    route: str = "",
-    status: str = "",
-    from_dept: str = "",
-    to_dept: str = "",
-    date_from: str = "",
-    date_to: str = "",
-):
+def tn01_history(req: Request, plant: str = "", route: str = "", status: str = "", from_dept: str = "", to_dept: str = "", date_from: str = "", date_to: str = ""):
     user = need(req)
     uname = user["username"].lower()
     sql = "SELECT * FROM transfer_notes WHERE 1=1"
     params = []
-
     if not (is_master(user) or user["role"] == "admin"):
-        sql += (
-            " AND (from_user = ? OR to_user = ? "
-            "OR from_dept = ? OR to_dept = ? "
-            "OR (',' || cc_users || ',') LIKE ?)"
-        )
-        params.extend([
-            user["username"], user["username"],
-            user["department"], user["department"],
-            f"%,{uname},%",
-        ])
-
+        sql += " AND (from_user = ? OR to_user = ? OR from_dept = ? OR to_dept = ? OR (',' || cc_users || ',') LIKE ?)"
+        params.extend([user["username"], user["username"], user["department"], user["department"], f"%,{uname},%"])
     if plant:
         sql += " AND (from_plant = ? OR to_plant = ?)"
         params.extend([plant, plant])
-
     if route:
         sql += " AND route = ?"
         params.append(route)
-
     if status:
         sql += " AND status = ?"
         params.append(status)
-
     if is_master(user) or user["role"] == "admin":
         if from_dept:
             sql += " AND from_dept = ?"
@@ -2807,413 +1224,186 @@ def tn01_history(
         if date_to:
             sql += " AND created_at <= ?"
             params.append(date_to + " 23:59:59")
-
     sql += " ORDER BY id DESC LIMIT 300"
     return fetch_all(sql, tuple(params))
-
 
 @app.get("/api/tn01/note/{nid}")
 def tn01_get_note(req: Request, nid: int):
     need(req)
     note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
-    if not note:
-        raise HTTPException(404, "Note not found.")
-    try:
-        note["sheet_headers"] = json.loads(note["sheet_headers"])
-    except Exception:
-        note["sheet_headers"] = []
-    try:
-        note["sheet_data"] = json.loads(note["sheet_data"])
-    except Exception:
-        note["sheet_data"] = []
+    if not note: raise HTTPException(404, "Note not found.")
+    try: note["sheet_headers"] = json.loads(note["sheet_headers"])
+    except Exception: note["sheet_headers"] = []
+    try: note["sheet_data"] = json.loads(note["sheet_data"])
+    except Exception: note["sheet_data"] = []
     return note
-
 
 @app.get("/api/tn01/export/{nid}")
 def tn01_export_excel(req: Request, nid: int):
     user = need(req)
     note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
-    if not note:
-        raise HTTPException(404, "Note not found.")
-
-    is_sender = (
-        (user["username"] == note["from_user"])
-        or (user["department"] == note["from_dept"])
-    )
-    is_receiver = (
-        (user["username"] == note["to_user"])
-        or (user["department"] == note["to_dept"])
-    )
+    if not note: raise HTTPException(404, "Note not found.")
+    is_sender = (user["username"] == note["from_user"]) or (user["department"] == note["from_dept"])
+    is_receiver = (user["username"] == note["to_user"]) or (user["department"] == note["to_dept"])
     cc_hit = f",{user['username'].lower()}," in f",{note.get('cc_users') or ''},"
-    if not (is_sender or is_receiver or cc_hit
-            or is_master(user) or user["role"] == "admin"):
-        raise HTTPException(403, "Access denied.")
-
-    try:
-        headers = json.loads(note["sheet_headers"])
-    except Exception:
-        headers = []
-    try:
-        data_rows = json.loads(note["sheet_data"])
-    except Exception:
-        data_rows = []
-
+    if not (is_sender or is_receiver or cc_hit or is_master(user) or user["role"] == "admin"): raise HTTPException(403, "Access denied.")
+    try: headers = json.loads(note["sheet_headers"])
+    except Exception: headers = []
+    try: data_rows = json.loads(note["sheet_data"])
+    except Exception: data_rows = []
     wb = Workbook()
     ws = wb.active
     ws.title = "Transfer_Note"
-
     org = fetch_one("SELECT * FROM org WHERE id=1") or {}
     ws.append([org.get("name", "Thermocables Limited")])
     ws.append([f"TRANSFER NOTE {note['note_no']} — {note['route']}"])
-    ws.append([
-        f"From: {note['from_plant']} - {note['from_dept']}  |  "
-        f"To: {note['to_plant']} - {note['to_dept']}"
-    ])
-    ws.append([
-        f"Sender: {note['from_user_name']}  |  "
-        f"Receiver: {note['to_user_name']}  |  "
-        f"Status: {note['status'].upper()}"
-    ])
+    ws.append([f"From: {note['from_plant']} - {note['from_dept']}  |  To: {note['to_plant']} - {note['to_dept']}"])
+    ws.append([f"Sender: {note['from_user_name']}  |  Receiver: {note['to_user_name']}  |  Status: {note['status'].upper()}"])
     cc_line = f"  |  CC: {note.get('cc_users')}" if note.get("cc_users") else ""
-    ws.append([
-        f"Created: {note['created_at']}  |  "
-        f"Received: {note['received_at'] or 'Pending'}{cc_line}"
-    ])
+    ws.append([f"Created: {note['created_at']}  |  Received: {note['received_at'] or 'Pending'}{cc_line}"])
     ws.append([])
     ws.append(headers)
-    for row in data_rows:
-        ws.append(row)
+    for row in data_rows: ws.append(row)
     ws.append([])
-    ws.append([
-        "Handovered By: ________________", "",
-        "Received By: ________________", "", "QC: ________________",
-    ])
-
+    ws.append(["Handovered By: ________________", "", "Received By: ________________", "", "QC: ________________"])
     from openpyxl.styles import Font, Alignment, PatternFill
     header_fill = PatternFill("solid", fgColor="4F46E5")
     header_font = Font(bold=True, color="FFFFFF")
     ws["A1"].font = Font(bold=True, size=14)
     ws["A2"].font = Font(bold=True)
-
     for col_idx in range(1, len(headers) + 1):
         cell = ws.cell(row=7, column=col_idx)
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center")
-
     for col_idx, h in enumerate(headers, 1):
-        ws.column_dimensions[
-            ws.cell(row=7, column=col_idx).column_letter
-        ].width = max(14, min(40, len(str(h)) + 4))
-
+        ws.column_dimensions[ws.cell(row=7, column=col_idx).column_letter].width = max(14, min(40, len(str(h)) + 4))
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)
-    return StreamingResponse(
-        bio,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition":
-                f"attachment; filename=TransferNote_{note['note_no']}.xlsx"
-        },
-    )
-
+    return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=TransferNote_{note['note_no']}.xlsx"})
 
 @app.post("/api/tn01/export-grid")
 def tn01_export_grid(req: Request, payload: dict):
     user = need(req)
-
     headers = payload.get("headers", [])
     rows = payload.get("rows", [])
     title = payload.get("title", "Transfer Note (Draft)")
-
-    if not headers:
-        raise HTTPException(400, "No columns to export.")
-
+    if not headers: raise HTTPException(400, "No columns to export.")
     wb = Workbook()
     ws = wb.active
     ws.title = "Draft_Note"
-
     org = fetch_one("SELECT * FROM org WHERE id=1") or {}
     ws.append([org.get("name", "Thermocables Limited")])
     ws.append([title])
-    ws.append([
-        f"Prepared by: {user['full_name']} ({user['username']}) "
-        f"· {user['department']}"
-    ])
+    ws.append([f"Prepared by: {user['full_name']} ({user['username']}) · {user['department']}"])
     ws.append([f"Generated: {now()}"])
     ws.append([])
     ws.append(headers)
-    for r in rows:
-        ws.append(r)
-
+    for r in rows: ws.append(r)
     from openpyxl.styles import Font, Alignment, PatternFill
     header_fill = PatternFill("solid", fgColor="4F46E5")
     header_font = Font(bold=True, color="FFFFFF")
     ws["A1"].font = Font(bold=True, size=14)
     ws["A2"].font = Font(bold=True)
-
     header_row = 6
     for col_idx in range(1, len(headers) + 1):
         cell = ws.cell(row=header_row, column=col_idx)
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center")
-
     for col_idx, h in enumerate(headers, 1):
-        ws.column_dimensions[
-            ws.cell(row=header_row, column=col_idx).column_letter
-        ].width = max(14, min(40, len(str(h)) + 4))
-
+        ws.column_dimensions[ws.cell(row=header_row, column=col_idx).column_letter].width = max(14, min(40, len(str(h)) + 4))
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)
-    return StreamingResponse(
-        bio,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition":
-                f"attachment; filename=TN01_Draft_"
-                f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        },
-    )
-
+    return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=TN01_Draft_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"})
 
 @app.get("/api/tn01/print/{nid}", response_class=HTMLResponse)
 def tn01_print_preview(req: Request, nid: int):
     need(req)
     note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
-    if not note:
-        return HTMLResponse("Note not found", 404)
-
+    if not note: return HTMLResponse("Note not found", 404)
     org = fetch_one("SELECT * FROM org WHERE id=1") or {}
-    try:
-        headers = json.loads(note["sheet_headers"])
-    except Exception:
-        headers = []
-    try:
-        data_rows = json.loads(note["sheet_data"])
-    except Exception:
-        data_rows = []
+    try: headers = json.loads(note["sheet_headers"])
+    except Exception: headers = []
+    try: data_rows = json.loads(note["sheet_data"])
+    except Exception: data_rows = []
+    th = "".join(f"<th style='border:1px solid #0f172a; padding:6px 8px; font-size:11px; background:#e0e7ff'>{h}</th>" for h in headers)
+    trs = "".join(f"<tr>{''.join(f'<td style=\"border:1px solid #cbd5e1; padding:6px 8px; font-size:11px\">{c}</td>' for c in r)}</tr>" for r in data_rows)
+    return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>{note['note_no']}</title><style>body {{ font-family: sans-serif; margin: 30px; color: #0f172a; }} .header {{ border-bottom: 2px solid #4f46e5; padding-bottom: 10px; margin-bottom: 15px; }} .meta {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; font-size: 12px; background: #f8fafc; padding: 12px; border: 1px solid #e2e8f0; margin-bottom: 20px; }} table {{ width: 100%; border-collapse: collapse; margin-bottom: 30px; }} .signs {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-top: 40px; text-align: center; font-size: 11px; font-weight: bold; }} .sign-box {{ border-top: 1px solid #0f172a; padding-top: 8px; }} @media print {{ .no-print {{ display: none; }} body {{ margin: 0; }} }}</style></head><body><div class="no-print" style="margin-bottom:15px;text-align:right"><button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:bold">Print / PDF</button></div><div class="header"><h2 style="margin:0">{org.get('name', 'Thermocables')}</h2><h4 style="margin:4px 0 0;color:#4f46e5">TRANSFER NOTE (TN01)</h4><div style="font-family:monospace;font-weight:bold;margin-top:4px">{note['note_no']} | {note['created_at']}</div></div><div class="meta"><div><b>Route:</b><br>{note['route']}</div><div><b>From:</b><br>{note['from_plant']} - {note['from_dept']}</div><div><b>To:</b><br>{note['to_plant']} - {note['to_dept']}</div><div><b>Entries:</b><br>{note['entry_count']}</div><div><b>Sender:</b><br>{note['from_user_name']}</div><div><b>Recipient:</b><br>{note['to_user_name']}</div><div><b>Status:</b><br>{note['status'].upper()}</div><div><b>Receipt:</b><br>{note['received_at'] or 'Pending'}</div></div><div style="font-size:11px;margin-bottom:10px"><b>CC:</b> {note.get('cc_users') or '—'}</div><table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table><div class="signs"><div class="sign-box">Handovered By ({note['from_user_name']})</div><div class="sign-box">Production | QC</div><div class="sign-box">Received By ({note['received_by_name'] or note['to_user_name']})</div></div></body></html>""")
 
-    th = "".join(
-        f"<th style='border:1px solid #0f172a; padding:6px 8px; "
-        f"font-size:11px; background:#e0e7ff'>{h}</th>"
-        for h in headers
-    )
-    trs = "".join(
-        f"<tr>"
-        + "".join(
-            f'<td style="border:1px solid #cbd5e1; padding:6px 8px; '
-            f'font-size:11px">{c}</td>'
-            for c in r
-        )
-        + "</tr>"
-        for r in data_rows
-    )
-
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>{note['note_no']}</title>
-<style>
-body {{ font-family: sans-serif; margin: 30px; color: #0f172a; }}
-.header {{ border-bottom: 2px solid #4f46e5; padding-bottom: 10px;
-margin-bottom: 15px; }}
-.meta {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;
-font-size: 12px; background: #f8fafc; padding: 12px;
-border: 1px solid #e2e8f0; margin-bottom: 20px; }}
-table {{ width: 100%; border-collapse: collapse; margin-bottom: 30px; }}
-.signs {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px;
-margin-top: 40px; text-align: center; font-size: 11px; font-weight: bold; }}
-.sign-box {{ border-top: 1px solid #0f172a; padding-top: 8px; }}
-@media print {{ .no-print {{ display: none; }} body {{ margin: 0; }} }}
-</style>
-</head>
-<body>
-<div class="no-print" style="margin-bottom:15px;text-align:right">
-  <button onclick="window.print()"
-    style="background:#4f46e5;color:white;border:none;padding:8px 16px;
-    border-radius:6px;cursor:pointer;font-weight:bold">Print / PDF</button>
-</div>
-<div class="header">
-  <h2 style="margin:0">{org.get('name', 'Thermocables')}</h2>
-  <h4 style="margin:4px 0 0;color:#4f46e5">TRANSFER NOTE (TN01)</h4>
-  <div style="font-family:monospace;font-weight:bold;margin-top:4px">
-    {note['note_no']} | {note['created_at']}
-  </div>
-</div>
-<div class="meta">
-  <div><b>Route:</b><br>{note['route']}</div>
-  <div><b>From:</b><br>{note['from_plant']} - {note['from_dept']}</div>
-  <div><b>To:</b><br>{note['to_plant']} - {note['to_dept']}</div>
-  <div><b>Entries:</b><br>{note['entry_count']}</div>
-  <div><b>Sender:</b><br>{note['from_user_name']}</div>
-  <div><b>Recipient:</b><br>{note['to_user_name']}</div>
-  <div><b>Status:</b><br>{note['status'].upper()}</div>
-  <div><b>Receipt:</b><br>{note['received_at'] or 'Pending'}</div>
-</div>
-<div style="font-size:11px;margin-bottom:10px">
-  <b>CC:</b> {note.get('cc_users') or '—'}
-</div>
-<table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table>
-<div class="signs">
-  <div class="sign-box">Handovered By ({note['from_user_name']})</div>
-  <div class="sign-box">Production | QC</div>
-  <div class="sign-box">Received By ({note['received_by_name'] or note['to_user_name']})</div>
-</div>
-</body>
-</html>""")
-
-
-# =========================================================================
-# STANDARD MODULE HANDLERS
-# =========================================================================
 @app.get("/api/tcode/{code}/layouts")
 def get_layouts(code: str, req: Request):
     user = need(req)
-    if not check_tcode_access(user, code):
-        raise HTTPException(403, "Access denied.")
-
-    rows = fetch_all(
-        "SELECT * FROM tcode_layouts WHERE tcode_code=? "
-        "ORDER BY is_default DESC, id ASC",
-        (code,),
-    )
+    if not check_tcode_access(user, code): raise HTTPException(403, "Access denied.")
+    rows = fetch_all("SELECT * FROM tcode_layouts WHERE tcode_code=? ORDER BY is_default DESC, id ASC", (code,))
     for r in rows:
-        try:
-            r["fields"] = json.loads(r["fields"])
-        except Exception:
-            r["fields"] = []
+        try: r["fields"] = json.loads(r["fields"])
+        except Exception: r["fields"] = []
     return rows
 
-
 @app.get("/api/tcode/{code}/records")
-def get_tcode_records(
-    code: str, req: Request, plant: str = "", limit: int = 500
-):
+def get_tcode_records(code: str, req: Request, plant: str = "", limit: int = 500):
     user = need(req)
-    if not check_tcode_access(user, code):
-        raise HTTPException(403, "Access denied.")
-
-    sql = (
-        "SELECT * FROM tcode_records WHERE tcode_code=? AND status='active'"
-    )
+    if not check_tcode_access(user, code): raise HTTPException(403, "Access denied.")
+    sql = "SELECT * FROM tcode_records WHERE tcode_code=? AND status='active'"
     params = [code]
-
     if plant:
         sql += " AND plant=?"
         params.append(plant)
-
     sql += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
-
     rows = fetch_all(sql, tuple(params))
     for r in rows:
-        try:
-            r["data"] = json.loads(r["data"])
-        except Exception:
-            r["data"] = {}
+        try: r["data"] = json.loads(r["data"])
+        except Exception: r["data"] = {}
     return rows
-
 
 @app.post("/api/tcode/{code}/records")
 def create_record(code: str, req: Request, payload: dict):
     user = need(req)
-    if not check_tcode_access(user, code):
-        raise HTTPException(403, "Access denied.")
-
+    if not check_tcode_access(user, code): raise HTTPException(403, "Access denied.")
     plant = payload.pop("_plant", "").strip()
     cur_time = now()
-    exec_write(
-        "INSERT INTO tcode_records (tcode_code, plant, data, status, "
-        "created_by, created_by_name, created_at, updated_at) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (code, plant, json.dumps(payload, default=json_serial), "active",
-         user["username"], user["full_name"], cur_time, cur_time),
-    )
+    exec_write("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)", (code, plant, json.dumps(payload, default=json_serial), "active", user["username"], user["full_name"], cur_time, cur_time))
     return {"ok": True}
-
 
 @app.delete("/api/tcode/{code}/records/{rid}")
 def delete_record(code: str, rid: int, req: Request):
     user = need(req)
-    if not check_tcode_access(user, code):
-        raise HTTPException(403, "Access denied.")
-
-    rec = fetch_one(
-        "SELECT * FROM tcode_records WHERE id=? AND tcode_code=?", (rid, code)
-    )
-    if not rec:
-        raise HTTPException(404, "Record not found.")
-
-    if (rec["created_by"] != user["username"]
-            and not is_master(user)
-            and user["role"] != "admin"):
-        raise HTTPException(403, "You can only delete your own records.")
-
-    exec_write(
-        "UPDATE tcode_records SET status='deleted', updated_at=? WHERE id=?",
-        (now(), rid),
-    )
+    if not check_tcode_access(user, code): raise HTTPException(403, "Access denied.")
+    rec = fetch_one("SELECT * FROM tcode_records WHERE id=? AND tcode_code=?", (rid, code))
+    if not rec: raise HTTPException(404, "Record not found.")
+    if (rec["created_by"] != user["username"] and not is_master(user) and user["role"] != "admin"): raise HTTPException(403, "You can only delete your own records.")
+    exec_write("UPDATE tcode_records SET status='deleted', updated_at=? WHERE id=?", (now(), rid))
     return {"ok": True}
-
 
 @app.get("/api/tcode/{code}/export")
 def export_excel(code: str, req: Request):
     user = need(req)
-    if not check_tcode_access(user, code):
-        raise HTTPException(403, "Access denied.")
-
-    rows = fetch_all(
-        "SELECT * FROM tcode_records WHERE tcode_code=? AND status='active' "
-        "ORDER BY id ASC",
-        (code,),
-    )
-
+    if not check_tcode_access(user, code): raise HTTPException(403, "Access denied.")
+    rows = fetch_all("SELECT * FROM tcode_records WHERE tcode_code=? AND status='active' ORDER BY id ASC", (code,))
     wb = Workbook()
     ws = wb.active
     ws.title = f"{code}_DATA"
-
     base_keys = ["id", "plant", "created_by_name", "created_at"]
     dynamic_keys = set()
     parsed_rows = []
-
     for r in rows:
-        try:
-            d = json.loads(r["data"]) if isinstance(r["data"], str) else r["data"]
-        except Exception:
-            d = {}
+        try: d = json.loads(r["data"]) if isinstance(r["data"], str) else r["data"]
+        except Exception: d = {}
         dynamic_keys.update(d.keys())
         parsed_rows.append((r, d))
-
     all_cols = base_keys + sorted(dynamic_keys)
     ws.append(all_cols)
-
     for r, d in parsed_rows:
-        ws.append(
-            [r["id"], r["plant"], r["created_by_name"], r["created_at"]]
-            + [d.get(k, "") for k in sorted(dynamic_keys)]
-        )
-
+        ws.append([r["id"], r["plant"], r["created_by_name"], r["created_at"]] + [d.get(k, "") for k in sorted(dynamic_keys)])
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)
-    return StreamingResponse(
-        bio,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition":
-                f"attachment; filename=Export_{code}_"
-                f"{datetime.date.today().strftime('%Y%m%d')}.xlsx"
-        },
-    )
+    return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=Export_{code}_{datetime.date.today().strftime('%Y%m%d')}.xlsx"})
 
-
-# =========================================================================
-# FRONTEND
-# =========================================================================
 HTML_UI = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3384,11 +1574,10 @@ function renderLogon(err=""){
       </div>
       ${err?`<div class="mb-4 p-3 bg-red-50 border border-red-200 rounded-xl text-red-700 text-xs">${esc(err)}</div>`:''}
       <div class="space-y-4">
-        <div><label class="form-label">Username</label><input id="l_u" class="form-input" placeholder="admin" autofocus></div>
+        <div><label class="form-label">Username</label><input id="l_u" class="form-input" placeholder="Username" autofocus></div>
         <div><label class="form-label">Password</label><input id="l_p" type="password" class="form-input" placeholder="••••••••" onkeydown="if(event.key==='Enter')handleLogon()"></div>
         <button onclick="handleLogon()" class="w-full btn-primary py-2.5 rounded-lg font-semibold text-sm">Sign In</button>
       </div>
-      <div class="mt-6 pt-4 border-t border-slate-200 text-[11px] text-slate-500 text-center">Default: admin / Admin@123</div>
     </div>
   </div>`;
 }
@@ -3993,15 +2182,20 @@ function setupPasteHandler(){
     const lines=clip.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n');
     let sr=TN01_CELL.r||0;
     let sc=TN01_CELL.c||1;
-    if(sc===0)sc=1;
+    
+    // FORCE PASTE TO START AT COLUMN 1 (The first data column)
+    // This prevents the paste from overwriting "Sr. No." and shifting the data right.
+    sc = 1; 
+
     lines.forEach((line,li)=>{
       if(!line&&li===lines.length-1)return;
       const cells=line.split('\t');
-      // Drop a single leading empty cell (Excel clipboard artifact) so
-      // pasted values align to the intended starting column.
-      if(cells.length>1 && cells[0].trim()==='' && (sc+cells.length-1)>=TN01_HEADERS.length){
-        cells.shift();
+      
+      // Strip trailing empty cell from Excel
+      if(cells.length > 0 && cells[cells.length - 1] === '') {
+         cells.pop();
       }
+
       const tr=sr+li;
       while(TN01_ROWS.length<=tr){const nr=new Array(TN01_HEADERS.length).fill("");nr[0]=TN01_ROWS.length+1;TN01_ROWS.push(nr);}
       cells.forEach((v,ci)=>{const tc=sc+ci;if(tc<TN01_HEADERS.length)TN01_ROWS[tr][tc]=v.trim();});
@@ -4012,22 +2206,7 @@ function setupPasteHandler(){
   });
 }
 
-// Repair any rows whose column 1 is empty but later columns are not,
-// shifting left so pasted data doesn't end up one cell over.
-function normalizeTN01Rows(){
-  TN01_ROWS.forEach(r=>{
-    if(r.length>=3 && String(r[1]||'').trim()==='' &&
-       r.slice(2).some(x=>String(x).trim()!=='')){
-      // Shift data left by one starting at index 1
-      for(let i=1;i<r.length-1;i++) r[i]=r[i+1];
-      r[r.length-1]='';
-    }
-  });
-  TN01_ROWS.forEach((r,i)=>{r[0]=i+1;});
-}
-
 async function exportGridAsExcel(){
-  normalizeTN01Rows();
   const f=TN01_ROWS.filter(r=>r.slice(1).some(x=>String(x).trim()!==''));
   if(!f.length)return alert("No rows.");
   const t=TN01_ROUTES[TN01_ACTIVE_ROUTE]?TN01_ROUTES[TN01_ACTIVE_ROUTE].route:"Draft";
@@ -4049,7 +2228,6 @@ async function exportGridAsExcel(){
 }
 
 async function openSendModal(){
-  normalizeTN01Rows();
   const a=TN01_ROUTES[TN01_ACTIVE_ROUTE];
   const f=TN01_ROWS.filter(r=>r.slice(1).some(x=>String(x).trim()!==''));
   if(!f.length)return alert("Enter at least one row.");
@@ -4083,14 +2261,10 @@ async function openSendModal(){
 async function updateSuggestedUsers(){
   const pl=$('#send_plant').value;
   const dept=$('#send_dept').value;
-
-  // Primary receiver — filtered by dept (existing behavior)
   const u=await api(`/api/tn01/suggest-users?plant=${pl}&dept=${encodeURIComponent(dept)}`);
   $('#send_user').innerHTML=u.length
     ? u.map(x=>`<option value="${esc(x.username)}">${esc(x.full_name)} (${esc(x.username)})</option>`).join('')
     : `<option value="">(Dept Pool)</option>`;
-
-  // CC list — every approved user in the plant, grouped by department
   const all=await api(`/api/tn01/suggest-users?plant=${pl}`);
   const byDept={};
   all.forEach(x=>{
@@ -4107,7 +2281,6 @@ async function updateSuggestedUsers(){
 }
 
 async function submitSendNote(){
-  normalizeTN01Rows();
   const f=TN01_ROWS.filter(r=>r.slice(1).some(x=>String(x).trim()!==''));
   const ccEl=$('#send_cc');
   const cc=ccEl?Array.from(ccEl.selectedOptions).map(o=>o.value):[];
@@ -4224,6 +2397,7 @@ async function renderTN01HistoryTab(){
 
 function renderHistoryRows(hs){
   if(!hs.length)return `<tr><td colspan="10" class="text-center py-10 text-slate-400">No records.</td></tr>`;
+  const admin=ME.is_master||ME.role==='admin';
   return hs.map(h=>`
     <tr>
       <td class="font-mono font-bold text-indigo-600">${esc(h.note_no)}</td>
@@ -4239,8 +2413,18 @@ function renderHistoryRows(hs){
         <button onclick="viewTransferNote(${h.id})" class="text-xs text-indigo-600 font-semibold">View</button>
         <a href="/api/tn01/print/${h.id}" target="_blank" class="text-xs text-slate-600 font-semibold ml-2">PDF</a>
         <a href="/api/tn01/export/${h.id}" class="text-xs text-emerald-600 font-semibold ml-2">Excel</a>
+        ${admin?`<button onclick="deleteTN01History(${h.id})" class="text-xs text-red-600 font-bold ml-2">Del</button>`:''}
       </td>
     </tr>`).join('');
+}
+
+async function deleteTN01History(id){
+  if(!confirm("Permanently delete this transfer note?"))return;
+  try{
+    await api(`/api/tn01/delete/${id}`, {method:'DELETE'});
+    setMsg("Deleted");
+    renderTN01HistoryTab();
+  }catch(e){alert(e);}
 }
 
 async function applyHistoryFilters(){
@@ -4724,16 +2908,13 @@ initSession();
 </html>
 """
 
-
 @app.get("/", response_class=HTMLResponse)
 def home():
     return HTMLResponse(HTML_UI)
 
-
 @app.get("/health")
 def health():
     return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "3.9.0"}
-
 
 if __name__ == "__main__":
     import uvicorn
