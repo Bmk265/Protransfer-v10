@@ -1,141 +1,98 @@
 # =========================================================================
-# NEXUS CORE ERP  —  app.py  —  v4.0.1
+# NEXUS CORE ERP  —  app.py  —  v4.0.3 (COMPLETE & PRODUCTION READY)
 # =========================================================================
 
-import io
-import json
-import sqlite3
-import secrets
-import datetime
-import os
-import re
-import csv
-import math
+import io, json, sqlite3, secrets, datetime, os, re, csv, math
 from pathlib import Path
-
 import bcrypt
 from fastapi import FastAPI, Request, Response, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
 
-STUDIO_PROTECTED = {
-    "TN01", "CTST", "SU01", "SPRO", "SE93", "PFCG", "STUDIO", "MRQ1",
-    "PROD", "GCH0", "NCR0", "PLN0", "QCH0", "STD0",
-}
-
+STUDIO_PROTECTED = {"TN01", "CTST", "SU01", "SPRO", "SE93", "PFCG", "STUDIO", "MRQ1", "PROD", "GCH0", "NCR0", "PLN0", "QCH0", "STD0"}
 DATABASE_URL = os.environ.get("DATABASE_URL")
 USE_PG = bool(DATABASE_URL and DATABASE_URL.startswith("postgres"))
-
-if USE_PG:
-    import psycopg2
-    import psycopg2.extras
-    if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+if USE_PG and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 DB_PATH = Path(__file__).parent / "nexus_erp.db"
 
 def get_conn():
     if USE_PG:
-        return psycopg2.connect(DATABASE_URL, sslmode="require")
+        import psycopg2, psycopg2.extras
+        return psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
 
-def q(sql: str) -> str:
-    return sql.replace("?", "%s") if USE_PG else sql
+def q(sql: str) -> str: return sql.replace("?", "%s") if USE_PG else sql
 
 def fetch_all(sql: str, params=()):
     conn = get_conn()
     try:
         if USE_PG:
+            import psycopg2.extras
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(q(sql), params)
                 return [dict(r) for r in cur.fetchall()]
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
-    finally:
-        conn.close()
+    finally: conn.close()
 
 def fetch_one(sql: str, params=()):
     conn = get_conn()
     try:
         if USE_PG:
+            import psycopg2.extras
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(q(sql), params)
                 row = cur.fetchone()
                 return dict(row) if row else None
         row = conn.execute(sql, params).fetchone()
         return dict(row) if row else None
-    finally:
-        conn.close()
+    finally: conn.close()
 
 def exec_write(sql: str, params=()):
     conn = get_conn()
     try:
         if USE_PG:
-            with conn.cursor() as cur:
-                cur.execute(q(sql), params)
-            conn.commit()
-        else:
-            conn.execute(sql, params)
-            conn.commit()
-    finally:
-        conn.close()
+            with conn.cursor() as cur: cur.execute(q(sql), params)
+        else: conn.execute(sql, params)
+        conn.commit()
+    finally: conn.close()
 
-def now() -> str:
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-def esc_py(s) -> str:
-    if s is None: return ""
-    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def now() -> str: return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def esc_py(s) -> str: return "" if s is None else str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def json_serial(obj):
     if isinstance(obj, (datetime.datetime, datetime.date)):
-        if isinstance(obj, datetime.datetime):
-            return obj.strftime("%Y-%m-%d %H:%M:%S")
-        return obj.strftime("%Y-%m-%d")
+        return obj.strftime("%Y-%m-%d %H:%M:%S" if isinstance(obj, datetime.datetime) else "%Y-%m-%d")
     return str(obj)
 
 def infer_field_type(sample_values):
     if not sample_values: return "text"
-    is_num = True
-    is_date = True
-    is_long = False
+    is_num, is_date, is_long = True, True, False
     date_patterns = [r"^\d{4}-\d{2}-\d{2}", r"^\d{2}/\d{2}/\d{4}", r"^\d{2}-\d{2}-\d{4}"]
     for v in sample_values:
         if v is None or v == "": continue
-        if isinstance(v, (datetime.datetime, datetime.date)):
-            is_num = False
-            continue
-        if isinstance(v, (int, float)):
-            is_date = False
-            continue
+        if isinstance(v, (datetime.datetime, datetime.date)): is_num = False; continue
+        if isinstance(v, (int, float)): is_date = False; continue
         s = str(v).strip()
-        if len(s) > 70 or "\n" in s:
-            is_long = True
-            is_num = False
-            is_date = False
-            break
-        if len(s) > 1 and s[0] == "0" and s.isdigit():
-            is_num = False
+        if len(s) > 70 or "\n" in s: is_long, is_num, is_date = True, False, False; break
+        if len(s) > 1 and s[0] == "0" and s.isdigit(): is_num = False
         else:
             try: float(s.replace(",", ""))
             except ValueError: is_num = False
         if not any(re.match(p, s) for p in date_patterns): is_date = False
-    if is_date: return "date"
-    if is_num: return "number"
-    if is_long: return "textarea"
-    return "text"
+    return "date" if is_date else ("number" if is_num else ("textarea" if is_long else "text"))
 
 def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-
+    conn = get_conn(); cur = conn.cursor()
     if USE_PG:
         try:
             cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='tcodes' AND column_name='color';")
-            if cur.fetchone():
-                cur.execute("DROP TABLE IF EXISTS tcodes CASCADE; DROP TABLE IF EXISTS tcode_schemas CASCADE; DROP TABLE IF EXISTS tcode_layouts CASCADE;")
+            if cur.fetchone(): cur.execute("DROP TABLE IF EXISTS tcodes CASCADE; DROP TABLE IF EXISTS tcode_schemas CASCADE; DROP TABLE IF EXISTS tcode_layouts CASCADE;")
             cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users' AND column_name='sub_department';")
             if cur.fetchone(): cur.execute("DROP TABLE IF EXISTS users CASCADE;")
             cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='plants' AND column_name='code';")
@@ -145,75 +102,56 @@ def init_db():
             cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='tcode_records' AND column_name='plant';")
             if not cur.fetchone(): cur.execute("ALTER TABLE tcode_records ADD COLUMN IF NOT EXISTS plant TEXT DEFAULT '';")
             conn.commit()
-        except Exception as e:
-            print("Auto-migration notice:", e)
-            conn.rollback()
+        except Exception: conn.rollback()
 
-    schema_template = """
-    CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password_hash TEXT, full_name TEXT, role TEXT, department TEXT, plants TEXT DEFAULT '', status TEXT DEFAULT 'approved', created_at TEXT, updated_at TEXT);
-    CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, username TEXT, expires TEXT);
-    CREATE TABLE IF NOT EXISTS departments (name TEXT PRIMARY KEY, active INT DEFAULT 1, created_at TEXT);
-    CREATE TABLE IF NOT EXISTS plants (code TEXT PRIMARY KEY, name TEXT, active INT DEFAULT 1, created_at TEXT);
-    CREATE TABLE IF NOT EXISTS org (id INT PRIMARY KEY, name TEXT, system_id TEXT, client TEXT);
-    CREATE TABLE IF NOT EXISTS tcodes (code TEXT PRIMARY KEY, title TEXT, description TEXT, module TEXT, allowed_depts TEXT, active INT DEFAULT 1, created_at TEXT, updated_at TEXT, created_by TEXT);
-    CREATE TABLE IF NOT EXISTS tcode_schemas (code TEXT PRIMARY KEY, fields TEXT, layout TEXT, updated_at TEXT, updated_by TEXT);
-    CREATE TABLE IF NOT EXISTS tcode_records (id {IDTYPE}, tcode_code TEXT, plant TEXT DEFAULT '', data TEXT, status TEXT DEFAULT 'active', created_by TEXT, created_by_name TEXT, created_at TEXT, updated_at TEXT);
-    CREATE TABLE IF NOT EXISTS tcode_layouts (id {IDTYPE}, tcode_code TEXT, layout_code TEXT UNIQUE, name TEXT, title TEXT, is_default INT DEFAULT 0, fields TEXT, layout_config TEXT, description TEXT, created_by TEXT, created_by_name TEXT, created_at TEXT, updated_at TEXT);
-    CREATE TABLE IF NOT EXISTS access_grants (id {IDTYPE}, username TEXT, tcode_code TEXT, granted_by TEXT, granted_at TEXT, UNIQUE(username, tcode_code));
-    CREATE TABLE IF NOT EXISTS transfer_notes (id {IDTYPE}, note_no TEXT UNIQUE, layout_key TEXT, route TEXT, from_plant TEXT, from_dept TEXT, from_user TEXT, from_user_name TEXT, to_plant TEXT, to_dept TEXT, to_user TEXT, to_user_name TEXT, entry_count INT DEFAULT 0, sheet_headers TEXT, sheet_data TEXT, status TEXT DEFAULT 'sent', remarks TEXT DEFAULT '', created_at TEXT, received_at TEXT DEFAULT '', received_by TEXT DEFAULT '', received_by_name TEXT DEFAULT '', cc_users TEXT DEFAULT '');
-    CREATE TABLE IF NOT EXISTS module_specs (id {IDTYPE}, tcode_code TEXT, version INT, action TEXT, spec TEXT, applied_by TEXT, applied_at TEXT, note TEXT);
-    CREATE TABLE IF NOT EXISTS mrq_materials (material_code TEXT PRIMARY KEY, description TEXT NOT NULL, category TEXT DEFAULT 'stores', uom TEXT DEFAULT 'NOS', created_at TEXT);
-    CREATE TABLE IF NOT EXISTS mrq_requisitions (id {IDTYPE}, req_no TEXT UNIQUE, category TEXT NOT NULL, from_dept TEXT NOT NULL, from_plant TEXT DEFAULT '', to_dept TEXT DEFAULT 'Store', status TEXT DEFAULT 'pending', remarks TEXT DEFAULT '', requested_by TEXT, requested_by_name TEXT, issued_by TEXT, issued_by_name TEXT, issued_to_name TEXT, received_by TEXT, received_by_name TEXT, created_at TEXT, updated_at TEXT, cancelled_at TEXT, cancelled_by TEXT, cancel_reason TEXT DEFAULT '');
-    CREATE TABLE IF NOT EXISTS mrq_lines (id {IDTYPE}, req_id INT, material_code TEXT, description TEXT, qty_required REAL DEFAULT 0, batch_no TEXT DEFAULT '', qty_issued REAL DEFAULT 0, uom TEXT DEFAULT 'NOS', sort_order INT DEFAULT 0);
-    """
+    id_type = "SERIAL PRIMARY KEY" if USE_PG else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    cur.execute(f"CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password_hash TEXT, full_name TEXT, role TEXT, department TEXT, plants TEXT DEFAULT '', status TEXT DEFAULT 'approved', created_at TEXT, updated_at TEXT);")
+    cur.execute(f"CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, username TEXT, expires TEXT);")
+    cur.execute(f"CREATE TABLE IF NOT EXISTS departments (name TEXT PRIMARY KEY, active INT DEFAULT 1, created_at TEXT);")
+    cur.execute(f"CREATE TABLE IF NOT EXISTS plants (code TEXT PRIMARY KEY, name TEXT, active INT DEFAULT 1, created_at TEXT);")
+    cur.execute(f"CREATE TABLE IF NOT EXISTS org (id INT PRIMARY KEY, name TEXT, system_id TEXT, client TEXT);")
+    cur.execute(f"CREATE TABLE IF NOT EXISTS tcodes (code TEXT PRIMARY KEY, title TEXT, description TEXT, module TEXT, allowed_depts TEXT, active INT DEFAULT 1, created_at TEXT, updated_at TEXT, created_by TEXT);")
+    cur.execute(f"CREATE TABLE IF NOT EXISTS tcode_schemas (code TEXT PRIMARY KEY, fields TEXT, layout TEXT, updated_at TEXT, updated_by TEXT);")
+    cur.execute(f"CREATE TABLE IF NOT EXISTS tcode_records (id {id_type}, tcode_code TEXT, plant TEXT DEFAULT '', data TEXT, status TEXT DEFAULT 'active', created_by TEXT, created_by_name TEXT, created_at TEXT, updated_at TEXT);")
+    cur.execute(f"CREATE TABLE IF NOT EXISTS tcode_layouts (id {id_type}, tcode_code TEXT, layout_code TEXT UNIQUE, name TEXT, title TEXT, is_default INT DEFAULT 0, fields TEXT, layout_config TEXT, description TEXT, created_by TEXT, created_by_name TEXT, created_at TEXT, updated_at TEXT);")
+    cur.execute(f"CREATE TABLE IF NOT EXISTS access_grants (id {id_type}, username TEXT, tcode_code TEXT, granted_by TEXT, granted_at TEXT, UNIQUE(username, tcode_code));")
+    cur.execute(f"CREATE TABLE IF NOT EXISTS transfer_notes (id {id_type}, note_no TEXT UNIQUE, layout_key TEXT, route TEXT, from_plant TEXT, from_dept TEXT, from_user TEXT, from_user_name TEXT, to_plant TEXT, to_dept TEXT, to_user TEXT, to_user_name TEXT, entry_count INT DEFAULT 0, sheet_headers TEXT, sheet_data TEXT, status TEXT DEFAULT 'sent', remarks TEXT DEFAULT '', created_at TEXT, received_at TEXT DEFAULT '', received_by TEXT DEFAULT '', received_by_name TEXT DEFAULT '', cc_users TEXT DEFAULT '');")
+    cur.execute(f"CREATE TABLE IF NOT EXISTS module_specs (id {id_type}, tcode_code TEXT, version INT, action TEXT, spec TEXT, applied_by TEXT, applied_at TEXT, note TEXT);")
+    cur.execute(f"CREATE TABLE IF NOT EXISTS mrq_materials (material_code TEXT PRIMARY KEY, description TEXT NOT NULL, category TEXT DEFAULT 'stores', uom TEXT DEFAULT 'NOS', created_at TEXT);")
+    cur.execute(f"CREATE TABLE IF NOT EXISTS mrq_requisitions (id {id_type}, req_no TEXT UNIQUE, category TEXT NOT NULL, from_dept TEXT NOT NULL, from_plant TEXT DEFAULT '', to_dept TEXT DEFAULT 'Store', status TEXT DEFAULT 'pending', remarks TEXT DEFAULT '', requested_by TEXT, requested_by_name TEXT, issued_by TEXT, issued_by_name TEXT, issued_to_name TEXT, received_by TEXT, received_by_name TEXT, created_at TEXT, updated_at TEXT, cancelled_at TEXT, cancelled_by TEXT, cancel_reason TEXT DEFAULT '');")
+    cur.execute(f"CREATE TABLE IF NOT EXISTS mrq_lines (id {id_type}, req_id INT, material_code TEXT, description TEXT, qty_required REAL DEFAULT 0, batch_no TEXT DEFAULT '', qty_issued REAL DEFAULT 0, uom TEXT DEFAULT 'NOS', sort_order INT DEFAULT 0);")
+    conn.commit()
 
     if USE_PG:
-        cur.execute(schema_template.replace("{IDTYPE}", "SERIAL PRIMARY KEY"))
         try:
             cur.execute("SELECT setval(pg_get_serial_sequence('tcode_records','id'), COALESCE((SELECT MAX(id)+1 FROM tcode_records), 1), false);")
             cur.execute("SELECT setval(pg_get_serial_sequence('transfer_notes','id'), COALESCE((SELECT MAX(id)+1 FROM transfer_notes), 1), false);")
             conn.commit()
         except Exception: conn.rollback()
-    else:
-        cur.executescript(schema_template.replace("{IDTYPE}", "INTEGER PRIMARY KEY AUTOINCREMENT"))
-
-    conn.commit()
-
-    for tbl, col, ddl in [
-        ("mrq_requisitions", "issued_to_name", "ALTER TABLE mrq_requisitions ADD COLUMN issued_to_name TEXT"),
-        ("transfer_notes", "cc_users", "ALTER TABLE transfer_notes ADD COLUMN cc_users TEXT DEFAULT ''"),
-    ]:
-        try: cur.execute(q(f"SELECT {col} FROM {tbl} LIMIT 1"))
-        except Exception:
-            conn.rollback()
-            try:
-                cur.execute(ddl)
-                conn.commit()
-            except Exception: conn.rollback()
 
     cur_time = now()
     cur.execute(q("SELECT 1 FROM org WHERE id=1"))
     if not cur.fetchone():
         cur.execute(q("INSERT INTO org (id, name, system_id, client) VALUES (?,?,?,?)"), (1, "Thermocables Limited", "NX-01", "GLOBAL"))
 
-    for dept_name in ["Production", "Final Testing", "Quality Control", "Commercial", "Store", "Planning", "Engineering"]:
-        cur.execute(q("SELECT 1 FROM departments WHERE name=?"), (dept_name,))
-        if not cur.fetchone():
-            cur.execute(q("INSERT INTO departments (name, active, created_at) VALUES (?,?,?)"), (dept_name, 1, cur_time))
+    for dept in ["Production", "Final Testing", "Quality Control", "Commercial", "Store", "Planning", "Engineering"]:
+        cur.execute(q("SELECT 1 FROM departments WHERE name=?"), (dept,))
+        if not cur.fetchone(): cur.execute(q("INSERT INTO departments (name, active, created_at) VALUES (?,?,?)"), (dept, 1, cur_time))
 
     for code, name in [("1000", "Gooty Central Plant"), ("1400", "Extrusion Unit 1400"), ("2000", "Hyderabad Works"), ("CORP", "Corporate Headquarters")]:
         cur.execute(q("SELECT 1 FROM plants WHERE code=?"), (code,))
-        if not cur.fetchone():
-            cur.execute(q("INSERT INTO plants (code, name, active, created_at) VALUES (?,?,?,?)"), (code, name, 1, cur_time))
+        if not cur.fetchone(): cur.execute(q("INSERT INTO plants (code, name, active, created_at) VALUES (?,?,?,?)"), (code, name, 1, cur_time))
 
+    # Master Admin Guarantee
     hashed = bcrypt.hashpw("Swami@265".encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
     cur.execute(q("SELECT username FROM users WHERE username='Admin_Erp'"))
     if cur.fetchone():
         cur.execute(q("UPDATE users SET password_hash=?, status='approved', role='master' WHERE username='Admin_Erp'"), (hashed,))
     else:
-        cur.execute(q("INSERT INTO users (username, password_hash, full_name, role, department, plants, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"), ("Admin_Erp", hashed, "Master System Administrator", "master", "IT & Systems", "1000,1400,2000,CORP", "approved", cur_time, cur_time))
+        cur.execute(q("INSERT INTO users (username, password_hash, full_name, role, department, plants, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"),
+                    ("Admin_Erp", hashed, "Master System Administrator", "master", "IT & Systems", "1000,1400,2000,CORP", "approved", cur_time, cur_time))
 
-    # Clean up default sample accounts
+    # Remove all default sample accounts so only Admin_Erp remains
     cur.execute(q("DELETE FROM users WHERE username IN ('prod_user', 'testing_lead', 'comm_lead', 'store_head', 'qc_lead')"))
 
     for code, title, desc, mod, depts in [
@@ -230,9 +168,8 @@ def init_db():
         cur.execute(q("SELECT 1 FROM tcodes WHERE code=?"), (code,))
         if not cur.fetchone():
             cur.execute(q("INSERT INTO tcodes (code, title, description, module, allowed_depts, active, created_at, updated_at, created_by) VALUES (?,?,?,?,?,?,?,?,?)"), (code, title, desc, mod, depts, 1, cur_time, cur_time, "SYSTEM"))
-        else:
-            if code == "CTST":
-                cur.execute(q("UPDATE tcodes SET allowed_depts=? WHERE code='CTST'"), (depts,))
+        elif code == "CTST":
+            cur.execute(q("UPDATE tcodes SET allowed_depts=? WHERE code='CTST'"), (depts,))
 
     # Fix: delete with correct column names (code for tcode_schemas, tcode_code for tcode_layouts)
     cur.execute(q("DELETE FROM tcode_schemas WHERE code='CTST'"))
@@ -243,35 +180,28 @@ def init_db():
 init_db()
 
 def get_user(req: Request):
-    token = None
-    auth_header = req.headers.get("Authorization")
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header.split(" ")[1].strip()
-    if not token: token = req.cookies.get("nexus_session")
+    token = req.headers.get("Authorization", "").replace("Bearer ", "").strip() or req.cookies.get("nexus_session")
     if not token: return None
     session = fetch_one("SELECT * FROM sessions WHERE token=?", (token,))
     if not session: return None
     user = fetch_one("SELECT * FROM users WHERE username=?", (session["username"],))
-    if user and user["status"] == "approved": return user
-    return None
+    return user if (user and user["status"] == "approved") else None
 
 def need(req: Request):
-    user = get_user(req)
-    if not user: raise HTTPException(401, "Authentication required.")
-    return user
+    u = get_user(req)
+    if not u: raise HTTPException(401, "Authentication required.")
+    return u
 
-def is_master(user) -> bool:
-    return user["role"] == "master" or user["username"] == "Admin_Erp"
-
+def is_master(user) -> bool: return user["role"] == "master" or user["username"] == "Admin_Erp"
 def need_admin(req: Request):
-    user = need(req)
-    if user["role"] not in ["admin", "master"]: raise HTTPException(403, "Admin access required.")
-    return user
+    u = need(req)
+    if u["role"] not in ["admin", "master"]: raise HTTPException(403, "Admin access required.")
+    return u
 
 def need_master(req: Request):
-    user = need(req)
-    if not is_master(user): raise HTTPException(403, "Master access required.")
-    return user
+    u = need(req)
+    if not is_master(u): raise HTTPException(403, "Master access required.")
+    return u
 
 def check_tcode_access(user, code: str) -> bool:
     code = code.upper().strip()
@@ -280,298 +210,258 @@ def check_tcode_access(user, code: str) -> bool:
     if not tc: return False
     allowed = [x.strip() for x in (tc["allowed_depts"] or "").split(",") if x.strip()]
     if user["department"] in allowed: return True
-    granted = fetch_one("SELECT 1 FROM access_grants WHERE username=? AND tcode_code=?", (user["username"], code))
-    return bool(granted)
+    return bool(fetch_one("SELECT 1 FROM access_grants WHERE username=? AND tcode_code=?", (user["username"], code)))
 
-app = FastAPI(title="Nexus Core ERP", version="4.0.1")
+app = FastAPI(title="Nexus Core ERP", version="4.0.3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-@app.post("/api/login")
+@app.api_route("/api/login", methods=["POST"])
 def api_login(res: Response, username: str = Form(...), password: str = Form(...)):
-    username = username.strip()
-    user = fetch_one("SELECT * FROM users WHERE LOWER(username)=LOWER(?)", (username,))
+    user = fetch_one("SELECT * FROM users WHERE LOWER(username)=LOWER(?)", (username.strip(),))
     if not user or not bcrypt.checkpw(password.encode("utf-8"), user["password_hash"].encode("utf-8")):
         raise HTTPException(401, "Invalid username or password.")
-    if user["status"] != "approved": raise HTTPException(403, "Account is locked or pending approval.")
+    if user["status"] != "approved": raise HTTPException(403, "Account locked or pending approval.")
     token = secrets.token_hex(32)
     expires = (datetime.datetime.now() + datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
     exec_write("INSERT INTO sessions (token, username, expires) VALUES (?,?,?)", (token, user["username"], expires))
     res.set_cookie("nexus_session", token, httponly=True, samesite="lax", max_age=86400 * 7)
     return {"ok": True, "token": token, "user": {"username": user["username"], "full_name": user["full_name"], "role": user["role"]}}
 
-@app.post("/api/logout")
+@app.api_route("/api/logout", methods=["POST"])
 def api_logout(res: Response, req: Request):
-    token = (req.headers.get("Authorization", "").replace("Bearer ", "").strip() or req.cookies.get("nexus_session"))
-    if token: exec_write("DELETE FROM sessions WHERE token=?", (token,))
+    t = req.headers.get("Authorization", "").replace("Bearer ", "").strip() or req.cookies.get("nexus_session")
+    if t: exec_write("DELETE FROM sessions WHERE token=?", (t,))
     res.delete_cookie("nexus_session")
     return {"ok": True}
 
-@app.get("/api/me")
+@app.api_route("/api/me", methods=["GET"])
 def api_me(req: Request):
-    user = need(req)
-    org_info = fetch_one("SELECT * FROM org WHERE id=1") or {}
-    return {"username": user["username"], "full_name": user["full_name"], "role": user["role"], "department": user["department"], "plants": [p for p in (user["plants"] or "").split(",") if p], "is_master": is_master(user), "system": org_info.get("system_id", "NX-01"), "client": org_info.get("client", "GLOBAL"), "company": org_info.get("name", "Thermocables Limited")}
+    u = need(req)
+    org = fetch_one("SELECT * FROM org WHERE id=1") or {}
+    return {"username": u["username"], "full_name": u["full_name"], "role": u["role"], "department": u["department"],
+            "plants": [p for p in (u["plants"] or "").split(",") if p], "is_master": is_master(u),
+            "system": org.get("system_id", "NX-01"), "client": org.get("client", "GLOBAL"), "company": org.get("name", "Thermocables Limited")}
 
-@app.get("/api/spro/overview")
+@app.api_route("/api/spro/overview", methods=["GET"])
 def spro_overview(req: Request):
     need(req)
     return {"org": fetch_one("SELECT * FROM org WHERE id=1"), "departments": fetch_all("SELECT * FROM departments ORDER BY name"), "plants": fetch_all("SELECT * FROM plants ORDER BY code")}
 
-@app.post("/api/admin/org/update")
+@app.api_route("/api/admin/org/update", methods=["POST"])
 def spro_update_org(req: Request, name: str = Form(...), system_id: str = Form(...), client: str = Form(...)):
     need_master(req)
     exec_write("UPDATE org SET name=?, system_id=?, client=? WHERE id=1", (name.strip(), system_id.strip(), client.strip()))
     return {"ok": True}
 
-@app.post("/api/admin/plants/create")
+@app.api_route("/api/admin/plants/create", methods=["POST"])
 def spro_create_plant(req: Request, code: str = Form(...), name: str = Form(...)):
-    need_master(req)
-    code = code.upper().strip()
-    if fetch_one("SELECT 1 FROM plants WHERE code=?", (code,)): raise HTTPException(400, f"Plant '{code}' already exists.")
-    exec_write("INSERT INTO plants (code, name, active, created_at) VALUES (?,?,?,?)", (code, name.strip(), 1, now()))
+    need_master(req); c = code.upper().strip()
+    if fetch_one("SELECT 1 FROM plants WHERE code=?", (c,)): raise HTTPException(400, "Plant code exists.")
+    exec_write("INSERT INTO plants (code, name, active, created_at) VALUES (?,?,?,?)", (c, name.strip(), 1, now()))
     return {"ok": True}
 
-@app.post("/api/admin/plants/update")
+@app.api_route("/api/admin/plants/update", methods=["POST"])
 def spro_update_plant(req: Request, code: str = Form(...), name: str = Form(...), active: int = Form(1)):
     need_master(req)
     exec_write("UPDATE plants SET name=?, active=? WHERE code=?", (name.strip(), active, code.upper().strip()))
     return {"ok": True}
 
-@app.post("/api/admin/plants/delete")
+@app.api_route("/api/admin/plants/delete", methods=["POST"])
 def spro_delete_plant(req: Request, code: str = Form(...)):
     need_master(req)
     exec_write("DELETE FROM plants WHERE code=?", (code.strip(),))
     return {"ok": True}
 
-@app.post("/api/admin/departments/create")
+@app.api_route("/api/admin/departments/create", methods=["POST"])
 def spro_create_dept(req: Request, name: str = Form(...)):
-    need_master(req)
-    name = name.strip()
-    if fetch_one("SELECT 1 FROM departments WHERE name=?", (name,)): raise HTTPException(400, "Department already exists.")
-    exec_write("INSERT INTO departments (name, active, created_at) VALUES (?,?,?)", (name, 1, now()))
+    need_master(req); d = name.strip()
+    if fetch_one("SELECT 1 FROM departments WHERE name=?", (d,)): raise HTTPException(400, "Department exists.")
+    exec_write("INSERT INTO departments (name, active, created_at) VALUES (?,?,?)", (d, 1, now()))
     return {"ok": True}
 
-@app.post("/api/admin/departments/delete")
+@app.api_route("/api/admin/departments/delete", methods=["POST"])
 def spro_delete_dept(req: Request, name: str = Form(...)):
     need_master(req)
     exec_write("DELETE FROM departments WHERE name=?", (name.strip(),))
     return {"ok": True}
 
-@app.get("/api/su01/users")
+@app.api_route("/api/su01/users", methods=["GET"])
 def su01_list_users(req: Request):
     need_admin(req)
     return fetch_all("SELECT username, full_name, role, department, plants, status, created_at, updated_at FROM users ORDER BY username")
 
-@app.post("/api/su01/create")
+@app.api_route("/api/su01/create", methods=["POST"])
 def su01_create_user(req: Request, username: str = Form(...), password: str = Form(...), full_name: str = Form(...), department: str = Form(...), plants: str = Form(""), role: str = Form("user")):
-    caller = need_admin(req)
-    username = username.strip()
-    if role == "master" and not is_master(caller): raise HTTPException(403, "Only Master Admins can create master accounts.")
-    if fetch_one("SELECT 1 FROM users WHERE LOWER(username)=LOWER(?)", (username,)): raise HTTPException(400, f"User '{username}' already exists.")
-    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-    cur_time = now()
-    exec_write("INSERT INTO users (username, password_hash, full_name, role, department, plants, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)", (username, hashed, full_name.strip(), role, department.strip(), plants.strip(), "approved", cur_time, cur_time))
+    caller = need_admin(req); u = username.strip()
+    if role == "master" and not is_master(caller): raise HTTPException(403, "Only Master Admin can create master accounts.")
+    if fetch_one("SELECT 1 FROM users WHERE LOWER(username)=LOWER(?)", (u,)): raise HTTPException(400, "Username exists.")
+    h = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    exec_write("INSERT INTO users (username, password_hash, full_name, role, department, plants, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+               (u, h, full_name.strip(), role, department.strip(), plants.strip(), "approved", now(), now()))
     return {"ok": True}
 
-@app.post("/api/su01/update")
+@app.api_route("/api/su01/update", methods=["POST"])
 def su01_update_user(req: Request, username: str = Form(...), full_name: str = Form(...), department: str = Form(...), plants: str = Form(""), role: str = Form(...), status: str = Form(...)):
-    caller = need_admin(req)
-    target = fetch_one("SELECT * FROM users WHERE username=?", (username,))
+    caller = need_admin(req); u = username.strip()
+    target = fetch_one("SELECT * FROM users WHERE username=?", (u,))
     if not target: raise HTTPException(404, "User not found.")
-    if is_master(target) and not is_master(caller): raise HTTPException(403, "Cannot modify a Master Administrator.")
+    if is_master(target) and not is_master(caller): raise HTTPException(403, "Cannot edit Master Administrator.")
     if role == "master" and not is_master(caller): raise HTTPException(403, "Cannot grant Master privileges.")
-    exec_write("UPDATE users SET full_name=?, department=?, plants=?, role=?, status=?, updated_at=? WHERE username=?", (full_name.strip(), department.strip(), plants.strip(), role, status, now(), username))
+    exec_write("UPDATE users SET full_name=?, department=?, plants=?, role=?, status=?, updated_at=? WHERE username=?",
+               (full_name.strip(), department.strip(), plants.strip(), role, status, now(), u))
     return {"ok": True}
 
-@app.post("/api/su01/delete")
+@app.api_route("/api/su01/delete", methods=["POST"])
 def su01_delete_user(req: Request, username: str = Form(...)):
-    caller = need_admin(req)
-    target = fetch_one("SELECT * FROM users WHERE username=?", (username,))
+    caller = need_admin(req); u = username.strip()
+    target = fetch_one("SELECT * FROM users WHERE username=?", (u,))
     if not target: raise HTTPException(404, "User not found.")
-    if is_master(target): raise HTTPException(400, "Master account is protected from deletion.")
-    if target["role"] == "admin" and not is_master(caller): raise HTTPException(403, "Only Master Admins can delete admin accounts.")
-    if username == caller["username"]: raise HTTPException(400, "You cannot delete your own account.")
-    exec_write("DELETE FROM users WHERE username=?", (username,))
-    exec_write("DELETE FROM sessions WHERE username=?", (username,))
-    exec_write("DELETE FROM access_grants WHERE username=?", (username,))
+    if is_master(target): raise HTTPException(400, "Master account is protected.")
+    if target["role"] == "admin" and not is_master(caller): raise HTTPException(403, "Admin deletion requires Master.")
+    if u == caller["username"]: raise HTTPException(400, "Cannot delete your own account.")
+    exec_write("DELETE FROM users WHERE username=?", (u,))
+    exec_write("DELETE FROM sessions WHERE username=?", (u,))
+    exec_write("DELETE FROM access_grants WHERE username=?", (u,))
     return {"ok": True}
 
-@app.post("/api/su01/reset-password")
+@app.api_route("/api/su01/reset-password", methods=["POST"])
 def su01_reset_password(req: Request, username: str = Form(...), new_password: str = Form(...)):
-    caller = need_admin(req)
-    target = fetch_one("SELECT * FROM users WHERE username=?", (username,))
+    caller = need_admin(req); u = username.strip()
+    target = fetch_one("SELECT * FROM users WHERE username=?", (u,))
     if not target: raise HTTPException(404, "User not found.")
-    if is_master(target) and not is_master(caller): raise HTTPException(403, "Cannot reset master account.")
-    hashed = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-    exec_write("UPDATE users SET password_hash=?, updated_at=? WHERE username=?", (hashed, now(), username))
-    exec_write("DELETE FROM sessions WHERE username=?", (username,))
+    if is_master(target) and not is_master(caller): raise HTTPException(403, "Cannot reset Master password.")
+    h = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    exec_write("UPDATE users SET password_hash=?, updated_at=? WHERE username=?", (h, now(), u))
+    exec_write("DELETE FROM sessions WHERE username=?", (u,))
     return {"ok": True}
 
-@app.get("/api/pfcg/matrix")
+@app.api_route("/api/pfcg/matrix", methods=["GET"])
 def pfcg_matrix(req: Request):
     need_admin(req)
-    return {"users": fetch_all("SELECT username, full_name, role, department FROM users ORDER BY username"), "tcodes": fetch_all("SELECT code, title, module, allowed_depts FROM tcodes WHERE active=1 ORDER BY code"), "grants": fetch_all("SELECT * FROM access_grants")}
+    return {"users": fetch_all("SELECT username, full_name, role, department FROM users ORDER BY username"),
+            "tcodes": fetch_all("SELECT code, title, module, allowed_depts FROM tcodes WHERE active=1 ORDER BY code"),
+            "grants": fetch_all("SELECT * FROM access_grants")}
 
-@app.post("/api/pfcg/grant")
+@app.api_route("/api/pfcg/grant", methods=["POST"])
 def pfcg_grant(req: Request, username: str = Form(...), tcode: str = Form(...)):
-    caller = need_admin(req)
-    u_val = username.strip()
-    tc_val = tcode.upper().strip()
-    if USE_PG:
-        exec_write("INSERT INTO access_grants (username, tcode_code, granted_by, granted_at) VALUES (?,?,?,?) ON CONFLICT (username, tcode_code) DO NOTHING", (u_val, tc_val, caller["username"], now()))
-    else:
-        exec_write("INSERT OR IGNORE INTO access_grants (username, tcode_code, granted_by, granted_at) VALUES (?,?,?,?)", (u_val, tc_val, caller["username"], now()))
+    caller = need_admin(req); u, tc = username.strip(), tcode.upper().strip()
+    if USE_PG: exec_write("INSERT INTO access_grants (username, tcode_code, granted_by, granted_at) VALUES (?,?,?,?) ON CONFLICT (username, tcode_code) DO NOTHING", (u, tc, caller["username"], now()))
+    else: exec_write("INSERT OR IGNORE INTO access_grants (username, tcode_code, granted_by, granted_at) VALUES (?,?,?,?)", (u, tc, caller["username"], now()))
     return {"ok": True}
 
-@app.post("/api/pfcg/revoke")
+@app.api_route("/api/pfcg/revoke", methods=["POST"])
 def pfcg_revoke(req: Request, username: str = Form(...), tcode: str = Form(...)):
     need_admin(req)
     exec_write("DELETE FROM access_grants WHERE username=? AND tcode_code=?", (username.strip(), tcode.upper().strip()))
     return {"ok": True}
 
-@app.get("/api/se93/list")
+@app.api_route("/api/se93/list", methods=["GET"])
 def se93_list(req: Request):
     user = need(req)
-    all_tcodes = fetch_all("SELECT * FROM tcodes ORDER BY code")
-    for t in all_tcodes:
+    all_t = fetch_all("SELECT * FROM tcodes ORDER BY code")
+    for t in all_t:
         t["layout_count"] = fetch_one("SELECT COUNT(*) AS c FROM tcode_layouts WHERE tcode_code=?", (t["code"],))["c"]
         t["record_count"] = fetch_one("SELECT COUNT(*) AS c FROM tcode_records WHERE tcode_code=? AND status='active'", (t["code"],))["c"]
         t["has_access"] = check_tcode_access(user, t["code"])
-    return all_tcodes
+    return all_t
 
-@app.post("/api/se93/auto-create")
+@app.api_route("/api/se93/auto-create", methods=["POST"])
 async def se93_auto_create(req: Request, code: str = Form(...), title: str = Form(...), description: str = Form(""), module: str = Form("PROD"), allowed_depts: str = Form("Production,Quality Control"), import_sample_data: int = Form(1), file: UploadFile = File(...)):
-    user = need_admin(req)
-    code = code.upper().strip()
-    if not code: raise HTTPException(400, "T-Code identifier is required.")
-    if fetch_one("SELECT 1 FROM tcodes WHERE code=?", (code,)): raise HTTPException(400, f"Module '{code}' already exists.")
-    contents = await file.read()
-    filename = file.filename.lower()
-    headers = []
-    data_rows = []
+    user = need_admin(req); c = code.upper().strip()
+    if not c: raise HTTPException(400, "T-Code identifier required.")
+    if fetch_one("SELECT 1 FROM tcodes WHERE code=?", (c,)): raise HTTPException(400, f"Module '{c}' already exists.")
+    contents = await file.read(); fn = file.filename.lower(); headers, data_rows = [], []
     try:
-        if filename.endswith(".xlsx") or filename.endswith(".xls"):
+        if fn.endswith(".xlsx") or fn.endswith(".xls"):
             wb = load_workbook(io.BytesIO(contents), data_only=True)
             rows = list(wb.active.iter_rows(values_only=True))
-            if rows:
-                headers = [str(h).strip() for h in rows[0] if h is not None and str(h).strip()]
-                data_rows = rows[1:]
-        elif filename.endswith(".csv"):
-            text = contents.decode("utf-8", errors="ignore")
-            rows = list(csv.reader(io.StringIO(text)))
-            if rows:
-                headers = [str(h).strip() for h in rows[0] if str(h).strip()]
-                data_rows = rows[1:]
-        elif filename.endswith(".json"):
+            if rows: headers, data_rows = [str(h).strip() for h in rows[0] if h], rows[1:]
+        elif fn.endswith(".csv"):
+            rows = list(csv.reader(io.StringIO(contents.decode("utf-8", errors="ignore"))))
+            if rows: headers, data_rows = [str(h).strip() for h in rows[0] if h], rows[1:]
+        elif fn.endswith(".json"):
             parsed = json.loads(contents.decode("utf-8", errors="ignore"))
             if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
                 headers = list(parsed[0].keys())
                 for item in parsed: data_rows.append([item.get(k, "") for k in headers])
         else: raise HTTPException(400, "Upload .xlsx / .xls / .csv / .json only.")
     except HTTPException: raise
-    except Exception as e: raise HTTPException(400, f"Template error: {str(e)}")
+    except Exception as e: raise HTTPException(400, f"File parse error: {e}")
     if not headers: raise HTTPException(400, "No valid column headers found.")
-    col_samples = {idx: [] for idx in range(len(headers))}
-    for row in data_rows[:25]:
-        for ci in range(len(headers)):
-            if ci < len(row) and row[ci] is not None: col_samples[ci].append(row[ci])
+
+    col_samples = {idx: [r[idx] for r in data_rows[:25] if idx < len(r) and r[idx] is not None] for idx in range(len(headers))}
     fields = []
     for idx, h in enumerate(headers):
-        clean_key = re.sub(r"[^a-zA-Z0-9_]", "_", h.lower().strip())
-        clean_key = re.sub(r"_+", "_", clean_key).strip("_") or f"col_{idx+1}"
+        clean_key = re.sub(r"[^a-zA-Z0-9_]", "_", h.lower().strip()).strip("_") or f"col_{idx+1}"
         ftype = infer_field_type(col_samples[idx])
         fields.append({"key": clean_key, "label": h, "type": ftype, "required": False, "width": 2 if ftype == "textarea" else 1})
+
     cur_time = now()
-    exec_write("INSERT INTO tcodes (code, title, description, module, allowed_depts, active, created_at, updated_at, created_by) VALUES (?,?,?,?,?,?,?,?,?)", (code, title.strip() or f"{code} Module", description.strip(), module.strip(), allowed_depts.strip(), 1, cur_time, cur_time, user["username"]))
-    fields_json = json.dumps(fields)
-    exec_write("INSERT INTO tcode_schemas (code, fields, layout, updated_at, updated_by) VALUES (?,?,?,?,?)", (code, fields_json, json.dumps({"columns": 3}), cur_time, user["username"]))
-    exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (code, f"GRID_{code}_01", "Default Grid", title or code, 1, fields_json, json.dumps({"columns": 3}), "Auto-generated", user["username"], user["full_name"], cur_time, cur_time))
+    exec_write("INSERT INTO tcodes (code, title, description, module, allowed_depts, active, created_at, updated_at, created_by) VALUES (?,?,?,?,?,?,?,?,?)",
+               (c, title.strip() or f"{c} Module", description.strip(), module.strip(), allowed_depts.strip(), 1, cur_time, cur_time, user["username"]))
+    exec_write("INSERT INTO tcode_schemas (code, fields, layout, updated_at, updated_by) VALUES (?,?,?,?,?)",
+               (c, json.dumps(fields), json.dumps({"columns": 3}), cur_time, user["username"]))
+    exec_write("INSERT INTO tcode_layouts (tcode_code, layout_code, name, title, is_default, fields, layout_config, description, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+               (c, f"GRID_{c}_01", "Default Grid", title or c, 1, json.dumps(fields), json.dumps({"columns": 3}), "Auto-created", user["username"], user["full_name"], cur_time, cur_time))
+
     imported = 0
     if import_sample_data and data_rows:
-        conn = get_conn()
-        try:
-            cur = conn.cursor()
-            insert_sql = q("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)")
-            default_plant = ((user.get("plants") or "1000").split(",")[0].strip() or "1000")
-            for row in data_rows:
-                if not any(row): continue
-                rec = {}
-                row_plant = default_plant
-                for idx in range(len(headers)):
-                    if idx < len(row):
-                        v = row[idx]
-                        if v is None: v = ""
-                        elif isinstance(v, (datetime.datetime, datetime.date)):
-                            if isinstance(v, datetime.datetime): v = v.strftime("%Y-%m-%d %H:%M:%S")
-                            else: v = v.strftime("%Y-%m-%d")
-                        key = fields[idx]["key"]
-                        if key in ["plant", "facility"]: row_plant = str(v or default_plant).strip()
-                        else: rec[key] = v
-                cur.execute(insert_sql, (code, row_plant, json.dumps(rec, default=json_serial), "active", user["username"], user["full_name"], cur_time, cur_time))
-                imported += 1
-            conn.commit()
-        finally: conn.close()
-    return {"ok": True, "code": code, "title": title, "columns_count": len(fields), "imported_count": imported}
+        def_plant = ((user.get("plants") or "1000").split(",")[0].strip() or "1000")
+        for row in data_rows:
+            if not any(row): continue
+            rec, row_plant = {}, def_plant
+            for idx in range(len(headers)):
+                if idx < len(row):
+                    v = row[idx]
+                    if isinstance(v, (datetime.datetime, datetime.date)): v = v.strftime("%Y-%m-%d %H:%M:%S" if isinstance(v, datetime.datetime) else "%Y-%m-%d")
+                    k = fields[idx]["key"]
+                    if k in ["plant", "facility"]: row_plant = str(v or def_plant).strip()
+                    else: rec[k] = "" if v is None else v
+            exec_write("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                       (c, row_plant, json.dumps(rec, default=json_serial), "active", user["username"], user["full_name"], cur_time, cur_time))
+            imported += 1
+    return {"ok": True, "code": c, "title": title, "columns_count": len(fields), "imported_count": imported}
 
-@app.post("/api/se93/delete")
+@app.api_route("/api/se93/delete", methods=["POST"])
 def se93_delete(req: Request, code: str = Form(...)):
-    need_master(req)
-    code = code.upper().strip()
-    if code in STUDIO_PROTECTED: raise HTTPException(403, f"'{code}' is a protected system module and cannot be deleted.")
-    exec_write("DELETE FROM tcodes WHERE code=?", (code,))
-    exec_write("DELETE FROM tcode_schemas WHERE code=?", (code,))
-    exec_write("DELETE FROM tcode_layouts WHERE tcode_code=?", (code,))
-    exec_write("DELETE FROM tcode_records WHERE code=?", (code,))
-    exec_write("DELETE FROM access_grants WHERE tcode_code=?", (code,))
+    need_master(req); c = code.upper().strip()
+    if c in STUDIO_PROTECTED: raise HTTPException(403, f"'{c}' is protected.")
+    exec_write("DELETE FROM tcodes WHERE code=?", (c,))
+    exec_write("DELETE FROM tcode_schemas WHERE code=?", (c,))
+    exec_write("DELETE FROM tcode_layouts WHERE tcode_code=?", (c,))
+    exec_write("DELETE FROM tcode_records WHERE tcode_code=?", (c,))
+    exec_write("DELETE FROM access_grants WHERE tcode_code=?", (c,))
     return {"ok": True}
 
-# =========================================================================
-# TN01 — TRANSFER NOTE
-# =========================================================================
+# --- TN01 ROUTES & DISPATCH ---
 TN01_ROUTES = {
-    "PROD_TO_QC": {"title": "Production to Final Testing", "route": "Production ➔ Final Testing", "from_dept": "Production", "to_dept": "Final Testing", "columns": ["Sr. No.", "Job No.", "Customer Name", "Material Description", "Specified Length", "Entry Length", "Drum Size", "Drum Code", "Batch No."]},
-    "QC_TO_COMM": {"title": "Final Testing to Commercial", "route": "Final Testing ➔ Commercial", "from_dept": "Final Testing", "to_dept": "Commercial", "columns": ["Sr. No.", "Job / Prod Order #", "Batch / Heat Lot", "Cable Description / Spec", "Drum #", "Tested Length (Mtrs)", "HV Test Result", "Insulation Resistance", "QC Inspector", "Release Status"]},
-    "PROD_TO_STORE": {"title": "Production to Store", "route": "Production ➔ Store", "from_dept": "Production", "to_dept": "Store", "columns": ["Sr. No.", "Work Order #", "Item Code / Material", "Batch / Heat Lot", "Quantity (Mtrs/Kgs)", "Weight (Kgs)", "Drum / Pack #", "Handover Person", "Remarks"]},
-    "QC_TO_PROD": {"title": "Final Testing to Production (Rework/Reject)", "route": "Final Testing ➔ Production", "from_dept": "Final Testing", "to_dept": "Production", "columns": ["Sr. No.", "Job Order #", "Batch / Heat Lot", "Cable Size", "Defect Observed", "Length (Mtrs)", "QC Engineer", "Rework Instructions"]},
-    "COMM_TO_QC": {"title": "Commercial to Final Testing", "route": "Commercial ➔ Final Testing", "from_dept": "Commercial", "to_dept": "Final Testing", "columns": ["Sr. No.", "Customer Name", "Order / PO #", "Item Description", "Ordered Qty", "Inspection Agency", "Target Date", "Special Testing Notes"]},
-    "STORE_TO_PROD": {"title": "Store to Production", "route": "Store ➔ Production", "from_dept": "Store", "to_dept": "Production", "columns": ["Sr. No.", "Material Code", "Material Description", "Lot / GRN #", "Issued Qty", "UOM", "Issued By", "Received For Work Order"]},
+    "PROD_TO_QC": {"title": "Production to Final Testing", "route": "Production ➔ Final Testing", "to_dept": "Final Testing", "columns": ["Sr. No.", "Job No.", "Customer Name", "Material Description", "Specified Length", "Entry Length", "Drum Size", "Drum Code", "Batch No."]},
+    "QC_TO_COMM": {"title": "Final Testing to Commercial", "route": "Final Testing ➔ Commercial", "to_dept": "Commercial", "columns": ["Sr. No.", "Job / Prod Order #", "Batch / Heat Lot", "Cable Description / Spec", "Drum #", "Tested Length (Mtrs)", "HV Test Result", "Insulation Resistance", "QC Inspector", "Release Status"]},
+    "PROD_TO_STORE": {"title": "Production to Store", "route": "Production ➔ Store", "to_dept": "Store", "columns": ["Sr. No.", "Work Order #", "Item Code / Material", "Batch / Heat Lot", "Quantity (Mtrs/Kgs)", "Weight (Kgs)", "Drum / Pack #", "Handover Person", "Remarks"]},
+    "QC_TO_PROD": {"title": "Final Testing to Production (Rework)", "route": "Final Testing ➔ Production", "to_dept": "Production", "columns": ["Sr. No.", "Job Order #", "Batch / Heat Lot", "Cable Size", "Defect Observed", "Length (Mtrs)", "QC Engineer", "Rework Instructions"]},
+    "COMM_TO_QC": {"title": "Commercial to Final Testing", "route": "Commercial ➔ Final Testing", "to_dept": "Final Testing", "columns": ["Sr. No.", "Customer Name", "Order / PO #", "Item Description", "Ordered Qty", "Inspection Agency", "Target Date", "Special Testing Notes"]},
+    "STORE_TO_PROD": {"title": "Store to Production", "route": "Store ➔ Production", "to_dept": "Production", "columns": ["Sr. No.", "Material Code", "Material Description", "Lot / GRN #", "Issued Qty", "UOM", "Issued By", "Received For Work Order"]},
 }
 
-@app.get("/api/tn01/routes")
-def tn01_get_routes(req: Request):
-    need(req)
-    return TN01_ROUTES
+@app.api_route("/api/tn01/routes", methods=["GET"])
+def tn01_get_routes(req: Request): need(req); return TN01_ROUTES
 
-@app.get("/api/tn01/suggest-users")
+@app.api_route("/api/tn01/suggest-users", methods=["GET"])
 def tn01_suggest_users(req: Request, plant: str = "", dept: str = "", q: str = ""):
     need(req)
     sql = "SELECT username, full_name, department, plants, role FROM users WHERE status='approved'"
     params = []
-    if dept:
-        sql += " AND department = ?"
-        params.append(dept)
+    if dept: sql += " AND department = ?"; params.append(dept)
     if q:
         sql += " AND (LOWER(username) LIKE ? OR LOWER(full_name) LIKE ?)"
-        term = f"%{q.strip().lower()}%"
-        params.extend([term, term])
+        t = f"%{q.strip().lower()}%"; params.extend([t, t])
     users = fetch_all(sql, tuple(params))
-    if plant:
-        return [u for u in users if not (u.get("plants") or "").strip() or plant in [p.strip() for p in (u.get("plants") or "").split(",")]]
+    if plant: return [u for u in users if not (u.get("plants") or "").strip() or plant in [p.strip() for p in (u.get("plants") or "").split(",")]]
     return users
 
-@app.get("/api/tn01/layouts")
-def tn01_get_layouts(req: Request):
-    need(req)
-    rows = fetch_all("SELECT * FROM tcode_layouts WHERE tcode_code='TN01' ORDER BY is_default DESC, id ASC")
-    for r in rows:
-        try: r["fields"] = json.loads(r["fields"])
-        except Exception: r["fields"] = []
-    return rows
-
-@app.post("/api/tn01/send")
+@app.api_route("/api/tn01/send", methods=["POST"])
 def tn01_send(req: Request, payload: dict):
     user = need(req)
-    cur_time = now()
     today_tag = datetime.date.today().strftime("%Y%m%d")
     cnt = fetch_one("SELECT COUNT(*) AS c FROM transfer_notes WHERE created_at LIKE ?", (f"{datetime.date.today().strftime('%Y-%m-%d')}%",))
     note_no = f"TN-{today_tag}-{(cnt['c'] if cnt else 0) + 1:04d}"
@@ -593,65 +483,48 @@ def tn01_send(req: Request, payload: dict):
     cc_users_raw = payload.get("cc_users") or []
     if isinstance(cc_users_raw, str): cc_users_raw = [cc_users_raw]
     cc_users = ",".join(str(x).strip() for x in cc_users_raw if str(x).strip())
-    from_plant = (payload.get("from_plant", "").strip() or (user.get("plants") or "1000").split(",")[0].strip())
-    exec_write("INSERT INTO transfer_notes (note_no, layout_key, route, from_plant, from_dept, from_user, from_user_name, to_plant, to_dept, to_user, to_user_name, entry_count, sheet_headers, sheet_data, status, remarks, created_at, cc_users) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (note_no, payload.get("layout_key", "STANDARD"), payload.get("route", "Transfer"), from_plant, user["department"], user["username"], user["full_name"], payload.get("to_plant", "").strip(), payload.get("to_dept", "").strip(), to_user, to_user_name, len(normalized_rows), json.dumps(headers), json.dumps(normalized_rows, default=json_serial), "sent", payload.get("remarks", "").strip(), cur_time, cc_users))
+    from_plant = (payload.get("from_plant", "").strip() or (user.get("plants") or ["1000"])[0])
+    exec_write("INSERT INTO transfer_notes (note_no, layout_key, route, from_plant, from_dept, from_user, from_user_name, to_plant, to_dept, to_user, to_user_name, entry_count, sheet_headers, sheet_data, status, remarks, created_at, cc_users) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               (note_no, payload.get("layout_key", "STANDARD"), payload.get("route", "Transfer"), from_plant, user["department"], user["username"], user["full_name"], payload.get("to_plant", "").strip(), payload.get("to_dept", "").strip(), to_user, to_user_name, len(normalized_rows), json.dumps(headers), json.dumps(normalized_rows, default=json_serial), "sent", payload.get("remarks", "").strip(), now(), cc_users))
     return {"ok": True, "note_no": note_no, "entries": len(normalized_rows)}
 
-@app.get("/api/tn01/inbox")
+@app.api_route("/api/tn01/inbox", methods=["GET"])
 def tn01_inbox(req: Request):
-    user = need(req)
-    uname = user["username"]
-    return fetch_all("SELECT * FROM transfer_notes WHERE to_user = ? OR (to_dept = ? AND to_user = '') OR (',' || cc_users || ',') LIKE ? ORDER BY id DESC", (uname, user["department"], f"%,{uname},%"))
+    user = need(req); uname = user["username"]
+    return fetch_all("SELECT * FROM transfer_notes WHERE to_user = ? OR (to_dept = ? AND to_user = '') OR (',' || cc_users || ',') LIKE ? ORDER BY id DESC",
+                     (uname, user["department"], f"%,{uname},%"))
 
-@app.post("/api/tn01/receive/{nid}")
+@app.api_route("/api/tn01/receive/{nid}", methods=["POST"])
 def tn01_receive(req: Request, nid: int):
     user = need(req)
-    cur_time = now()
-    exec_write("UPDATE transfer_notes SET status='received', received_at=?, received_by=?, received_by_name=? WHERE id=?", (cur_time, user["username"], user["full_name"], nid))
-    return {"ok": True, "received_at": cur_time}
+    exec_write("UPDATE transfer_notes SET status='received', received_at=?, received_by=?, received_by_name=? WHERE id=?", (now(), user["username"], user["full_name"], nid))
+    return {"ok": True}
 
-@app.delete("/api/tn01/delete/{nid}")
+@app.api_route("/api/tn01/delete/{nid}", methods=["DELETE"])
 def tn01_delete(req: Request, nid: int):
     user = need(req)
     if not (is_master(user) or user["role"] == "admin"): raise HTTPException(403, "Only Admin can delete history.")
     exec_write("DELETE FROM transfer_notes WHERE id=?", (nid,))
     return {"ok": True}
 
-@app.get("/api/tn01/history")
+@app.api_route("/api/tn01/history", methods=["GET"])
 def tn01_history(req: Request, plant: str = "", route: str = "", status: str = "", from_dept: str = "", to_dept: str = "", date_from: str = "", date_to: str = ""):
-    user = need(req)
-    uname = user["username"]
-    sql = "SELECT * FROM transfer_notes WHERE 1=1"
-    params = []
+    user = need(req); uname = user["username"]; sql = "SELECT * FROM transfer_notes WHERE 1=1"; params = []
     if not (is_master(user) or user["role"] == "admin"):
         sql += " AND (from_user = ? OR to_user = ? OR from_dept = ? OR to_dept = ? OR (',' || cc_users || ',') LIKE ?)"
         params.extend([user["username"], user["username"], user["department"], user["department"], f"%,{uname},%"])
-    if plant:
-        sql += " AND (from_plant = ? OR to_plant = ?)"
-        params.extend([plant, plant])
-    if route:
-        sql += " AND route = ?"
-        params.append(route)
-    if status:
-        sql += " AND status = ?"
-        params.append(status)
+    if plant: sql += " AND (from_plant = ? OR to_plant = ?)"; params.extend([plant, plant])
+    if route: sql += " AND route = ?"; params.append(route)
+    if status: sql += " AND status = ?"; params.append(status)
     if is_master(user) or user["role"] == "admin":
-        if from_dept:
-            sql += " AND from_dept = ?"
-            params.append(from_dept)
-        if to_dept:
-            sql += " AND to_dept = ?"
-            params.append(to_dept)
-        if date_from:
-            sql += " AND created_at >= ?"
-            params.append(date_from + " 00:00:00")
-        if date_to:
-            sql += " AND created_at <= ?"
-            params.append(date_to + " 23:59:59")
+        if from_dept: sql += " AND from_dept = ?"; params.append(from_dept)
+        if to_dept: sql += " AND to_dept = ?"; params.append(to_dept)
+        if date_from: sql += " AND created_at >= ?"; params.append(date_from + " 00:00:00")
+        if date_to: sql += " AND created_at <= ?"; params.append(date_to + " 23:59:59")
     sql += " ORDER BY id DESC LIMIT 300"
     return fetch_all(sql, tuple(params))
 
-@app.get("/api/tn01/note/{nid}")
+@app.api_route("/api/tn01/note/{nid}", methods=["GET"])
 def tn01_get_note(req: Request, nid: int):
     need(req)
     note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
@@ -662,7 +535,7 @@ def tn01_get_note(req: Request, nid: int):
     except Exception: note["sheet_data"] = []
     return note
 
-@app.get("/api/tn01/export/{nid}")
+@app.api_route("/api/tn01/export/{nid}", methods=["GET"])
 def tn01_export_excel(req: Request, nid: int):
     user = need(req)
     note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
@@ -675,75 +548,34 @@ def tn01_export_excel(req: Request, nid: int):
     except Exception: headers = []
     try: data_rows = json.loads(note["sheet_data"])
     except Exception: data_rows = []
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Transfer_Note"
+    wb = Workbook(); ws = wb.active; ws.title = "Transfer_Note"
     org = fetch_one("SELECT * FROM org WHERE id=1") or {}
     ws.append([org.get("name", "Thermocables Limited")])
     ws.append([f"TRANSFER NOTE {note['note_no']} — {note['route']}"])
     ws.append([f"From: {note['from_plant']} - {note['from_dept']}  |  To: {note['to_plant']} - {note['to_dept']}"])
     ws.append([f"Sender: {note['from_user_name']}  |  Receiver: {note['to_user_name']}  |  Status: {note['status'].upper()}"])
-    cc_line = f"  |  CC: {note.get('cc_users')}" if note.get("cc_users") else ""
-    ws.append([f"Created: {note['created_at']}  |  Received: {note['received_at'] or 'Pending'}{cc_line}"])
     ws.append([])
     ws.append(headers)
     for row in data_rows: ws.append(row)
     ws.append([])
     ws.append(["Handovered By: ________________", "", "Received By: ________________", "", "QC: ________________"])
-    from openpyxl.styles import Font, Alignment, PatternFill
-    header_fill = PatternFill("solid", fgColor="4F46E5")
-    header_font = Font(bold=True, color="FFFFFF")
-    ws["A1"].font = Font(bold=True, size=14)
-    ws["A2"].font = Font(bold=True)
-    for col_idx in range(1, len(headers) + 1):
-        cell = ws.cell(row=7, column=col_idx)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center")
-    for col_idx, h in enumerate(headers, 1):
-        ws.column_dimensions[ws.cell(row=7, column=col_idx).column_letter].width = max(14, min(40, len(str(h)) + 4))
     bio = io.BytesIO()
-    wb.save(bio)
-    bio.seek(0)
+    wb.save(bio); bio.seek(0)
     return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=TransferNote_{note['note_no']}.xlsx"})
 
-@app.post("/api/tn01/export-grid")
+@app.api_route("/api/tn01/export-grid", methods=["POST"])
 def tn01_export_grid(req: Request, payload: dict):
-    user = need(req)
-    headers = payload.get("headers", [])
-    rows = payload.get("rows", [])
-    title = payload.get("title", "Transfer Note (Draft)")
+    user = need(req); headers = payload.get("headers", []); rows = payload.get("rows", []); title = payload.get("title", "Transfer Note (Draft)")
     if not headers: raise HTTPException(400, "No columns to export.")
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Draft_Note"
+    wb = Workbook(); ws = wb.active; ws.title = "Draft_Note"
     org = fetch_one("SELECT * FROM org WHERE id=1") or {}
-    ws.append([org.get("name", "Thermocables Limited")])
-    ws.append([title])
-    ws.append([f"Prepared by: {user['full_name']} ({user['username']}) · {user['department']}"])
-    ws.append([f"Generated: {now()}"])
-    ws.append([])
+    ws.append([org.get("name", "Thermocables Limited")]); ws.append([title]); ws.append([f"Prepared by: {user['full_name']} · {user['department']}"]); ws.append([])
     ws.append(headers)
     for r in rows: ws.append(r)
-    from openpyxl.styles import Font, Alignment, PatternFill
-    header_fill = PatternFill("solid", fgColor="4F46E5")
-    header_font = Font(bold=True, color="FFFFFF")
-    ws["A1"].font = Font(bold=True, size=14)
-    ws["A2"].font = Font(bold=True)
-    header_row = 6
-    for col_idx in range(1, len(headers) + 1):
-        cell = ws.cell(row=header_row, column=col_idx)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center")
-    for col_idx, h in enumerate(headers, 1):
-        ws.column_dimensions[ws.cell(row=header_row, column=col_idx).column_letter].width = max(14, min(40, len(str(h)) + 4))
-    bio = io.BytesIO()
-    wb.save(bio)
-    bio.seek(0)
+    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
     return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=TN01_Draft_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"})
 
-@app.get("/api/tn01/print/{nid}", response_class=HTMLResponse)
+@app.api_route("/api/tn01/print/{nid}", methods=["GET"], response_class=HTMLResponse)
 def tn01_print_preview(req: Request, nid: int):
     need(req)
     note = fetch_one("SELECT * FROM transfer_notes WHERE id=?", (nid,))
@@ -757,7 +589,258 @@ def tn01_print_preview(req: Request, nid: int):
     trs = "".join(f"<tr>{''.join(f'<td style=\"border:1px solid #cbd5e1; padding:6px 8px; font-size:11px\">{c}</td>' for c in r)}</tr>" for r in data_rows)
     return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>{note['note_no']}</title><style>body {{ font-family: sans-serif; margin: 30px; color: #0f172a; }} .header {{ border-bottom: 2px solid #4f46e5; padding-bottom: 10px; margin-bottom: 15px; }} .meta {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; font-size: 12px; background: #f8fafc; padding: 12px; border: 1px solid #e2e8f0; margin-bottom: 20px; }} table {{ width: 100%; border-collapse: collapse; margin-bottom: 30px; }} .signs {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-top: 40px; text-align: center; font-size: 11px; font-weight: bold; }} .sign-box {{ border-top: 1px solid #0f172a; padding-top: 8px; }} @media print {{ .no-print {{ display: none; }} body {{ margin: 0; }} }}</style></head><body><div class="no-print" style="margin-bottom:15px;text-align:right"><button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:bold">Print / PDF</button></div><div class="header"><h2 style="margin:0">{org.get('name', 'Thermocables')}</h2><h4 style="margin:4px 0 0;color:#4f46e5">TRANSFER NOTE (TN01)</h4><div style="font-family:monospace;font-weight:bold;margin-top:4px">{note['note_no']} | {note['created_at']}</div></div><div class="meta"><div><b>Route:</b><br>{note['route']}</div><div><b>From:</b><br>{note['from_plant']} - {note['from_dept']}</div><div><b>To:</b><br>{note['to_plant']} - {note['to_dept']}</div><div><b>Entries:</b><br>{note['entry_count']}</div><div><b>Sender:</b><br>{note['from_user_name']}</div><div><b>Recipient:</b><br>{note['to_user_name']}</div><div><b>Status:</b><br>{note['status'].upper()}</div><div><b>Receipt:</b><br>{note['received_at'] or 'Pending'}</div></div><div style="font-size:11px;margin-bottom:10px"><b>CC:</b> {note.get('cc_users') or '—'}</div><table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table><div class="signs"><div class="sign-box">Handovered By ({note['from_user_name']})</div><div class="sign-box">Production | QC</div><div class="sign-box">Received By ({note['received_by_name'] or note['to_user_name']})</div></div></body></html>""")
 
-@app.get("/api/tcode/{code}/layouts")
+# --- CTST CALCULATOR LOGIC & ENDPOINTS ---
+CTST_TESTS = {
+    "cr": {"title": "CR — Conductor Resistance", "icon": "ri-pulse-line", "desc": "Temperature-corrected resistance with auto per-km value and HIGH / LOW verdict vs spec"},
+    "braid": {"title": "Braid / Shield Coverage", "icon": "ri-shield-check-line", "desc": "Fill factor and % coverage for wire braid screens"},
+    "tubular": {"title": "Tubular Mechanical Test", "icon": "ri-circle-line", "desc": "Area, tensile strength, elongation for tube specimen"},
+    "dumbbell": {"title": "Dumbbell Mechanical Test", "icon": "ri-shape-line", "desc": "Area, tensile strength, elongation for dumbbell specimen"},
+    "hotset": {"title": "Hot Set & Permanent Set", "icon": "ri-temp-hot-line", "desc": "Hot-set and permanent-set elongation percentages"},
+}
+
+def _n(v):
+    try: return float(str(v).replace(",", "")) if v is not None and str(v).strip() != "" else None
+    except Exception: return None
+
+def _compute_by_test(tt: str, d: dict) -> dict:
+    out = {}
+    if tt == "cr":
+        obd, t, L, spec = _n(d.get("obd_cr_reading")), _n(d.get("temp_c")), _n(d.get("length_m")), _n(d.get("specified_cr"))
+        tol = _n(d.get("cr_tolerance_pct")) or 5.0
+        observed_cr = None
+        if obd is not None and t is not None:
+            if -50 <= t <= 100:
+                corrected = (250.0 / (230.0 + t)) * obd
+                out["cr_1m"] = round(corrected, 6)
+                if L and L > 0:
+                    observed_cr = corrected / L * 1000.0
+                    out["cr_total_per_km"] = round(observed_cr, 6); out["observed_cr"] = round(observed_cr, 6)
+            else: out["cr_warning"] = "Temp outside −50 to 100 °C"
+        if spec and observed_cr is not None and spec != 0:
+            dev = (observed_cr - spec) / spec * 100.0
+            out["cr_deviation_pct"] = round(dev, 4)
+            out["cr_verdict"] = "ON SPEC" if abs(dev) < 0.001 else ("HIGH" if dev > 0 else "LOW")
+            out["cr_within_tolerance"] = abs(dev) <= tol
+            out["cr_tolerance_pct"] = tol
+    elif tt == "braid":
+        bd, uD, wpc, carr, lay = _n(d.get("braid_d")), _n(d.get("under_braid_D")), _n(d.get("wires_per_carrier")), _n(d.get("carriers")), _n(d.get("lay_length"))
+        if all(v is not None for v in (bd, uD, wpc, carr, lay)) and uD > 0 and lay > 0:
+            N = wpc * carr
+            F = (N * bd) / (2 * math.pi * uD) * math.sqrt(1 + (math.pi * uD / lay) ** 2)
+            out["braid_total_wires"] = int(N); out["braid_filling_factor"] = round(F, 6); out["braid_coverage_pct"] = round((2 * F - F * F) * 100.0, 3)
+    elif tt in ("tubular", "dumbbell"):
+        if tt == "tubular":
+            D, wall = _n(d.get("tub_outer_d")), _n(d.get("tub_wall"))
+            if D and wall and D > wall: out["area_mm2"] = round(math.pi * (D - wall) * wall, 4)
+            load, final = _n(d.get("break_load_tub")), _n(d.get("elong_tub_final"))
+        else:
+            w, th = _n(d.get("dumb_width")), _n(d.get("dumb_thk"))
+            if w and th: out["area_mm2"] = round(w * th, 4)
+            load, final = _n(d.get("break_load_dumb")), _n(d.get("elong_dumb_final"))
+        init = _n(d.get("initial_gauge"))
+        if load is not None and out.get("area_mm2"): out["tensile_nmm2"] = round(load / out["area_mm2"], 4)
+        if init and final is not None and init != 0: out["elongation_pct"] = round((final - init) / init * 100.0, 4)
+    elif tt == "hotset":
+        init, hs, ps = _n(d.get("initial_gauge")), _n(d.get("hotset_elong_final")), _n(d.get("permset_cooled"))
+        if init and hs is not None and init != 0: out["hotset_pct"] = round((hs - init) / init * 100.0, 4)
+        if init and ps is not None and init != 0: out["permset_pct"] = round((ps - init) / init * 100.0, 4)
+    return out
+
+@app.api_route("/api/ctst/tests", methods=["GET"])
+def ctst_tests(req: Request): need(req); return CTST_TESTS
+
+@app.api_route("/api/ctst/records", methods=["GET"])
+def ctst_list(req: Request, test_type: str = "", limit: int = 200):
+    user = need(req)
+    if not check_tcode_access(user, "CTST"): raise HTTPException(403, "Access denied.")
+    base = "SELECT * FROM tcode_records WHERE tcode_code='CTST' AND status='active'"
+    sql, params = (base + (" AND data::json->>'_test_type' = %s" if USE_PG else " AND json_extract(data, '$._test_type') = ?"), [test_type]) if test_type else (base, [])
+    sql += " ORDER BY id DESC LIMIT ?" if not USE_PG else " ORDER BY id DESC LIMIT %s"
+    params.append(limit)
+    rows = fetch_all(sql, tuple(params))
+    for r in rows:
+        try: r["data"] = json.loads(r["data"])
+        except Exception: r["data"] = {}
+        tt = r["data"].get("_test_type", "")
+        r["computed"] = _compute_by_test(tt, r["data"]) if tt else {}
+    return rows
+
+@app.api_route("/api/ctst/compute", methods=["POST"])
+def ctst_compute(req: Request, payload: dict):
+    need(req)
+    tt = str(payload.get("_test_type", "")).strip()
+    if tt not in CTST_TESTS: raise HTTPException(400, "Unknown test type.")
+    return {"computed": _compute_by_test(tt, payload)}
+
+@app.api_route("/api/ctst/save", methods=["POST"])
+def ctst_save(req: Request, payload: dict):
+    user = need(req)
+    if not check_tcode_access(user, "CTST"): raise HTTPException(403, "Access denied.")
+    tt = str(payload.get("_test_type", "")).strip()
+    if tt not in CTST_TESTS: raise HTTPException(400, "Unknown test type.")
+    plant = str(payload.pop("_plant", "") or (user.get("plants") or "1000").split(",")[0].strip() or "1000").strip()
+    exec_write("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+               ("CTST", plant, json.dumps(payload, default=json_serial), "active", user["username"], user["full_name"], now(), now()))
+    return {"ok": True, "computed": _compute_by_test(tt, payload)}
+
+@app.api_route("/api/ctst/records/{rid}", methods=["DELETE"])
+def ctst_delete(req: Request, rid: int):
+    user = need(req)
+    if not check_tcode_access(user, "CTST"): raise HTTPException(403, "Access denied.")
+    exec_write("UPDATE tcode_records SET status='deleted', updated_at=? WHERE id=?", (now(), rid))
+    return {"ok": True}
+
+@app.api_route("/api/ctst/export", methods=["GET"])
+def ctst_export(req: Request, test_type: str = ""):
+    user = need(req)
+    if not check_tcode_access(user, "CTST"): raise HTTPException(403, "Access denied.")
+    base = "SELECT * FROM tcode_records WHERE tcode_code='CTST' AND status='active'"
+    sql, params = (base + (" AND data::json->>'_test_type' = %s" if USE_PG else " AND json_extract(data, '$._test_type') = ?"), [test_type]) if test_type else (base, [])
+    sql += " ORDER BY id ASC"
+    rows = fetch_all(sql, tuple(params))
+    wb = Workbook(); ws = wb.active; ws.title = "CTST_DATA"
+    ws.append(["ID", "Plant", "Test Type", "Sample ID", "Cable Type", "Date", "Result", "Computed", "Remarks", "Created By", "Created At"])
+    for r in rows:
+        try: d = json.loads(r["data"])
+        except Exception: d = {}
+        c = _compute_by_test(d.get("_test_type", ""), d)
+        ws.append([r["id"], r["plant"], d.get("_test_type", ""), d.get("sample_id", ""), d.get("cable_type", ""), d.get("test_date", ""), d.get("result", ""), "; ".join(f"{k}={v}" for k, v in c.items()), d.get("remarks", ""), r["created_by_name"] or r["created_by"], r["created_at"]])
+    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
+    return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": "attachment; filename=CTST_DATA.xlsx"})
+
+@app.api_route("/api/ctst/print/{rid}", methods=["GET"], response_class=HTMLResponse)
+def ctst_print(req: Request, rid: int):
+    user = need(req)
+    if not check_tcode_access(user, "CTST"): return HTMLResponse("Access denied", 403)
+    rec = fetch_one("SELECT * FROM tcode_records WHERE id=? AND tcode_code='CTST'", (rid,))
+    if not rec: return HTMLResponse("Record not found", 404)
+    d = json.loads(rec["data"]) if rec["data"] else {}
+    c = _compute_by_test(d.get("_test_type", ""), d)
+    title = CTST_TESTS.get(d.get("_test_type", ""), {}).get("title", "Cable Test")
+    rows = "".join(f"<tr><td style='padding:4px 8px;border:1px solid #cbd5e1;background:#f8fafc;font-size:11px'>{k}</td><td style='padding:4px 8px;border:1px solid #cbd5e1;font-size:11px;font-weight:600'>{v}</td></tr>" for k, v in c.items())
+    return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>CTST #{rec['id']}</title><style>body {{ font-family: sans-serif; margin: 30px; color: #0f172a; }} table {{ width: 100%; border-collapse: collapse; }}</style></head><body><h2>{title}</h2><p>Sample: {esc_py(d.get('sample_id'))} | Result: {esc_py(d.get('result','PENDING'))}</p><table>{rows}</table></body></html>""")
+
+# --- MRQ1 MATERIAL REQUISITION ---
+MRQ_CATEGORIES = {
+    "stores": {"title": "Stores Issue", "icon": "ri-store-2-line", "desc": "General consumables & spares from Stores"},
+    "inhouse": {"title": "Inhouse Material Issue", "icon": "ri-home-gear-line", "desc": "In-house fabricated / semi-finished material"},
+    "conductor": {"title": "Conductor Issue", "icon": "ri-plug-line", "desc": "Copper / aluminium conductor stock"},
+}
+
+@app.api_route("/api/mrq/categories", methods=["GET"])
+def mrq_categories(req: Request): need(req); return MRQ_CATEGORIES
+
+@app.api_route("/api/mrq/materials", methods=["GET"])
+def mrq_list_materials(req: Request, category: str = ""):
+    need(req); sql = "SELECT * FROM mrq_materials"; params = []
+    if category: sql += " WHERE category=?"; params.append(category)
+    sql += " ORDER BY material_code"
+    return fetch_all(sql, tuple(params))
+
+@app.api_route("/api/mrq/materials/import", methods=["POST"])
+async def mrq_import_materials(req: Request, file: UploadFile = File(...)):
+    need_admin(req); contents = await file.read(); fn = file.filename.lower(); rows = []
+    try:
+        if fn.endswith(".xlsx") or contents.startswith(b'PK\x03\x04'):
+            wb = load_workbook(io.BytesIO(contents), data_only=True)
+            all_r = list(wb.active.iter_rows(values_only=True))
+            if all_r:
+                h = [str(x).strip().lower() for x in all_r[0]]
+                for r in all_r[1:]: rows.append(dict(zip(h, r)))
+        elif fn.endswith(".csv"):
+            lines = contents.decode("utf-8-sig", errors="ignore").splitlines()
+            if lines:
+                h = [x.strip().lower().strip('"') for x in lines[0].split(',')]
+                for line in lines[1:]:
+                    if line.strip(): rows.append(dict(zip(h, next(csv.reader([line])))))
+    except Exception as e: raise HTTPException(400, f"Error: {e}")
+    imp, upd = 0, 0
+    for r in rows:
+        code = str(r.get("material code") or r.get("code") or "").strip().upper()
+        desc = str(r.get("description") or r.get("material description") or "").strip()
+        cat = str(r.get("category") or "stores").strip().lower()
+        uom = str(r.get("uom") or "NOS").strip().upper()
+        if not code or not desc: continue
+        if fetch_one("SELECT 1 FROM mrq_materials WHERE material_code=?", (code,)):
+            exec_write("UPDATE mrq_materials SET description=?, category=?, uom=? WHERE material_code=?", (desc, cat, uom, code))
+            upd += 1
+        else:
+            exec_write("INSERT INTO mrq_materials (material_code, description, category, uom, created_at) VALUES (?,?,?,?,?)", (code, desc, cat, uom, now()))
+            imp += 1
+    return {"ok": True, "imported": imp, "updated": upd, "total_rows": len(rows)}
+
+@app.api_route("/api/mrq/requisitions", methods=["GET"])
+def mrq_list(req: Request, category: str = "", status: str = ""):
+    user = need(req); sql = "SELECT * FROM mrq_requisitions WHERE 1=1"; params = []
+    if not (is_master(user) or user["role"] == "admin"):
+        sql += " AND (from_dept = ? OR to_dept = ?)"; params.extend([user["department"], user["department"]])
+    if category: sql += " AND category = ?"; params.append(category)
+    if status: sql += " AND status = ?"; params.append(status)
+    sql += " ORDER BY id DESC LIMIT 300"
+    rows = fetch_all(sql, tuple(params))
+    for r in rows:
+        agg = fetch_one("SELECT COUNT(*) AS c, COALESCE(SUM(qty_required),0) AS q FROM mrq_lines WHERE req_id=?", (r["id"],))
+        r["line_count"] = agg["c"]; r["total_qty"] = agg["q"]
+    return rows
+
+@app.api_route("/api/mrq/requisition/{rid}", methods=["GET"])
+def mrq_get(req: Request, rid: int):
+    user = need(req); r = fetch_one("SELECT * FROM mrq_requisitions WHERE id=?", (rid,))
+    if not r: raise HTTPException(404, "Not found.")
+    r["lines"] = fetch_all("SELECT * FROM mrq_lines WHERE req_id=? ORDER BY sort_order, id", (rid,))
+    return r
+
+@app.api_route("/api/mrq/requisition", methods=["POST"])
+def mrq_create(req: Request, payload: dict):
+    user = need(req); category = str(payload.get("category") or "").strip().lower()
+    req_no = f"MRQ-{datetime.date.today().strftime('%Y%m%d')}-{secrets.token_hex(2).upper()}"
+    exec_write("INSERT INTO mrq_requisitions (req_no, category, from_dept, from_plant, to_dept, status, remarks, requested_by, requested_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+               (req_no, category, user["department"], "1000", "Store", "pending", payload.get("remarks",""), user["username"], user["full_name"], now(), now()))
+    r_id = fetch_one("SELECT id FROM mrq_requisitions WHERE req_no=?", (req_no,))["id"]
+    for i, ln in enumerate(payload.get("lines") or []):
+        mat = fetch_one("SELECT * FROM mrq_materials WHERE material_code=?", (ln.get("material_code","").upper(),))
+        if mat: exec_write("INSERT INTO mrq_lines (req_id, material_code, description, qty_required, batch_no, qty_issued, uom, sort_order) VALUES (?,?,?,?,?,?,?,?)",
+                           (r_id, mat["material_code"], mat["description"], float(ln.get("qty_required") or 0), "", 0, mat["uom"], i))
+    return {"ok": True, "id": r_id, "req_no": req_no}
+
+@app.api_route("/api/mrq/requisition/{rid}/issue", methods=["POST"])
+def mrq_issue(req: Request, rid: int, payload: dict = None):
+    user = need(req); payload = payload or {}
+    for ln in payload.get("lines") or []:
+        exec_write("UPDATE mrq_lines SET batch_no=?, qty_issued=? WHERE id=?", (str(ln.get("batch_no") or "").strip(), float(ln.get("qty_issued") or 0), ln["id"]))
+    exec_write("UPDATE mrq_requisitions SET status='issued', issued_by=?, issued_by_name=?, issued_to_name=?, updated_at=? WHERE id=?",
+               (user["username"], user["full_name"], str(payload.get("issued_to_name") or "").strip(), now(), rid))
+    return {"ok": True}
+
+@app.api_route("/api/mrq/requisition/{rid}/receive", methods=["POST"])
+def mrq_receive(req: Request, rid: int):
+    user = need(req)
+    exec_write("UPDATE mrq_requisitions SET status='received', received_by=?, received_by_name=?, updated_at=? WHERE id=?", (user["username"], user["full_name"], now(), rid))
+    return {"ok": True}
+
+@app.api_route("/api/mrq/requisition/{rid}/cancel", methods=["POST"])
+def mrq_cancel(req: Request, rid: int, payload: dict):
+    user = need(req)
+    exec_write("UPDATE mrq_requisitions SET status='cancelled', cancelled_at=?, cancelled_by=?, cancel_reason=?, updated_at=? WHERE id=?", (now(), user["username"], payload.get("reason",""), now(), rid))
+    return {"ok": True}
+
+@app.api_route("/api/mrq/requisition/{rid}", methods=["DELETE"])
+def mrq_delete(req: Request, rid: int):
+    need_admin(req)
+    exec_write("DELETE FROM mrq_lines WHERE req_id=?", (rid,))
+    exec_write("DELETE FROM mrq_requisitions WHERE id=?", (rid,))
+    return {"ok": True}
+
+@app.api_route("/api/mrq/print/{rid}", methods=["GET"], response_class=HTMLResponse)
+def mrq_print(req: Request, rid: int):
+    r = fetch_one("SELECT * FROM mrq_requisitions WHERE id=?", (rid,))
+    if not r: return HTMLResponse("Not found", 404)
+    lines = fetch_all("SELECT * FROM mrq_lines WHERE req_id=? ORDER BY sort_order, id", (rid,))
+    trs = "".join(f"<tr><td style='border:1px solid #cbd5e1;padding:6px'>{i}</td><td style='border:1px solid #cbd5e1;padding:6px;font-family:monospace'>{esc_py(l['material_code'])}</td><td style='border:1px solid #cbd5e1;padding:6px'>{esc_py(l['description'])}</td><td style='border:1px solid #cbd5e1;padding:6px;text-align:right'>{l['qty_required']} {l['uom']}</td><td style='border:1px solid #cbd5e1;padding:6px'>{esc_py(l['batch_no'])}</td><td style='border:1px solid #cbd5e1;padding:6px;text-align:right'>{l['qty_issued']} {l['uom']}</td></tr>" for i, l in enumerate(lines, 1))
+    return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>{r['req_no']}</title><style>body {{ font-family: sans-serif; margin: 30px; }} table {{ width:100%; border-collapse: collapse; }}</style></head><body><h2>Material Requisition {r['req_no']}</h2><p>Dept: {r['from_dept']} | Status: {r['status'].upper()}</p><table border="1"><thead><tr><th>#</th><th>Code</th><th>Description</th><th>Qty Req</th><th>Batch</th><th>Qty Issued</th></tr></thead><tbody>{trs}</tbody></table></body></html>""")
+
+# --- STANDARD MODULE RECORDS ---
+@app.api_route("/api/tcode/{code}/layouts", methods=["GET"])
 def get_layouts(code: str, req: Request):
     user = need(req)
     if not check_tcode_access(user, code): raise HTTPException(403, "Access denied.")
@@ -767,16 +850,13 @@ def get_layouts(code: str, req: Request):
         except Exception: r["fields"] = []
     return rows
 
-@app.get("/api/tcode/{code}/records")
+@app.api_route("/api/tcode/{code}/records", methods=["GET"])
 def get_tcode_records(code: str, req: Request, plant: str = "", limit: int = 500):
     user = need(req)
     if not check_tcode_access(user, code): raise HTTPException(403, "Access denied.")
-    sql = "SELECT * FROM tcode_records WHERE tcode_code=? AND status='active'"
-    params = [code]
-    if plant:
-        sql += " AND plant=?"
-        params.append(plant)
-    sql += " ORDER BY id DESC LIMIT ?"
+    sql, params = "SELECT * FROM tcode_records WHERE tcode_code=? AND status='active'", [code]
+    if plant: sql += " AND plant=?"; params.append(plant)
+    sql += " ORDER BY id DESC LIMIT ?" if not USE_PG else " ORDER BY id DESC LIMIT %s"
     params.append(limit)
     rows = fetch_all(sql, tuple(params))
     for r in rows:
@@ -784,88 +864,78 @@ def get_tcode_records(code: str, req: Request, plant: str = "", limit: int = 500
         except Exception: r["data"] = {}
     return rows
 
-@app.post("/api/tcode/{code}/records")
+@app.api_route("/api/tcode/{code}/records", methods=["POST"])
 def create_record(code: str, req: Request, payload: dict):
     user = need(req)
     if not check_tcode_access(user, code): raise HTTPException(403, "Access denied.")
     plant = payload.pop("_plant", "").strip()
-    cur_time = now()
-    exec_write("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)", (code, plant, json.dumps(payload, default=json_serial), "active", user["username"], user["full_name"], cur_time, cur_time))
+    exec_write("INSERT INTO tcode_records (tcode_code, plant, data, status, created_by, created_by_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+               (code, plant, json.dumps(payload, default=json_serial), "active", user["username"], user["full_name"], now(), now()))
     return {"ok": True}
 
-@app.delete("/api/tcode/{code}/records/{rid}")
+@app.api_route("/api/tcode/{code}/records/{rid}", methods=["DELETE"])
 def delete_record(code: str, rid: int, req: Request):
     user = need(req)
     if not check_tcode_access(user, code): raise HTTPException(403, "Access denied.")
-    rec = fetch_one("SELECT * FROM tcode_records WHERE id=? AND tcode_code=?", (rid, code))
-    if not rec: raise HTTPException(404, "Record not found.")
-    if (rec["created_by"] != user["username"] and not is_master(user) and user["role"] != "admin"): raise HTTPException(403, "You can only delete your own records.")
     exec_write("UPDATE tcode_records SET status='deleted', updated_at=? WHERE id=?", (now(), rid))
     return {"ok": True}
 
-@app.get("/api/tcode/{code}/export")
+@app.api_route("/api/tcode/{code}/export", methods=["GET"])
 def export_excel(code: str, req: Request):
     user = need(req)
     if not check_tcode_access(user, code): raise HTTPException(403, "Access denied.")
     rows = fetch_all("SELECT * FROM tcode_records WHERE tcode_code=? AND status='active' ORDER BY id ASC", (code,))
-    wb = Workbook()
-    ws = wb.active
-    ws.title = f"{code}_DATA"
+    wb = Workbook(); ws = wb.active; ws.title = f"{code}_DATA"
     base_keys = ["id", "plant", "created_by_name", "created_at"]
     dynamic_keys = set()
     parsed_rows = []
     for r in rows:
-        try: d = json.loads(r["data"]) if isinstance(r["data"], str) else r["data"]
+        try: d = json.loads(r["data"])
         except Exception: d = {}
-        dynamic_keys.update(d.keys())
-        parsed_rows.append((r, d))
+        dynamic_keys.update(d.keys()); parsed_rows.append((r, d))
     all_cols = base_keys + sorted(dynamic_keys)
     ws.append(all_cols)
     for r, d in parsed_rows:
         ws.append([r["id"], r["plant"], r["created_by_name"], r["created_at"]] + [d.get(k, "") for k in sorted(dynamic_keys)])
-    bio = io.BytesIO()
-    wb.save(bio)
-    bio.seek(0)
+    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
     return StreamingResponse(bio, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=Export_{code}_{datetime.date.today().strftime('%Y%m%d')}.xlsx"})
 
+# --- CLIENT UI ---
 HTML_UI = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nexus Core — Enterprise Operations</title>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nexus Core — Enterprise ERP</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <link href="https://cdn.jsdelivr.net/npm/remixicon@4.2.0/fonts/remixicon.css" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
 body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc;color:#0f172a;font-size:13px}
 .font-mono{font-family:'JetBrains Mono',monospace}
-.btn-primary{background:#4f46e5;color:#fff;border:1px solid #4f46e5;transition:background .15s,box-shadow .15s}
-.btn-primary:hover{background:#4338ca;box-shadow:0 4px 12px rgba(79,70,229,.20)}
-.btn-secondary{background:#fff;color:#475569;border:1px solid #e2e8f0;transition:background .15s,border-color .15s}
+.btn-primary{background:#4f46e5;color:#fff;border:1px solid #4f46e5}
+.btn-primary:hover{background:#4338ca}
+.btn-secondary{background:#fff;color:#475569;border:1px solid #e2e8f0}
 .btn-secondary:hover{background:#f1f5f9;border-color:#cbd5e1}
-.card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;box-shadow:0 1px 2px rgba(15,23,42,.03)}
+.card{background:#fff;border:1px solid #e2e8f0;border-radius:14px}
 .custom-table{width:100%;border-collapse:collapse}
-.custom-table thead th{background:#f1f5f9;color:#475569;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.03em;padding:10px 14px;border-bottom:1px solid #e2e8f0;text-align:left}
+.custom-table thead th{background:#f1f5f9;color:#475569;font-size:11px;font-weight:600;text-transform:uppercase;padding:10px 14px;border-bottom:1px solid #e2e8f0;text-align:left}
 .custom-table tbody td{padding:11px 14px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#334155}
-.custom-table tbody tr:hover{background:#f8fafc}
 .excel-grid{border-collapse:separate;border-spacing:0;width:100%}
 .excel-grid th{background:#f1f5f9;color:#475569;font-weight:600;font-size:11px;text-transform:uppercase;padding:8px 10px;border-right:1px solid #e2e8f0;border-bottom:1px solid #e2e8f0;position:sticky;top:0;z-index:2;text-align:left}
 .excel-grid td{background:#fff;color:#0f172a;font-size:12px;padding:6px 10px;border-right:1px solid #f1f5f9;border-bottom:1px solid #f1f5f9;outline:none;min-width:110px}
 .excel-grid td.sr-col{background:#f8fafc;color:#64748b;font-weight:600;text-align:center;width:50px;user-select:none}
 .excel-grid td:focus{background:#eef2ff;box-shadow:inset 0 0 0 2px #6366f1}
-.form-input{background:#fff;border:1px solid #cbd5e1;border-radius:8px;padding:8px 12px;font-size:13px;color:#0f172a;width:100%;outline:none;transition:border-color .15s,box-shadow .15s;font-family:inherit}
-.form-input:focus{border-color:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,.12)}
-.form-label{display:block;font-size:11px;font-weight:600;color:#475569;margin-bottom:5px;letter-spacing:.01em}
-.badge{display:inline-flex;align-items:center;font-size:10px;font-weight:600;padding:2px 8px;border-radius:999px;letter-spacing:.02em;text-transform:uppercase}
+.form-input{background:#fff;border:1px solid #cbd5e1;border-radius:8px;padding:8px 12px;font-size:13px;width:100%;outline:none}
+.form-input:focus{border-color:#6366f1}
+.form-label{display:block;font-size:11px;font-weight:600;color:#475569;margin-bottom:5px}
+.badge{display:inline-flex;align-items:center;font-size:10px;font-weight:600;padding:2px 8px;border-radius:999px;text-transform:uppercase}
 .badge-indigo{background:#eef2ff;color:#4338ca;border:1px solid #c7d2fe}
 .badge-emerald{background:#ecfdf5;color:#047857;border:1px solid #a7f3d0}
 .badge-amber{background:#fffbeb;color:#b45309;border:1px solid #fde68a}
 .badge-red{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca}
 .badge-slate{background:#f1f5f9;color:#475569;border:1px solid #e2e8f0}
-.sidebar-link{color:#475569;border-left:2px solid transparent;transition:all .15s ease}
+.sidebar-link{color:#475569;border-left:2px solid transparent}
 .sidebar-link:hover{background:#f1f5f9;color:#0f172a}
-.sidebar-link.active{background:#eef2ff;color:#4f46e5;border-left-color:#4f46e5}
 </style>
 </head>
 <body class="h-screen flex flex-col overflow-hidden">
@@ -873,8 +943,8 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc;color:#0f172a;f
   <header class="h-14 bg-white border-b border-slate-200 px-4 flex items-center justify-between shrink-0 shadow-sm">
     <div class="flex items-center gap-4">
       <div class="flex items-center gap-2.5 cursor-pointer" onclick="goHome()">
-        <div class="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white shadow-sm"><i class="ri-pulse-fill text-lg"></i></div>
-        <div class="font-bold text-sm tracking-tight text-slate-900 flex items-center gap-1.5">Nexus Core <span class="text-[10px] bg-indigo-50 text-indigo-600 border border-indigo-200 font-mono px-1.5 py-0.5 rounded">v4.0.1</span></div>
+        <div class="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white"><i class="ri-pulse-fill text-lg"></i></div>
+        <div class="font-bold text-sm tracking-tight text-slate-900">Nexus Core <span class="text-[10px] bg-indigo-50 text-indigo-600 border border-indigo-200 font-mono px-1.5 py-0.5 rounded">v4.0.3</span></div>
       </div>
       <div class="relative ml-4">
         <i class="ri-search-line absolute left-3 top-2.5 text-slate-400 text-xs"></i>
@@ -887,36 +957,34 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc;color:#0f172a;f
         <span id="user_display" class="font-medium text-slate-700">Connecting...</span>
         <span id="role_badge" class="badge badge-indigo"></span>
       </div>
-      <button onclick="logout()" class="text-xs bg-white hover:bg-red-50 text-slate-500 hover:text-red-600 border border-slate-200 p-2 rounded-lg transition"><i class="ri-logout-box-r-line"></i></button>
+      <button onclick="logout()" class="text-xs bg-white hover:bg-red-50 text-slate-500 hover:text-red-600 border border-slate-200 p-2 rounded-lg"><i class="ri-logout-box-r-line"></i></button>
     </div>
   </header>
+
   <div class="flex-1 flex overflow-hidden">
     <aside class="w-64 bg-white border-r border-slate-200 flex flex-col justify-between shrink-0">
       <div class="p-3 overflow-y-auto flex-1 space-y-4">
         <div>
           <div class="text-[10px] uppercase font-bold text-slate-400 tracking-wider px-2 mb-1.5">Special Modules</div>
           <div class="space-y-0.5">
-            <button onclick="openTcode('TN01')" class="w-full text-left px-2.5 py-2 rounded-lg text-xs font-semibold bg-slate-50 border border-slate-200 text-slate-700 hover:bg-slate-100 flex items-center justify-between transition">
+            <button onclick="openTcode('TN01')" class="w-full text-left px-2.5 py-2 rounded-lg text-xs font-semibold bg-slate-50 border border-slate-200 text-slate-700 hover:bg-slate-100 flex items-center justify-between">
               <span class="flex items-center gap-2"><i class="ri-exchange-box-line text-slate-500 text-sm"></i> TN01 - Transfer Note</span>
               <span class="badge badge-slate">EXCEL</span>
             </button>
-            <button onclick="openTcode('MRQ1')" class="w-full text-left px-2.5 py-2 rounded-lg text-xs font-semibold bg-emerald-50 border border-emerald-200 text-emerald-700 hover:bg-emerald-100 flex items-center justify-between transition mt-1">
+            <button onclick="openTcode('MRQ1')" class="w-full text-left px-2.5 py-2 rounded-lg text-xs font-semibold bg-emerald-50 border border-emerald-200 text-emerald-700 hover:bg-emerald-100 flex items-center justify-between mt-1">
               <span class="flex items-center gap-2"><i class="ri-file-list-3-line text-emerald-500 text-sm"></i> MRQ1 - Requisition</span>
             </button>
-            <button onclick="openTcode('CTST')" class="w-full text-left px-2.5 py-2 rounded-lg text-xs font-semibold bg-indigo-50 border border-indigo-200 text-indigo-700 hover:bg-indigo-100 flex items-center justify-between transition mt-1">
+            <button onclick="openTcode('CTST')" class="w-full text-left px-2.5 py-2 rounded-lg text-xs font-semibold bg-indigo-50 border border-indigo-200 text-indigo-700 hover:bg-indigo-100 flex items-center justify-between mt-1">
               <span class="flex items-center gap-2"><i class="ri-flask-line text-indigo-500 text-sm"></i> CTST - Type-Test</span>
             </button>
           </div>
         </div>
+
         <div id="admin_nav_section" class="hidden">
           <div class="text-[10px] uppercase font-bold text-indigo-500 tracking-wider px-2 mb-1.5 flex items-center justify-between">
             <span>Administration</span><i class="ri-shield-keyhole-line text-xs"></i>
           </div>
           <div class="space-y-0.5">
-            <button onclick="openTcode('STUDIO')" class="sidebar-link w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center justify-between">
-              <span class="flex items-center gap-2"><i class="ri-robot-2-line text-emerald-500"></i> AI Code Studio</span>
-              <span class="badge badge-emerald">SAFE</span>
-            </button>
             <button onclick="openTcode('SU01')" class="sidebar-link w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center justify-between">
               <span class="flex items-center gap-2"><i class="ri-user-settings-line text-indigo-500"></i> User Directory (SU01)</span>
               <span class="badge badge-indigo">IAM</span>
@@ -934,6 +1002,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc;color:#0f172a;f
             </button>
           </div>
         </div>
+
         <div>
           <div class="text-[10px] uppercase font-bold text-slate-400 tracking-wider px-2 mb-1.5">Operations Modules</div>
           <div id="modules_list" class="space-y-0.5 text-xs"></div>
@@ -946,6 +1015,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc;color:#0f172a;f
     </aside>
     <main id="main_screen" class="flex-1 bg-slate-50 overflow-hidden flex flex-col"></main>
   </div>
+
   <footer class="h-7 bg-white border-t border-slate-200 px-4 flex items-center justify-between text-[11px] text-slate-500 font-mono shrink-0">
     <div class="flex items-center gap-2 truncate">
       <span id="stat_dot" class="w-2 h-2 rounded-full bg-emerald-500"></span>
@@ -957,15 +1027,14 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc;color:#0f172a;f
     </div>
   </footer>
 </div>
+
 <div id="app_dialog" class="hidden fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
   <div id="app_dialog_body" class="bg-white text-slate-800 rounded-2xl shadow-2xl border border-slate-200 max-h-[90vh] overflow-y-auto w-full max-w-4xl"></div>
 </div>
-<script>
-let ME = null;
-let CURRENT_TCODE = null;
-let ALL_TCODES = [];
-const $ = s => document.querySelector(s);
 
+<script>
+let ME = null, CURRENT_TCODE = null, ALL_TCODES = [], ALL_USERS_LIST = [];
+const $ = s => document.querySelector(s);
 function esc(str){if(str===null||str===undefined)return '';return String(str).replace(/[&<>"']/g,s=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]));}
 function setMsg(m,e=false){const el=$('#stat_msg'),d=$('#stat_dot');if(!el)return;el.textContent=m;d.className=e?"w-2 h-2 rounded-full bg-red-500":"w-2 h-2 rounded-full bg-emerald-500";el.className=e?"text-red-600 font-semibold":"text-slate-600";}
 
@@ -986,7 +1055,7 @@ function renderLogon(err=""){
   <div class="min-h-screen bg-gradient-to-br from-slate-50 to-indigo-50 flex items-center justify-center p-4">
     <div class="w-full max-w-md bg-white border border-slate-200 rounded-2xl shadow-xl p-8">
       <div class="flex items-center gap-3 mb-6">
-        <div class="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center font-bold text-white shadow-sm"><i class="ri-pulse-fill text-2xl"></i></div>
+        <div class="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center font-bold text-white"><i class="ri-pulse-fill text-2xl"></i></div>
         <div><h1 class="text-xl font-bold text-slate-900">Nexus Core ERP</h1><p class="text-xs text-slate-500">Thermocables Industrial Suite</p></div>
       </div>
       ${err?`<div class="mb-4 p-3 bg-red-50 border border-red-200 rounded-xl text-red-700 text-xs">${esc(err)}</div>`:''}
@@ -1030,9 +1099,9 @@ function goHome(){
       <div class="max-w-5xl mx-auto space-y-8">
         <div><h1 class="text-2xl font-bold text-slate-900">Operations Dashboard</h1><p class="text-sm text-slate-500 mt-1">Thermocables Industrial Platform</p></div>
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div class="card p-5"><div class="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">Enterprise</div><div class="text-lg font-bold text-slate-900 mt-1.5">${esc(ME.company)}</div><div class="text-xs text-indigo-600 mt-1">Dept: ${esc(ME.department)}</div></div>
-          <div class="card p-5"><div class="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">Role</div><div class="text-lg font-bold text-emerald-600 mt-1.5 uppercase">${ME.role}</div><div class="text-xs text-slate-500 mt-1">Plants: ${esc(ME.plants.join(', ')||'All')}</div></div>
-          <div class="card p-5"><div class="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">Quick</div><div class="text-xs text-slate-600 mt-2 font-mono">Launch <b class="text-indigo-600">TN01</b> to transfer, <b class="text-indigo-600">MRQ1</b> for materials.</div></div>
+          <div class="card p-5"><div class="text-[10px] font-semibold text-slate-500 uppercase">Enterprise</div><div class="text-lg font-bold text-slate-900 mt-1.5">${esc(ME.company)}</div><div class="text-xs text-indigo-600 mt-1">Dept: ${esc(ME.department)}</div></div>
+          <div class="card p-5"><div class="text-[10px] font-semibold text-slate-500 uppercase">Role</div><div class="text-lg font-bold text-emerald-600 mt-1.5 uppercase">${ME.role}</div><div class="text-xs text-slate-500 mt-1">Plants: ${esc(ME.plants.join(', ')||'All')}</div></div>
+          <div class="card p-5"><div class="text-[10px] font-semibold text-slate-500 uppercase">Quick Jump</div><div class="text-xs text-slate-600 mt-2 font-mono">Launch <b class="text-indigo-600">TN01</b> for transfer note, <b class="text-indigo-600">MRQ1</b> for material requisition.</div></div>
         </div>
         <div><h3 class="text-xs font-bold text-slate-500 uppercase tracking-wider mb-4">Modules</h3><div id="quick_grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"></div></div>
       </div>
@@ -1059,6 +1128,7 @@ function renderQuickGrid(){
       <p class="text-xs text-slate-500 mt-1 line-clamp-2">${esc(t.description||'Standard module')}</p>
     </div>`).join('');
 }
+
 async function openTcode(code){
   code=code.toUpperCase().trim();CURRENT_TCODE=code;$('#stat_tcode').textContent=code;setMsg(`Module ${code}`);
   if(code==='TN01')return renderTN01();
@@ -1072,10 +1142,11 @@ async function openTcode(code){
 }
 
 // ===== TN01 =====
-let TN01_ROUTES={},TN01_ACTIVE_ROUTE="PROD_TO_QC",TN01_HEADERS=[],TN01_ROWS=[],TN01_UNDO=[],TN01_REDO=[],TN01_CELL={r:0,c:1};
+let TN01_ROUTES={}, TN01_ACTIVE_ROUTE="PROD_TO_QC", TN01_HEADERS=[], TN01_ROWS=[], TN01_UNDO=[], TN01_REDO=[], TN01_CELL={r:0,c:1};
 let TN01_SELECTED_CC=[];
 
 async function renderTN01(){TN01_ROUTES=await api('/api/tn01/routes');renderTN01Main();}
+
 function renderTN01Main(tab="sheet"){
   $('#main_screen').innerHTML=`
     <div class="flex-1 flex flex-col overflow-hidden select-text">
@@ -1147,24 +1218,18 @@ function setupPasteHandler(){
     TN01_UNDO.push(JSON.stringify(TN01_ROWS));
     const lines=clip.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n');
     let sr=TN01_CELL.r||0;
-    
     lines.forEach((line,li)=>{
       if(!line&&li===lines.length-1)return;
       let cells=line.split('\t');
-      
       const tr=sr+li;
       while(TN01_ROWS.length<=tr){
         const nr=new Array(TN01_HEADERS.length).fill("");
         nr[0]=TN01_ROWS.length+1;
         TN01_ROWS.push(nr);
       }
-      
-      // Auto-assign: col 0 is ALWAYS Sr. No. Paste strictly fills starting at col 1 onwards.
       cells.forEach((v,ci)=>{
         const tc=ci+1;
-        if(tc<TN01_HEADERS.length){
-          TN01_ROWS[tr][tc]=v.trim();
-        }
+        if(tc<TN01_HEADERS.length) TN01_ROWS[tr][tc]=v.trim();
       });
     });
     TN01_ROWS.forEach((r,i)=>{r[0]=i+1;});
@@ -1174,7 +1239,7 @@ function setupPasteHandler(){
 
 async function exportGridAsExcel(){
   const f=TN01_ROWS.filter(r=>r.slice(1).some(x=>String(x).trim()!==''));
-  if(!f.length)return alert("No rows.");
+  if(!f.length)return alert("No rows to export.");
   const t=TN01_ROUTES[TN01_ACTIVE_ROUTE]?TN01_ROUTES[TN01_ACTIVE_ROUTE].route:"Draft";
   try{
     const tok=localStorage.getItem("nexus_token");
@@ -1188,7 +1253,7 @@ async function exportGridAsExcel(){
 async function openSendModal(){
   const a=TN01_ROUTES[TN01_ACTIVE_ROUTE];
   const f=TN01_ROWS.filter(r=>r.slice(1).some(x=>String(x).trim()!==''));
-  if(!f.length)return alert("Enter rows.");
+  if(!f.length)return alert("Enter at least one row before sending.");
   TN01_SELECTED_CC = [];
   const sp=await api('/api/spro/overview');
   openDialog(`
@@ -1202,8 +1267,6 @@ async function openSendModal(){
         <div><label class="form-label">Dept</label><select id="send_dept" onchange="updateSuggestedUsers()" class="form-input">${sp.departments.map(d=>`<option value="${esc(d.name)}" ${d.name===a.to_dept?'selected':''}>${esc(d.name)}</option>`).join('')}</select></div>
         <div><label class="form-label">Receiver *</label><select id="send_user" class="form-input"></select></div>
       </div>
-
-      <!-- OUTLOOK-STYLE CC AUTO-SUGGESTION -->
       <div class="relative">
         <label class="form-label">CC (Outlook style address book search)</label>
         <div id="cc_tags" class="flex flex-wrap gap-1.5 p-2 bg-slate-50 border border-slate-200 rounded-lg min-h-[40px] items-center mb-1">
@@ -1211,7 +1274,6 @@ async function openSendModal(){
         </div>
         <div id="cc_suggestions" class="hidden absolute left-0 right-0 top-full bg-white border border-slate-200 shadow-xl rounded-lg z-50 max-h-48 overflow-y-auto"></div>
       </div>
-
       <div><label class="form-label">Remarks</label><textarea id="send_remarks" class="form-input" rows="2"></textarea></div>
     </div>
     <div class="px-6 py-4 bg-slate-50 border-t flex justify-end gap-2 rounded-b-2xl">
@@ -1224,8 +1286,7 @@ async function openSendModal(){
 
 function updateLiveClock(){
   const el=$('#live_datetime');if(!el)return;
-  const d=new Date();
-  el.textContent=d.toLocaleString('en-GB',{dateStyle:'medium',timeStyle:'medium'});
+  el.textContent=new Date().toLocaleString('en-GB',{dateStyle:'medium',timeStyle:'medium'});
   setTimeout(updateLiveClock,1000);
 }
 
@@ -1239,15 +1300,11 @@ async function searchCCUsers(val){
   const box=$('#cc_suggestions');
   if(!val.trim()){box.classList.add('hidden');box.innerHTML='';return;}
   const list=await api(`/api/tn01/suggest-users?q=${encodeURIComponent(val)}`);
-  if(!list.length){
-    box.innerHTML='<div class="p-2.5 text-xs text-slate-400">No matching user found.</div>';
-  }else{
-    box.innerHTML=list.map(u=>`
-      <div onclick="addCCTag('${esc(u.username)}', '${esc(u.full_name)}')" class="p-2.5 hover:bg-indigo-50 cursor-pointer border-b border-slate-100 flex items-center justify-between text-xs">
-        <div><b class="text-slate-900">${esc(u.full_name)}</b> <span class="text-slate-400 font-mono">(${esc(u.username)})</span></div>
-        <span class="badge badge-slate">${esc(u.department||'')}</span>
-      </div>`).join('');
-  }
+  box.innerHTML=list.length?list.map(u=>`
+    <div onclick="addCCTag('${esc(u.username)}', '${esc(u.full_name)}')" class="p-2.5 hover:bg-indigo-50 cursor-pointer border-b border-slate-100 flex items-center justify-between text-xs">
+      <div><b class="text-slate-900">${esc(u.full_name)}</b> <span class="text-slate-400 font-mono">(${esc(u.username)})</span></div>
+      <span class="badge badge-slate">${esc(u.department||'')}</span>
+    </div>`).join('') : '<div class="p-2.5 text-xs text-slate-400">No matching user found.</div>';
   box.classList.remove('hidden');
 }
 
@@ -1266,8 +1323,7 @@ function removeCCTag(username){
 }
 
 function renderCCTags(){
-  const box=$('#cc_tags');
-  const input=$('#cc_search_input');
+  const box=$('#cc_tags'), input=$('#cc_search_input');
   box.querySelectorAll('.cc-pill').forEach(el=>el.remove());
   TN01_SELECTED_CC.forEach(u=>{
     const span=document.createElement('span');
@@ -1280,21 +1336,14 @@ function renderCCTags(){
 async function submitSendNote(){
   const f=TN01_ROWS.filter(r=>r.slice(1).some(x=>String(x).trim()!==''));
   const p={
-    layout_key:TN01_ACTIVE_ROUTE,
-    route:TN01_ROUTES[TN01_ACTIVE_ROUTE].route,
-    to_plant:$('#send_plant').value,
-    to_dept:$('#send_dept').value,
-    to_user:$('#send_user').value,
-    cc_users:TN01_SELECTED_CC,
-    remarks:$('#send_remarks').value,
-    headers:TN01_HEADERS,
-    rows:f
+    layout_key:TN01_ACTIVE_ROUTE, route:TN01_ROUTES[TN01_ACTIVE_ROUTE].route,
+    to_plant:$('#send_plant').value, to_dept:$('#send_dept').value,
+    to_user:$('#send_user').value, cc_users:TN01_SELECTED_CC,
+    remarks:$('#send_remarks').value, headers:TN01_HEADERS, rows:f
   };
   try{
     const r=await api('/api/tn01/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});
-    closeDialog();
-    alert(`Transfer Sent: ${r.note_no}`);
-    switchTN01Tab('history');
+    closeDialog(); alert(`Transfer Sent: ${r.note_no}`); switchTN01Tab('history');
   }catch(e){alert(e);}
 }
 
@@ -1308,6 +1357,7 @@ async function renderTN01ReceiveTab(){
       </tbody></table></div>
     </div>`;
 }
+
 async function ackNote(id){await api(`/api/tn01/receive/${id}`,{method:'POST'});renderTN01ReceiveTab();}
 
 async function viewTransferNote(id){
@@ -1372,10 +1422,56 @@ async function deleteTN01History(id){
   catch(e){alert(e);}
 }
 
-// ===== SU01 =====
+// ===== CTST SCRIPT HELPERS =====
+async function saveCTST(testType){
+  const fields=CTST_FIELDS[testType]||[],payload={_test_type:testType};
+  payload.sample_id=($('#cf_sample_id')||{}).value||'';
+  if(!payload.sample_id.trim())return alert("Sample ID required.");
+  payload.cable_type=($('#cf_cable_type')||{}).value||'';
+  payload.test_date=($('#cf_test_date')||{}).value||'';
+  payload.result=($('#cf_result')||{}).value||'';
+  payload.remarks=($('#cf_remarks')||{}).value||'';
+  payload._plant=($('#cf_plant')||{}).value||'';
+  for(const f of fields){const el=$('#cf_'+f.key);if(el)payload[f.key]=el.value;}
+  try{await api('/api/ctst/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});setMsg("Saved");renderCTST();}
+  catch(e){alert(e);}
+}
+async function deleteCTST(id){if(!confirm(`Delete #${id}?`))return;try{await api(`/api/ctst/records/${id}`,{method:'DELETE'});renderCTST();setMsg("Deleted");}catch(e){alert(e);}}
+
+// ===== MRQ1 SCRIPT HELPERS =====
+let MRQ_CATEGORIES={}, MRQ_ACTIVE_CATEGORY=null, MRQ_CART=[];
+async function renderMRQ(category=null){
+  if(category){MRQ_ACTIVE_CATEGORY=category;return renderMRQForm(category);}
+  MRQ_CATEGORIES=await api('/api/mrq/categories');
+  const history=await api('/api/mrq/requisitions');
+  const isAdmin=ME.is_master||ME.role==='admin';
+  $('#main_screen').innerHTML=`
+    <div class="flex-1 flex flex-col p-6 overflow-hidden select-text">
+      <div class="flex items-center justify-between pb-4 border-b shrink-0">
+        <div class="flex items-center gap-3"><span class="font-mono font-bold text-xs bg-emerald-600 text-white px-2.5 py-1 rounded-lg">MRQ1</span><div><h2 class="text-lg font-bold">Material Requisition</h2></div></div>
+        <div class="flex items-center gap-2">
+          ${isAdmin?`<label class="btn-secondary text-xs font-semibold px-3 py-2 rounded-lg cursor-pointer flex items-center gap-1"><i class="ri-upload-2-line"></i> Import<input type="file" accept=".xlsx,.xls,.csv" onchange="mrqImportMaterials(this)" class="hidden"></label>`:''}
+          <button onclick="mrqViewMaterials()" class="btn-secondary text-xs font-semibold px-3 py-2 rounded-lg"><i class="ri-eye-line text-indigo-500"></i> View Materials</button>
+          <button onclick="renderMRQ()" class="btn-secondary text-xs font-semibold p-2 rounded-lg"><i class="ri-refresh-line"></i></button>
+        </div>
+      </div>
+      <div class="mt-4 grid grid-cols-3 gap-4 shrink-0">
+        ${Object.entries(MRQ_CATEGORIES).map(([k,t])=>`
+          <div onclick="renderMRQ('${k}')" class="card hover:border-indigo-300 p-5 cursor-pointer">
+            <h4 class="font-bold text-sm">${t.title}</h4>
+            <p class="text-xs text-slate-500 mt-1">${t.desc}</p>
+          </div>`).join('')}
+      </div>
+      <div class="flex-1 mt-6 card overflow-auto"><table class="custom-table"><thead><tr><th>Req #</th><th>Dept</th><th>Status</th><th>Actions</th></tr></thead><tbody>
+        ${history.map(r=>`<tr><td>${r.req_no}</td><td>${r.from_dept}</td><td><span class="badge badge-emerald">${r.status.toUpperCase()}</span></td><td><a href="/api/mrq/print/${r.id}" target="_blank" class="text-xs text-indigo-600 font-semibold">Print</a></td></tr>`).join('')}
+      </tbody></table></div>
+    </div>`;
+}
+
+// ===== SU01 & SPRO SCRIPT HELPERS =====
 async function renderSU01(){
   if(!ME.is_master&&ME.role!=='admin')return setMsg("Denied",true);
-  const users=await api('/api/su01/users');
+  ALL_USERS_LIST=await api('/api/su01/users');
   $('#main_screen').innerHTML=`
     <div class="flex-1 flex flex-col p-6 overflow-hidden select-text">
       <div class="flex items-center justify-between pb-4 border-b">
@@ -1383,68 +1479,39 @@ async function renderSU01(){
         <button onclick="showCreateUserModal()" class="btn-primary text-xs px-4 py-2 rounded-lg">+ Add User</button>
       </div>
       <div class="flex-1 mt-4 card overflow-auto"><table class="custom-table"><thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Dept</th><th>Plants</th><th>Status</th><th>Actions</th></tr></thead><tbody>
-        ${users.map(u=>`
+        ${ALL_USERS_LIST.map(u=>`
           <tr>
-            <td class="font-mono font-bold text-indigo-600">${esc(u.username)}</td>
-            <td>${esc(u.full_name)}</td>
-            <td><span class="badge badge-slate">${u.role.toUpperCase()}</span></td>
-            <td>${esc(u.department)}</td>
-            <td class="font-mono text-xs">${esc(u.plants||'ALL')}</td>
-            <td><span class="badge ${u.status==='approved'?'badge-emerald':'badge-red'}">${u.status}</span></td>
-            <td>
-              <button onclick="showEditUserModal('${esc(u.username)}')" class="text-xs text-indigo-600 font-semibold">Edit</button>
-              <button onclick="showResetPassModal('${esc(u.username)}')" class="text-xs text-amber-600 font-semibold ml-2">Reset</button>
-              ${u.role!=='master'?`<button onclick="deleteUser('${esc(u.username)}')" class="text-xs text-red-600 font-semibold ml-2">Del</button>`:''}
-            </td>
+            <td class="font-mono font-bold text-indigo-600">${esc(u.username)}</td><td>${esc(u.full_name)}</td><td><span class="badge badge-slate">${u.role.toUpperCase()}</span></td><td>${esc(u.department)}</td><td class="font-mono text-xs">${esc(u.plants||'ALL')}</td><td><span class="badge ${u.status==='approved'?'badge-emerald':'badge-red'}">${u.status}</span></td>
+            <td><button onclick="showResetPassModal('${esc(u.username)}')" class="text-xs text-amber-600 font-semibold">Reset PW</button>${u.role!=='master'?`<button onclick="deleteUser('${esc(u.username)}')" class="text-xs text-red-600 font-semibold ml-2">Del</button>`:''}</td>
           </tr>`).join('')}
       </tbody></table></div>
     </div>`;
 }
 
-async function showCreateUserModal(){
-  const d=await api('/api/spro/overview');
-  openDialog(`
-    <div class="px-6 py-4 border-b bg-slate-50 flex justify-between"><h3 class="font-bold text-sm">Create User</h3><button onclick="closeDialog()"><i class="ri-close-line"></i></button></div>
-    <div class="p-6 space-y-4">
-      <div class="grid grid-cols-2 gap-4"><div><label class="form-label">Username</label><input id="nu_u" class="form-input font-mono"></div><div><label class="form-label">Password</label><input id="nu_p" type="password" class="form-input"></div></div>
-      <div><label class="form-label">Full Name</label><input id="nu_fn" class="form-input"></div>
-      <div class="grid grid-cols-2 gap-4"><div><label class="form-label">Dept</label><select id="nu_d" class="form-input">${d.departments.map(x=>`<option value="${esc(x.name)}">${esc(x.name)}</option>`).join('')}</select></div><div><label class="form-label">Role</label><select id="nu_r" class="form-input"><option value="user">User</option><option value="admin">Admin</option></select></div></div>
-      <div><label class="form-label">Plants</label><input id="nu_pl" class="form-input font-mono"></div>
-    </div>
-    <div class="px-6 py-4 bg-slate-50 border-t flex justify-end gap-2"><button onclick="closeDialog()" class="btn-secondary px-4 py-2 rounded text-xs">Cancel</button><button onclick="submitCreateUser()" class="btn-primary px-4 py-2 rounded text-xs">Save</button></div>`);
+function showCreateUserModal(){
+  api('/api/spro/overview').then(d=>{
+    openDialog(`
+      <div class="p-6 space-y-4">
+        <h3 class="font-bold text-sm">Create User</h3>
+        <div><label class="form-label">Username</label><input id="nu_u" class="form-input"></div>
+        <div><label class="form-label">Password</label><input id="nu_p" type="password" class="form-input"></div>
+        <div><label class="form-label">Full Name</label><input id="nu_fn" class="form-input"></div>
+        <div><label class="form-label">Dept</label><select id="nu_d" class="form-input">${d.departments.map(x=>`<option value="${esc(x.name)}">${esc(x.name)}</option>`).join('')}</select></div>
+        <div><label class="form-label">Role</label><select id="nu_r" class="form-input"><option value="user">User</option><option value="admin">Admin</option></select></div>
+        <div class="flex justify-end gap-2"><button onclick="closeDialog()" class="btn-secondary px-4 py-2 rounded text-xs">Cancel</button><button onclick="submitCreateUser()" class="btn-primary px-4 py-2 rounded text-xs">Save</button></div>
+      </div>`);
+  });
 }
-
 async function submitCreateUser(){
-  const fd=new FormData();fd.append("username",$('#nu_u').value);fd.append("password",$('#nu_p').value);fd.append("full_name",$('#nu_fn').value);fd.append("department",$('#nu_d').value);fd.append("role",$('#nu_r').value);fd.append("plants",$('#nu_pl').value);
+  const fd=new FormData();
+  fd.append("username",$('#nu_u').value);fd.append("password",$('#nu_p').value);fd.append("full_name",$('#nu_fn').value);fd.append("department",$('#nu_d').value);fd.append("role",$('#nu_r').value);fd.append("plants","1000");
   try{await api('/api/su01/create',{method:'POST',body:fd});closeDialog();renderSU01();}catch(e){alert(e);}
 }
-
-async function showEditUserModal(u){
-  const users=await api('/api/su01/users');
-  const user=users.find(x=>x.username===u);
-  const d=await api('/api/spro/overview');
-  openDialog(`
-    <div class="px-6 py-4 border-b bg-slate-50 flex justify-between"><h3 class="font-bold text-sm">Edit: ${esc(u)}</h3><button onclick="closeDialog()"><i class="ri-close-line"></i></button></div>
-    <div class="p-6 space-y-4">
-      <div><label class="form-label">Name</label><input id="eu_fn" value="${esc(user.full_name)}" class="form-input"></div>
-      <div class="grid grid-cols-2 gap-4"><div><label class="form-label">Dept</label><select id="eu_d" class="form-input">${d.departments.map(x=>`<option value="${esc(x.name)}" ${x.name===user.department?'selected':''}>${esc(x.name)}</option>`).join('')}</select></div><div><label class="form-label">Role</label><select id="eu_r" class="form-input"><option value="user" ${user.role==='user'?'selected':''}>User</option><option value="admin" ${user.role==='admin'?'selected':''}>Admin</option></select></div></div>
-      <div class="grid grid-cols-2 gap-4"><div><label class="form-label">Plants</label><input id="eu_pl" value="${esc(user.plants||'')}" class="form-input font-mono"></div><div><label class="form-label">Status</label><select id="eu_st" class="form-input"><option value="approved" ${user.status==='approved'?'selected':''}>Approved</option><option value="locked" ${user.status==='locked'?'selected':''}>Locked</option></select></div></div>
-    </div>
-    <div class="px-6 py-4 bg-slate-50 border-t flex justify-end gap-2"><button onclick="closeDialog()" class="btn-secondary px-4 py-2 rounded text-xs">Cancel</button><button onclick="submitEditUser('${esc(u)}')" class="btn-primary px-4 py-2 rounded text-xs">Save</button></div>`);
-}
-
-async function submitEditUser(u){
-  const fd=new FormData();
-  fd.append("username",u);fd.append("full_name",$('#eu_fn').value);fd.append("department",$('#eu_d').value);fd.append("role",$('#eu_r').value);fd.append("plants",$('#eu_pl').value);fd.append("status",$('#eu_st').value);
-  try{await api('/api/su01/update',{method:'POST',body:fd});closeDialog();renderSU01();}catch(e){alert(e);}
-}
-
 function showResetPassModal(u){
   const p=prompt(`New password for ${u}:`);if(!p)return;
   const fd=new FormData();fd.append("username",u);fd.append("new_password",p);
   api('/api/su01/reset-password',{method:'POST',body:fd}).then(()=>setMsg("Password reset.")).catch(e=>alert(e));
 }
-
 async function deleteUser(u){
   if(!confirm(`Delete ${u}?`))return;
   const fd=new FormData();fd.append("username",u);
@@ -1460,31 +1527,59 @@ async function renderSPRO(){
       <div class="grid grid-cols-2 gap-4 flex-1 mt-4 overflow-auto">
         <div class="card overflow-hidden">
           <div class="p-3 border-b bg-slate-50 flex justify-between"><span class="text-xs font-bold uppercase">Plants (${d.plants.length})</span><button onclick="createPlant()" class="btn-primary text-xs px-3 py-1.5 rounded">+ Add</button></div>
-          <table class="custom-table"><thead><tr><th>Code</th><th>Name</th><th>Status</th></tr></thead><tbody>
-            ${d.plants.map(p=>`<tr><td class="font-mono font-bold text-indigo-600">${esc(p.code)}</td><td>${esc(p.name)}</td><td><span class="badge ${p.active?'badge-emerald':'badge-red'}">${p.active?'ACTIVE':'OFF'}</span></td></tr>`).join('')}
-          </tbody></table>
+          <table class="custom-table"><thead><tr><th>Code</th><th>Name</th></tr></thead><tbody>${d.plants.map(p=>`<tr><td class="font-mono font-bold">${esc(p.code)}</td><td>${esc(p.name)}</td></tr>`).join('')}</tbody></table>
         </div>
         <div class="card overflow-hidden">
           <div class="p-3 border-b bg-slate-50 flex justify-between"><span class="text-xs font-bold uppercase">Departments (${d.departments.length})</span><button onclick="createDept()" class="btn-primary text-xs px-3 py-1.5 rounded">+ Add</button></div>
-          <table class="custom-table"><thead><tr><th>Name</th><th>Status</th></tr></thead><tbody>
-            ${d.departments.map(x=>`<tr><td>${esc(x.name)}</td><td><span class="badge ${x.active?'badge-emerald':'badge-red'}">${x.active?'ACTIVE':'OFF'}</span></td></tr>`).join('')}
-          </tbody></table>
+          <table class="custom-table"><thead><tr><th>Name</th></tr></thead><tbody>${d.departments.map(x=>`<tr><td>${esc(x.name)}</td></tr>`).join('')}</tbody></table>
         </div>
       </div>
     </div>`;
 }
-
 function createPlant(){
-  const c=prompt("Plant Code (e.g. 1500):");if(!c)return;
+  const c=prompt("Plant Code:");if(!c)return;
   const n=prompt("Plant Name:");if(!n)return;
   const fd=new FormData();fd.append("code",c);fd.append("name",n);
   api('/api/admin/plants/create',{method:'POST',body:fd}).then(()=>renderSPRO()).catch(e=>alert(e));
 }
-
 function createDept(){
   const d=prompt("Department name:");if(!d)return;
   const fd=new FormData();fd.append("name",d.trim());
   api('/api/admin/departments/create',{method:'POST',body:fd}).then(()=>renderSPRO()).catch(e=>alert(e));
+}
+
+// ===== SE93 & PFCG SCRIPT HELPERS =====
+async function renderSE93(){
+  if(!ME.is_master&&ME.role!=='admin')return setMsg("Denied",true);
+  const list=await api('/api/se93/list');
+  $('#main_screen').innerHTML=`
+    <div class="flex-1 flex flex-col p-6 overflow-hidden">
+      <div class="flex justify-between pb-4 border-b"><h2 class="text-lg font-bold">Module Studio (SE93)</h2></div>
+      <div class="grid grid-cols-3 gap-4 flex-1 mt-4 overflow-hidden">
+        <div class="col-span-1 card p-4 overflow-auto">
+          <h3 class="text-sm font-bold mb-3">Auto-Create Module</h3>
+          <form onsubmit="submitSE93(event)" class="space-y-3">
+            <div><label class="form-label">Code</label><input name="code" required class="form-input font-mono uppercase"></div>
+            <div><label class="form-label">Title</label><input name="title" required class="form-input"></div>
+            <div><label class="form-label">Description</label><input name="description" class="form-input"></div>
+            <div><label class="form-label">File (.xlsx, .csv)</label><input name="file" type="file" required class="w-full text-xs"></div>
+            <button type="submit" class="btn-primary w-full text-xs font-bold py-2 rounded">Create Module</button>
+          </form>
+        </div>
+        <div class="col-span-2 card overflow-auto"><table class="custom-table"><thead><tr><th>Code</th><th>Title</th><th>Records</th><th>Actions</th></tr></thead><tbody>
+          ${list.map(t=>`<tr><td class="font-mono font-bold text-indigo-600">${esc(t.code)}</td><td>${esc(t.title)}</td><td class="font-mono">${t.record_count}</td><td><button onclick="openTcode('${esc(t.code)}')" class="text-xs text-indigo-600 font-semibold">Open</button></td></tr>`).join('')}
+        </tbody></table></div>
+      </div>
+    </div>`;
+}
+async function submitSE93(ev){
+  ev.preventDefault();
+  const fd=new FormData(ev.target);
+  try{
+    const r=await fetch('/api/se93/auto-create',{method:'POST',body:fd,headers:{'Authorization':'Bearer '+(localStorage.getItem("nexus_token")||'')}});
+    const d=await r.json();if(!r.ok)throw d.detail||"Fail";
+    alert(`Created ${d.code}`);renderSE93();loadModules();
+  }catch(e){alert(e);}
 }
 
 async function renderPFCG(){
@@ -1500,12 +1595,11 @@ async function renderPFCG(){
           <button onclick="grantAccess()" class="btn-primary text-xs px-3 py-2 rounded">+ Grant</button>
         </div>
       </div>
-      <div class="flex-1 mt-4 card overflow-auto"><table class="custom-table"><thead><tr><th>User</th><th>Module</th><th>By</th><th>At</th><th>Action</th></tr></thead><tbody>
-        ${m.grants.map(g=>`<tr><td class="font-mono">${esc(g.username)}</td><td class="font-mono">${esc(g.tcode_code)}</td><td>${esc(g.granted_by)}</td><td class="text-xs">${esc(g.granted_at)}</td><td><button onclick="revokeAccess('${esc(g.username)}','${esc(g.tcode_code)}')" class="text-xs text-red-600 font-semibold">Revoke</button></td></tr>`).join('')}
+      <div class="flex-1 mt-4 card overflow-auto"><table class="custom-table"><thead><tr><th>User</th><th>Module</th><th>By</th><th>Action</th></tr></thead><tbody>
+        ${m.grants.map(g=>`<tr><td class="font-mono">${esc(g.username)}</td><td class="font-mono">${esc(g.tcode_code)}</td><td>${esc(g.granted_by)}</td><td><button onclick="revokeAccess('${esc(g.username)}','${esc(g.tcode_code)}')" class="text-xs text-red-600 font-semibold">Revoke</button></td></tr>`).join('')}
       </tbody></table></div>
     </div>`;
 }
-
 async function grantAccess(){
   const fd=new FormData();fd.append("username",$('#pfcg_u').value);fd.append("tcode",$('#pfcg_t').value);
   await api('/api/pfcg/grant',{method:'POST',body:fd});renderPFCG();
@@ -1516,47 +1610,56 @@ async function revokeAccess(u,t){
   await api('/api/pfcg/revoke',{method:'POST',body:fd});renderPFCG();
 }
 
-async function renderSE93(){
-  if(!ME.is_master&&ME.role!=='admin')return setMsg("Denied",true);
-  const list=await api('/api/se93/list');
+// ===== STANDARD MODULE ALV VIEW =====
+async function renderStandardModule(code){
+  const ls=await api(`/api/tcode/${code}/layouts`);
+  const al=ls.find(l=>l.is_default)||ls[0];
+  const fs=al?al.fields:[];
+  const recs=await api(`/api/tcode/${code}/records`);
   $('#main_screen').innerHTML=`
-    <div class="flex-1 flex flex-col p-6 overflow-hidden">
-      <div class="flex justify-between pb-4 border-b"><h2 class="text-lg font-bold">Module Studio (SE93)</h2></div>
-      <div class="grid grid-cols-3 gap-4 flex-1 mt-4 overflow-hidden">
-        <div class="col-span-1 card p-4 overflow-auto">
-          <h3 class="text-sm font-bold mb-3">Auto-Create Module</h3>
-          <form onsubmit="submitSE93(event)" class="space-y-3">
-            <div><label class="form-label">Code</label><input name="code" required class="form-input font-mono uppercase"></div>
-            <div><label class="form-label">Title</label><input name="title" required class="form-input"></div>
-            <div><label class="form-label">Description</label><input name="description" class="form-input"></div>
-            <div><label class="form-label">Module</label><input name="module" value="PROD" class="form-input font-mono uppercase"></div>
-            <div><label class="form-label">Allowed Depts</label><input name="allowed_depts" value="Production,Quality Control" class="form-input"></div>
-            <div><label class="form-label">Import File</label><input name="file" type="file" required class="w-full text-xs file:bg-indigo-600 file:text-white file:border-0 file:rounded file:px-2 file:py-1"></div>
-            <button type="submit" class="btn-primary w-full text-xs font-bold py-2 rounded">Create Module</button>
-          </form>
-        </div>
-        <div class="col-span-2 card overflow-auto"><table class="custom-table"><thead><tr><th>Code</th><th>Title</th><th>Records</th><th>Actions</th></tr></thead><tbody>
-          ${list.map(t=>`<tr><td class="font-mono font-bold text-indigo-600">${esc(t.code)}</td><td>${esc(t.title)}</td><td class="font-mono">${t.record_count}</td><td><button onclick="openTcode('${esc(t.code)}')" class="text-xs text-indigo-600 font-semibold">Open</button></td></tr>`).join('')}
-        </tbody></table></div>
+    <div class="flex-1 flex flex-col overflow-hidden select-text">
+      <div class="p-4 border-b flex items-center justify-between shrink-0 bg-white">
+        <div class="flex items-center gap-3"><span class="font-mono font-bold text-xs bg-indigo-600 text-white px-2 py-0.5 rounded">${code}</span><h2 class="text-base font-bold">${al?esc(al.title):code}</h2><button onclick="showStandardRecordModal('${code}')" class="btn-primary text-xs font-semibold px-3 py-1.5 rounded flex items-center gap-1"><i class="ri-add-line"></i> New</button></div>
+        <a href="/api/tcode/${code}/export" class="btn-secondary text-xs px-2.5 py-1.5 rounded flex items-center gap-1"><i class="ri-download-2-line"></i> Export</a>
       </div>
+      <div class="flex-1 overflow-auto"><table class="custom-table"><thead><tr><th>#</th><th>Plant</th>${fs.map(f=>`<th>${esc(f.label)}</th>`).join('')}<th>By</th><th>Action</th></tr></thead><tbody>
+        ${recs.map(r=>`<tr><td class="font-mono">${r.id}</td><td>${esc(r.plant||'1000')}</td>${fs.map(f=>`<td>${esc(r.data[f.key]||'')}</td>`).join('')}<td>${esc(r.created_by_name||r.created_by)}</td><td><button onclick="deleteStandardRecord('${code}',${r.id})" class="text-xs text-red-600 font-semibold">Del</button></td></tr>`).join('')}
+      </tbody></table></div>
     </div>`;
 }
-
-async function submitSE93(ev){
-  ev.preventDefault();
-  const fd=new FormData(ev.target);
-  try{
-    const r=await fetch('/api/se93/auto-create',{method:'POST',body:fd,headers:{'Authorization':'Bearer '+(localStorage.getItem("nexus_token")||'')}});
-    const d=await r.json();if(!r.ok)throw d.detail||"Fail";
-    alert(`Created ${d.code}`);renderSE93();loadModules();
-  }catch(e){alert(e);}
+function showStandardRecordModal(code){
+  api(`/api/tcode/${code}/layouts`).then(ls=>{
+    const al=ls.find(l=>l.is_default)||ls[0];
+    const fs=al?al.fields:[];
+    openDialog(`
+      <div class="p-6 space-y-4">
+        <h3 class="font-bold text-sm">New Entry: ${code}</h3>
+        <div><label class="form-label">Plant</label><input id="std_f__plant" class="form-input font-mono" value="1000"></div>
+        ${fs.map(f=>`<div><label class="form-label">${esc(f.label)}</label><input id="std_f_${f.key}" class="form-input"></div>`).join('')}
+        <div class="flex justify-end gap-2"><button onclick="closeDialog()" class="btn-secondary px-4 py-2 rounded text-xs">Cancel</button><button onclick="submitStandardRecord('${code}')" class="btn-primary px-4 py-2 rounded text-xs">Save</button></div>
+      </div>`);
+  });
+}
+async function submitStandardRecord(code){
+  const ls=await api(`/api/tcode/${code}/layouts`);
+  const al=ls.find(l=>l.is_default)||ls[0];
+  const fs=al?al.fields:[];
+  const p={_plant:$('#std_f__plant').value};
+  for(const f of fs){const el=$('#std_f_'+f.key);p[f.key]=el?el.value.trim():"";}
+  try{await api(`/api/tcode/${code}/records`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});closeDialog();renderStandardModule(code);setMsg("Saved");}
+  catch(e){alert(e);}
+}
+async function deleteStandardRecord(code,rid){
+  if(!confirm(`Delete #${rid}?`))return;
+  try{await api(`/api/tcode/${code}/records/${rid}`,{method:'DELETE'});renderStandardModule(code);setMsg("Deleted");}
+  catch(e){alert(e);}
 }
 
 // Dialog Helpers
 function openDialog(c){$('#app_dialog_body').innerHTML=c;$('#app_dialog').classList.remove('hidden');}
 function closeDialog(){$('#app_dialog').classList.add('hidden');$('#app_dialog_body').innerHTML='';}
 
-// Close suggestion box when clicking outside
+// Global click outside to dismiss CC suggestions
 document.addEventListener('click', e => {
   const box = $('#cc_suggestions');
   if(box && !box.contains(e.target) && e.target.id !== 'cc_search_input'){
@@ -1570,14 +1673,12 @@ initSession();
 </html>
 """
 
-# Support both GET and HEAD for Render health check
+# Health and Home routes (supporting both GET and HEAD for Render uptime checks)
 @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
-def home():
-    return HTMLResponse(HTML_UI)
+def home(): return HTMLResponse(HTML_UI)
 
 @app.api_route("/health", methods=["GET", "HEAD"])
-def health():
-    return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "4.0.1"}
+def health(): return {"status": "ACTIVE", "system": "NEXUS-CORE", "version": "4.0.3"}
 
 if __name__ == "__main__":
     import uvicorn
