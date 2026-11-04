@@ -10,9 +10,9 @@
 #   - SU01: Edit user modal with plant picker restored.
 #   - PFCG: user-centric access matrix with inline grant/revoke.
 #   - MRQ1: Added Reports & Analytics tab with advanced filtering.
-#   - MRQ1: Added Maintenance category. Backend issue logic relaxed (Admin 
-#     and selected `to_dept` can issue).
+#   - MRQ1: Added Maintenance category. Backend issue logic relaxed.
 #   - SPRO: Plant & Department management fully restored.
+#   - DB: Auto-fix added for access_grants unique constraint.
 # =========================================================================
 
 import io
@@ -215,6 +215,15 @@ def init_db():
                 cur.execute("ALTER TABLE mrq_requisitions ADD COLUMN issued_at TEXT;")
 
             conn.commit()
+
+            # --- AUTO FIX FOR MISSING UNIQUE CONSTRAINT ---
+            try:
+                cur.execute("ALTER TABLE access_grants ADD CONSTRAINT access_grants_username_tcode_key UNIQUE (username, tcode_code);")
+                conn.commit()
+            except Exception:
+                conn.rollback() # Ignore if it already exists
+            # ---------------------------------------------
+            
         except Exception as e:
             print("PG auto-migration notice:", e)
             conn.rollback()
