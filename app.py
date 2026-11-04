@@ -206,7 +206,6 @@ def init_db():
         if not cur.fetchone():
             cur.execute(q("INSERT INTO plants (code, name, active, created_at) VALUES (?,?,?,?)"), (code, name, 1, cur_time))
 
-    # Admin credentials updated
     hashed = bcrypt.hashpw("Swami@265".encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
     cur.execute(q("SELECT username FROM users WHERE username='Admin_Erp'"))
     if cur.fetchone():
@@ -234,7 +233,6 @@ def init_db():
         if not cur.fetchone():
             cur.execute(q("INSERT INTO tcodes (code, title, description, module, allowed_depts, active, created_at, updated_at, created_by) VALUES (?,?,?,?,?,?,?,?,?)"), (code, title, desc, mod, depts, 1, cur_time, cur_time, "SYSTEM"))
         else:
-            # Force update CTST departments to allow all existing users to access it
             if code == "CTST":
                 cur.execute(q("UPDATE tcodes SET allowed_depts=? WHERE code='CTST'"), (depts,))
 
@@ -1156,8 +1154,12 @@ def tn01_send(req: Request, payload: dict):
     for i, raw in enumerate(rows, 1):
         if not isinstance(raw, (list, tuple)): continue
         row = ["" if c is None else str(c) for c in raw]
-        if (header_count >= 3 and row[0].strip() == "" and len(row) >= 2 and row[1].strip() != "" and row[-1].strip() == ""):
+        
+        # If the row starts with an empty cell (col 0), it means the paste got shifted.
+        # Shift it back so Job No. is in col 1.
+        if len(row) >= 2 and row[0].strip() == "" and row[1].strip() != "":
             row = row[1:] + [""]
+
         while len(row) < header_count: row.append("")
         if header_count: row = row[:header_count]
         row[0] = str(i)
@@ -2181,24 +2183,22 @@ function setupPasteHandler(){
     TN01_UNDO.push(JSON.stringify(TN01_ROWS));
     const lines=clip.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n');
     let sr=TN01_CELL.r||0;
-    let sc=TN01_CELL.c||1;
     
-    // FORCE PASTE TO START AT COLUMN 1 (The first data column)
-    // This prevents the paste from overwriting "Sr. No." and shifting the data right.
-    sc = 1; 
-
     lines.forEach((line,li)=>{
       if(!line&&li===lines.length-1)return;
-      const cells=line.split('\t');
+      let cells=line.split('\t');
       
-      // Strip trailing empty cell from Excel
-      if(cells.length > 0 && cells[cells.length - 1] === '') {
-         cells.pop();
+      // Excel bug fix: If the first cell is empty, Excel adds a leading \t.
+      // We shift the entire row left by removing the empty first cell.
+      if(cells.length > 1 && cells[0].trim() === "") {
+         cells.shift();
       }
 
       const tr=sr+li;
       while(TN01_ROWS.length<=tr){const nr=new Array(TN01_HEADERS.length).fill("");nr[0]=TN01_ROWS.length+1;TN01_ROWS.push(nr);}
-      cells.forEach((v,ci)=>{const tc=sc+ci;if(tc<TN01_HEADERS.length)TN01_ROWS[tr][tc]=v.trim();});
+      
+      // Start writing at column 1, skipping column 0 (Sr. No.)
+      cells.forEach((v,ci)=>{const tc=ci+1;if(tc<TN01_HEADERS.length)TN01_ROWS[tr][tc]=v.trim();});
     });
     TN01_ROWS.forEach((r,i)=>{r[0]=i+1;});
     renderGridTable();
