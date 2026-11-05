@@ -14,6 +14,7 @@
 #   - SPRO: Plant & Department management fully restored.
 #   - DB: Auto-fix added for access_grants unique constraint.
 #   - TN01: Replaced header status with Sheet No. on print.
+#   - MRQ1: Issue modal now uses a dept-filtered receiver dropdown and includes CC.
 # =========================================================================
 
 import io
@@ -215,6 +216,14 @@ def init_db():
             if not cur.fetchone():
                 cur.execute("ALTER TABLE mrq_requisitions ADD COLUMN issued_at TEXT;")
 
+            # MRQ1 cc_users migration
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='mrq_requisitions' AND column_name='cc_users';"
+            )
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE mrq_requisitions ADD COLUMN cc_users TEXT DEFAULT '';")
+
             conn.commit()
 
             # --- AUTO FIX FOR MISSING UNIQUE CONSTRAINT ---
@@ -309,6 +318,7 @@ def init_db():
         f"to_dept TEXT DEFAULT 'Store', status TEXT DEFAULT 'pending', "
         f"remarks TEXT DEFAULT '', requested_by TEXT, requested_by_name TEXT, "
         f"issued_by TEXT, issued_by_name TEXT, issued_to_name TEXT, issued_at TEXT, "
+        f"cc_users TEXT DEFAULT '', "
         f"received_by TEXT, received_by_name TEXT, "
         f"created_at TEXT, updated_at TEXT, cancelled_at TEXT, "
         f"cancelled_by TEXT, cancel_reason TEXT DEFAULT '');"
@@ -1700,6 +1710,21 @@ def mrq_lookup_material(req: Request, code: str):
     return row
 
 
+@app.api_route("/api/mrq/materials/{code}", methods=["DELETE"])
+def mrq_delete_material(req: Request, code: str):
+    need_admin(req)
+    c = code.strip().upper()
+    exec_write("DELETE FROM mrq_materials WHERE material_code=?", (c,))
+    return {"ok": True}
+
+
+@app.api_route("/api/mrq/materials/clear", methods=["POST"])
+def mrq_clear_materials(req: Request):
+    need_admin(req)
+    exec_write("DELETE FROM mrq_materials")
+    return {"ok": True}
+
+
 @app.api_route("/api/mrq/materials/import", methods=["POST"])
 async def mrq_import_materials(req: Request, file: UploadFile = File(...)):
     need_admin(req)
@@ -1902,6 +1927,7 @@ def mrq_issue(req: Request, rid: int, payload: dict = None):
     issued_to_name = str(payload.get("issued_to_name") or "").strip()
     if not issued_to_name:
         raise HTTPException(400, "Receiver name is required.")
+    cc_users = str(payload.get("cc_users") or "").strip()
     lines_in = payload.get("lines") or []
     line_map = {int(x["id"]): x for x in lines_in if "id" in x}
     for ln in fetch_all("SELECT * FROM mrq_lines WHERE req_id=?", (rid,)):
@@ -1916,8 +1942,8 @@ def mrq_issue(req: Request, rid: int, payload: dict = None):
     ct = now()
     exec_write(
         "UPDATE mrq_requisitions SET status='issued', issued_by=?, "
-        "issued_by_name=?, issued_to_name=?, issued_at=?, updated_at=? WHERE id=?",
-        (user["username"], user["full_name"], issued_to_name, ct, ct, rid),
+        "issued_by_name=?, issued_to_name=?, issued_at=?, cc_users=?, updated_at=? WHERE id=?",
+        (user["username"], user["full_name"], issued_to_name, ct, cc_users, ct, rid),
     )
     return {"ok": True}
 
@@ -2105,6 +2131,7 @@ table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
   <div><b>Category:</b><br>{esc_py(cat_title)}</div><div><b>From Dept:</b><br>{esc_py(r['from_dept'])}</div><div><b>From Plant:</b><br>{esc_py(r['from_plant'])}</div><div><b>To Dept:</b><br>{esc_py(r['to_dept'])}</div>
   <div><b>Status:</b><br><span style="color:{status_color}; font-weight:700">{r['status'].upper()}</span></div><div><b>Requested By:</b><br>{esc_py(r['requested_by_name'] or r['requested_by'])}</div><div><b>Issued By:</b><br>{esc_py(r['issued_by_name'] or r['issued_by'] or '—')}</div><div><b>Received By:</b><br>{esc_py(r['received_by_name'] or r['received_by'] or '—')}</div>
 </div>
+<div style="font-size:11px;margin-bottom:10px"><b>CC:</b> {esc_py(r.get('cc_users') or '—')}</div>
 <table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table>
 <div style="margin-top:14px; font-size:11px"><b>Remarks:</b> {esc_py(r['remarks'] or '—')}</div>
 {cancel_html}
@@ -3404,6 +3431,10 @@ async function mrqExportReport() {
 
 async function mrqIssueModal(id) {
   const r = await api(`/api/mrq/requisition/${id}`);
+  const users = await api('/api/su01/users');
+  const deptUsers = users.filter(u => u.department === r.from_dept);
+  const otherUsers = users.filter(u => u.department !== r.from_dept);
+
   openDialog(`
     <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50 rounded-t-2xl">
       <div>
@@ -3413,9 +3444,21 @@ async function mrqIssueModal(id) {
       <button onclick="closeDialog()"><i class="ri-close-line text-lg text-slate-500"></i></button>
     </div>
     <div class="p-6 space-y-4">
-      <div>
-        <label class="form-label">Receiver Name (Person collecting material) *</label>
-        <input id="issue_receiver" class="form-input" placeholder="e.g. John Doe" required>
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="form-label">Receiver Name (Person collecting material) *</label>
+          <select id="issue_receiver" class="form-input">
+            <option value="">— Select from ${esc(r.from_dept)} —</option>
+            ${deptUsers.map(u=>`<option value="${esc(u.full_name)}">${esc(u.full_name)} (${esc(u.username)})</option>`).join('')}
+          </select>
+        </div>
+        <div class="relative">
+          <label class="form-label">CC (Optional)</label>
+          <div id="cc_tags" class="flex flex-wrap gap-1.5 p-2 bg-slate-50 border border-slate-200 rounded-lg min-h-[40px] items-center mb-1">
+            <input id="cc_search_input" placeholder="Search user to add CC..." oninput="mrqSearchCC(this.value)" class="bg-transparent text-xs outline-none flex-1 min-w-[140px]">
+          </div>
+          <div id="cc_suggestions" class="hidden absolute left-0 right-0 top-full bg-white border border-slate-200 shadow-xl rounded-lg z-50 max-h-48 overflow-y-auto"></div>
+        </div>
       </div>
       <table class="w-full text-left text-xs border border-slate-300 mt-4">
         <thead><tr class="bg-indigo-50 font-bold">
@@ -3441,11 +3484,58 @@ async function mrqIssueModal(id) {
       <button onclick="closeDialog()" class="btn-secondary px-4 py-2 rounded-lg text-xs font-semibold">Cancel</button>
       <button onclick="submitIssue(${r.id}, ${JSON.stringify(r.lines.map(l=>l.id))})" class="btn-primary px-5 py-2 rounded-lg text-xs font-bold shadow-sm">Confirm Issue</button>
     </div>`);
+  
+  window._MRQ_CC_LIST = [];
+  window._MRQ_ALL_USERS = otherUsers;
+}
+
+async function mrqSearchCC(val) {
+  const box = $('#cc_suggestions');
+  if(!val.trim()){ box.classList.add('hidden'); box.innerHTML=''; return; }
+  
+  const list = window._MRQ_ALL_USERS.filter(u => 
+    u.username.toLowerCase().includes(val.toLowerCase()) || 
+    u.full_name.toLowerCase().includes(val.toLowerCase())
+  );
+  
+  box.innerHTML = list.length ? list.map(u => `
+    <div onclick="mrqAddCC('${esc(u.full_name)}')" class="p-2.5 hover:bg-indigo-50 cursor-pointer border-b border-slate-100 flex items-center justify-between text-xs">
+      <div><b class="text-slate-900">${esc(u.full_name)}</b> <span class="text-slate-400 font-mono">(${esc(u.username)})</span></div>
+      <span class="badge badge-slate">${esc(u.department||'')}</span>
+    </div>`).join('') : '<div class="p-2.5 text-xs text-slate-400">No match.</div>';
+  box.classList.remove('hidden');
+}
+
+function mrqAddCC(name) {
+  if(!window._MRQ_CC_LIST.includes(name)) {
+    window._MRQ_CC_LIST.push(name);
+    mrqRenderCCTags();
+  }
+  $('#cc_search_input').value = '';
+  $('#cc_suggestions').classList.add('hidden');
+}
+
+function mrqRemoveCC(name) {
+  window._MRQ_CC_LIST = window._MRQ_CC_LIST.filter(n => n !== name);
+  mrqRenderCCTags();
+}
+
+function mrqRenderCCTags() {
+  const box = $('#cc_tags'), input = $('#cc_search_input');
+  box.querySelectorAll('.cc-pill').forEach(el => el.remove());
+  window._MRQ_CC_LIST.forEach(u => {
+    const span = document.createElement('span');
+    span.className = "cc-pill badge badge-indigo text-xs py-1 flex items-center gap-1 font-normal";
+    span.innerHTML = `<b>${esc(u)}</b> <button onclick="mrqRemoveCC('${esc(u)}')">&times;</button>`;
+    box.insertBefore(span, input);
+  });
 }
 
 async function submitIssue(id, lineIds) {
-  const receiver = $('#issue_receiver').value.trim();
-  if(!receiver) return alert("Receiver Name is required.");
+  const receiver = $('#issue_receiver').value;
+  if(!receiver) return alert("Please select a Receiver from the list.");
+  const cc_str = window._MRQ_CC_LIST.join(',');
+  
   const lines = lineIds.map(lid => {
     const batch = $(`#issue_batch_${lid}`).value.trim();
     const qty = parseFloat($(`#issue_qty_${lid}`).value) || 0;
@@ -3454,7 +3544,7 @@ async function submitIssue(id, lineIds) {
   try {
     await api(`/api/mrq/requisition/${id}/issue`, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ lines, issued_to_name: receiver })
+      body: JSON.stringify({ lines, issued_to_name: receiver, cc_users: cc_str })
     });
     closeDialog();
     setMsg("Issued successfully");
@@ -3484,22 +3574,32 @@ async function mrqViewMaterials() {
   const materials = await api('/api/mrq/materials');
   openDialog(`
     <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50 rounded-t-2xl">
-      <div><h3 class="font-bold text-slate-900 text-sm">Material Master List</h3>
-        <p class="text-xs text-slate-500">${materials.length} items loaded</p></div>
-      <button onclick="closeDialog()"><i class="ri-close-line text-lg text-slate-500"></i></button>
+      <div>
+        <h3 class="font-bold text-slate-900 text-sm">Material Master List</h3>
+        <p class="text-xs text-slate-500">${materials.length} items loaded</p>
+      </div>
+      <div class="flex items-center gap-2">
+        <button onclick="mrqClearMaterials()" class="text-xs bg-red-50 text-red-600 border border-red-200 px-3 py-1.5 rounded-lg font-bold hover:bg-red-100 transition">
+          <i class="ri-delete-bin-line"></i> Clear All
+        </button>
+        <button onclick="closeDialog()"><i class="ri-close-line text-lg text-slate-500"></i></button>
+      </div>
     </div>
     <div class="p-0 overflow-auto max-h-[60vh]">
       <table class="custom-table">
         <thead class="sticky top-0 bg-slate-50 shadow-sm z-10">
-          <tr><th>Code</th><th>Description</th><th>Category</th><th>UOM</th></tr>
+          <tr><th>Code</th><th>Description</th><th>Category</th><th>UOM</th><th class="text-right">Action</th></tr>
         </thead>
         <tbody>
-          ${!materials.length ? `<tr><td colspan="4" class="text-center py-10 text-slate-400">No materials loaded.</td></tr>`
+          ${!materials.length ? `<tr><td colspan="5" class="text-center py-10 text-slate-400">No materials loaded.</td></tr>`
             : materials.map(m => `<tr>
               <td class="font-mono font-bold text-emerald-600">${esc(m.material_code)}</td>
               <td class="font-medium text-slate-900">${esc(m.description)}</td>
               <td class="text-xs uppercase">${esc(m.category)}</td>
               <td class="text-xs">${esc(m.uom)}</td>
+              <td class="text-right">
+                <button onclick="mrqDeleteMaterial('${esc(m.material_code)}')" class="text-xs text-red-600 font-bold hover:underline">Del</button>
+              </td>
             </tr>`).join('')}
         </tbody>
       </table>
@@ -3507,6 +3607,24 @@ async function mrqViewMaterials() {
     <div class="px-6 py-4 bg-slate-50 border-t border-slate-200 flex justify-end rounded-b-2xl">
       <button onclick="closeDialog()" class="btn-secondary px-4 py-2 rounded-lg text-xs font-semibold">Close</button>
     </div>`);
+}
+
+async function mrqDeleteMaterial(code) {
+  if(!confirm(`Remove material ${code} from master list?`)) return;
+  try {
+    await api(`/api/mrq/materials/${code}`, {method: 'DELETE'});
+    setMsg(`Removed ${code}`);
+    mrqViewMaterials(); // Refresh
+  } catch(e) { alert(e); }
+}
+
+async function mrqClearMaterials() {
+  if(!confirm("Are you absolutely sure you want to delete ALL materials from the master list?")) return;
+  try {
+    await api('/api/mrq/materials/clear', {method: 'POST'});
+    setMsg("All materials cleared");
+    mrqViewMaterials(); // Refresh
+  } catch(e) { alert(e); }
 }
 
 async function renderMRQForm(category) {
