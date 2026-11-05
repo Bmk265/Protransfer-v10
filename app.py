@@ -13,6 +13,7 @@
 #   - MRQ1: Added Maintenance category. Backend issue logic relaxed.
 #   - SPRO: Plant & Department management fully restored.
 #   - DB: Auto-fix added for access_grants unique constraint.
+#   - TN01: Replaced header status with Sheet No. and Daily Count on print.
 # =========================================================================
 
 import io
@@ -2493,6 +2494,23 @@ def tn01_print_preview(req: Request, nid: int):
         data_rows = json.loads(note["sheet_data"])
     except Exception:
         data_rows = []
+    
+    # --- CALCULATE SHEET NO. & DAILY COUNT ---
+    day_str = note["created_at"].split(" ")[0] if note["created_at"] else ""
+    cnt = fetch_one(
+        "SELECT COUNT(*) AS c FROM transfer_notes WHERE from_dept=? AND created_at LIKE ?",
+        (note["from_dept"], f"{day_str}%")
+    )
+    daily_count = cnt["c"] if cnt else 0
+    
+    # Determine sheet number based on its order of creation that day for that department
+    seq = fetch_one(
+        "SELECT COUNT(*) AS c FROM transfer_notes WHERE from_dept=? AND created_at LIKE ? AND id <= ?",
+        (note["from_dept"], f"{day_str}%", nid)
+    )
+    sheet_no = seq["c"] if seq else 1
+    # -----------------------------------------
+
     th = "".join(
         f"<th style='border:1px solid #0f172a; padding:6px 8px; "
         f"font-size:11px; background:#e0e7ff'>{h}</th>" for h in headers
@@ -2534,7 +2552,7 @@ margin-top: 40px; text-align: center; font-size: 11px; font-weight: bold; }}
   <div><b>Entries:</b><br>{note['entry_count']}</div>
   <div><b>Sender:</b><br>{note['from_user_name']}</div>
   <div><b>Recipient:</b><br>{note['to_user_name']}</div>
-  <div><b>Status:</b><br>{note['status'].upper()}</div>
+  <div><b>Sheet No:</b><br>{sheet_no} (Day's Count: {daily_count})</div>
   <div><b>Receipt:</b><br>{note['received_at'] or 'Pending'}</div>
 </div>
 <div style="font-size:11px;margin-bottom:10px"><b>CC:</b> {note.get('cc_users') or '—'}</div>
